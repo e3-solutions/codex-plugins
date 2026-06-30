@@ -1,0 +1,20 @@
+{
+  "name": "coreedge-local",
+  "interface": {
+    "displayName": "Core Edge Local"
+  },
+  "plugins": [
+    {
+      "name": "linear-progress-sync",
+      "source": {
+        "source": "local",
+        "path": "./plugins/linear-progress-sync"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    }
+  ]
+}

@@ -1,0 +1,45 @@
+name: Linear Progress Sync
+
+on:
+  push:
+    branches:
+      - main
+      - dev
+
+jobs:
+  linear-sync:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Enqueue pushed commits
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p .codex/linear-sync/events
+          before="${{ github.event.before }}"
+          after="${{ github.sha }}"
+          if [ "$before" = "0000000000000000000000000000000000000000" ]; then
+            range="$after"
+          else
+            range="$before..$after"
+          fi
+          for sha in $(git rev-list "$range"); do
+            python3 plugins/linear-progress-sync/scripts/enqueue_event.py post_commit --sha "$sha"
+          done
+
+      - name: Drain Linear sync queue
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! command -v codex >/dev/null 2>&1; then
+            echo "Codex CLI is not available in CI; leaving queued events untouched."
+            exit 0
+          fi
+          python3 plugins/linear-progress-sync/scripts/drain_queue.py --once || true
+
