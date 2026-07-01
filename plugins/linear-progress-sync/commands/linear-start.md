@@ -52,7 +52,7 @@ Start Linear-linked implementation work before any code edits.
 
 5. Link Linear back to GitHub.
    - Read the helper JSON output.
-   - Use `mcp__codex_apps__linear._save_issue` to attach the PR link when `pr_url` is present.
+   - Use `mcp__codex_apps__linear._save_issue` to attach the required PR link from `pr_url`.
    - Use `mcp__codex_apps__linear._save_comment` to add the branch, draft PR URL, and kickoff commit summary.
    - Move to `In Progress` only if the state exists and is non-terminal.
 

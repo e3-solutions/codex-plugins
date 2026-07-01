@@ -6,6 +6,8 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
+import pytest
+
 
 ROOT = Path(__file__).resolve().parents[1]
 MODULE_PATH = ROOT / "plugins" / "linear-progress-sync" / "scripts" / "linear_sync.py"
@@ -132,22 +134,26 @@ def test_branch_issue_key_wins_over_fuzzy_inference(tmp_path, monkeypatch):
 
 
 def test_active_linear_issue_wins_over_branch_and_commit_inference(tmp_path, monkeypatch):
-    monkeypatch.setenv("LINEAR_SYNC_STATE_DIR", str(tmp_path))
+    state_dir = tmp_path / "state"
+    monkeypatch.setenv("LINEAR_SYNC_STATE_DIR", str(state_dir))
+    repo = init_git_repo(tmp_path / "repo", branch="arya/cor-33-active-issue")
     linear_sync.write_active_issue(
         {
             "issue_key": "COR-33",
             "issue_url": "https://linear.app/coreedge/issue/COR-33/test",
             "issue_title": "Active issue",
             "branch": "arya/cor-33-active-issue",
+            "pr_url": "https://github.com/e3-solutions/codex-plugins/pull/33",
+            "pr_number": 33,
         },
-        root=tmp_path,
+        root=repo,
     )
     event = {
         "branch": "arya/cor-999-wrong-branch",
         "commit_subject": "COR-888 wrong commit",
     }
 
-    inference = linear_sync.infer_issue(event, root=tmp_path)
+    inference = linear_sync.infer_issue(event, root=repo)
 
     assert inference.issue_key == "COR-33"
     assert inference.confidence == 1.0
@@ -284,6 +290,51 @@ def test_pre_tool_guard_blocks_writes_with_incomplete_active_state(tmp_path, mon
     assert "missing repo" in decision.message
 
 
+def test_pre_tool_guard_blocks_active_state_without_pr_evidence(tmp_path, monkeypatch):
+    state_dir = tmp_path / "state"
+    monkeypatch.setenv("LINEAR_SYNC_STATE_DIR", str(state_dir))
+    repo = init_git_repo(tmp_path / "repo", branch="arya/cor-40-work")
+    linear_sync.write_active_issue(
+        {
+            "issue_key": "COR-40",
+            "issue_title": "Missing PR evidence",
+            "issue_url": "https://linear.app/coreedge/issue/COR-40/missing-pr-evidence",
+            "branch": "arya/cor-40-work",
+            "repo": str(repo),
+        },
+        root=repo,
+    )
+
+    decision = linear_sync.pre_tool_guard_decision({"tool_name": "apply_patch"}, root=repo)
+
+    assert decision.blocked is True
+    assert "missing pr_url" in decision.message
+
+
+def test_pre_tool_guard_blocks_when_current_branch_cannot_be_verified(tmp_path, monkeypatch):
+    state_dir = tmp_path / "state"
+    monkeypatch.setenv("LINEAR_SYNC_STATE_DIR", str(state_dir))
+    repo = init_git_repo(tmp_path / "repo", branch="arya/cor-41-work")
+    subprocess.run(["git", "switch", "--detach"], cwd=repo, check=True)
+    linear_sync.write_active_issue(
+        {
+            "issue_key": "COR-41",
+            "issue_title": "Detached branch",
+            "issue_url": "https://linear.app/coreedge/issue/COR-41/detached-branch",
+            "branch": "arya/cor-41-work",
+            "repo": str(repo),
+            "pr_url": "https://github.com/e3-solutions/codex-plugins/pull/41",
+            "pr_number": 41,
+        },
+        root=repo,
+    )
+
+    decision = linear_sync.pre_tool_guard_decision({"tool_name": "apply_patch"}, root=repo)
+
+    assert decision.blocked is True
+    assert "current branch could not be verified" in decision.message
+
+
 def test_pre_tool_guard_blocks_long_form_branch_creation_without_active_state(tmp_path, monkeypatch):
     monkeypatch.setenv("LINEAR_SYNC_STATE_DIR", str(tmp_path))
 
@@ -337,17 +388,22 @@ def test_pre_tool_guard_allows_read_only_and_kickoff_commands_without_active_sta
 
 
 def test_enqueue_event_carries_active_issue_key(tmp_path, monkeypatch):
-    monkeypatch.setenv("LINEAR_SYNC_STATE_DIR", str(tmp_path))
+    state_dir = tmp_path / "state"
+    monkeypatch.setenv("LINEAR_SYNC_STATE_DIR", str(state_dir))
+    repo = init_git_repo(tmp_path / "repo", branch="arya/cor-38-carry-active-issue")
     linear_sync.write_active_issue(
         {
             "issue_key": "COR-38",
+            "issue_url": "https://linear.app/coreedge/issue/COR-38/carry-active-issue",
             "issue_title": "Carry active issue",
             "branch": "arya/cor-38-carry-active-issue",
+            "pr_url": "https://github.com/e3-solutions/codex-plugins/pull/38",
+            "pr_number": 38,
         },
-        root=tmp_path,
+        root=repo,
     )
 
-    event = linear_sync.enqueue_event("file_change", {"changed_files": ["app.py"]}, root=tmp_path)
+    event = linear_sync.enqueue_event("file_change", {"changed_files": ["app.py"]}, root=repo)
 
     assert event["issue_key"] == "COR-38"
 
@@ -371,6 +427,32 @@ def test_linear_start_dry_run_plan_contains_git_and_gh_commands(tmp_path):
     assert plan["active_state"]["issue_key"] == "COR-39"
     assert plan["active_state"]["team"] == "Engineering"
     assert plan["active_state"]["project"] == "Codex Plugins"
+
+
+def test_linear_start_requires_parseable_pr_url_before_writing_active_state(tmp_path, monkeypatch):
+    monkeypatch.setenv("LINEAR_SYNC_STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setattr(linear_sync, "current_branch", lambda root=None: "arya/cor-42-work")
+    monkeypatch.setattr(
+        linear_sync,
+        "run_git",
+        lambda args, root=None: subprocess.CompletedProcess(args, 0, "", ""),
+    )
+    monkeypatch.setattr(
+        linear_sync,
+        "run_local_command",
+        lambda args, root=None: subprocess.CompletedProcess(args, 0, "Created draft PR", ""),
+    )
+
+    with pytest.raises(RuntimeError, match="pull request URL"):
+        linear_sync.run_linear_start(
+            issue_key="COR-42",
+            issue_title="Require PR URL",
+            issue_url="https://linear.app/coreedge/issue/COR-42/require-pr-url",
+            branch="arya/cor-42-work",
+            root=tmp_path,
+        )
+
+    assert linear_sync.read_active_issue(root=tmp_path) is None
 
 
 def test_repo_identity_normalizes_github_origin(tmp_path):

@@ -258,8 +258,23 @@ def active_issue_context_problem(active: JsonDict, *, root: str | Path | None = 
     if not active_branch:
         return "active Linear issue state missing branch"
     branch = current_branch(root)
-    if active_branch and branch and active_branch != branch:
+    if not branch:
+        return "active Linear issue current branch could not be verified"
+    if active_branch != branch:
         return f"active Linear issue branch {active_branch} does not match current branch {branch}"
+
+    for field in ("issue_title", "issue_url", "pr_url"):
+        value = active.get(field)
+        if not isinstance(value, str) or not value.strip():
+            return f"active Linear issue state missing {field}"
+
+    pr_number = active.get("pr_number")
+    if pr_number is None or str(pr_number).strip() == "":
+        return "active Linear issue state missing pr_number"
+    try:
+        int(pr_number)
+    except (TypeError, ValueError):
+        return "active Linear issue state has invalid pr_number"
 
     return None
 
@@ -648,12 +663,14 @@ def run_linear_start(
     )
     require_success(pr_result, "create draft pull request")
     pr_url = extract_pr_url(pr_result.stdout)
+    if not pr_url:
+        raise RuntimeError("Failed to create draft pull request: gh output did not include a pull request URL")
+    pr_number = extract_pr_number(pr_url)
+    if pr_number is None:
+        raise RuntimeError("Failed to create draft pull request: pull request URL did not include a PR number")
     active_state = dict(plan["active_state"])
-    if pr_url:
-        active_state["pr_url"] = pr_url
-        pr_number = extract_pr_number(pr_url)
-        if pr_number is not None:
-            active_state["pr_number"] = pr_number
+    active_state["pr_url"] = pr_url
+    active_state["pr_number"] = pr_number
     active = write_active_issue(active_state, root=root)
     return {**plan, "active_state": active, "pr_url": pr_url}
 
