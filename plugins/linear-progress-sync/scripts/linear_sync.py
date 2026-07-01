@@ -150,6 +150,31 @@ def read_active_issue(*, root: str | Path | None = None) -> JsonDict | None:
     return data
 
 
+def read_current_active_issue(*, root: str | Path | None = None) -> JsonDict | None:
+    active = read_active_issue(root=root)
+    if not active or active_issue_context_problem(active, root=root):
+        return None
+    return active
+
+
+def active_issue_context_problem(active: JsonDict, *, root: str | Path | None = None) -> str | None:
+    active_repo = str(active.get("repo") or "").strip()
+    current_repo = str(repo_root(root))
+    if active_repo and normalize_path(active_repo) != normalize_path(current_repo):
+        return f"active Linear issue repo {active_repo} does not match current repo {current_repo}"
+
+    active_branch = str(active.get("branch") or "").strip()
+    branch = current_branch(root)
+    if active_branch and branch and active_branch != branch:
+        return f"active Linear issue branch {active_branch} does not match current branch {branch}"
+
+    return None
+
+
+def normalize_path(path: str) -> str:
+    return str(Path(path).expanduser().resolve())
+
+
 def write_active_issue(payload: JsonDict, *, root: str | Path | None = None) -> JsonDict:
     issue_key = payload.get("issue_key") or payload.get("issue_identifier") or payload.get("identifier")
     if not isinstance(issue_key, str) or not issue_key.strip():
@@ -187,7 +212,7 @@ def enqueue_event(event_type: str, payload: JsonDict | None = None, *, root: str
     event.setdefault("created_at", now_iso())
     event.setdefault("repo", str(repo_root(root)))
     event.setdefault("branch", current_branch(root))
-    active = read_active_issue(root=root)
+    active = read_current_active_issue(root=root)
     if active:
         event.setdefault("issue_key", active["issue_key"])
         if active.get("pr_url"):
@@ -322,7 +347,11 @@ def git_author(*, root: str | Path | None = None) -> str | None:
 
 def infer_issue(event: JsonDict, state: JsonDict | None = None, *, root: str | Path | None = None) -> IssueInference:
     local_state = state or read_state(root)
-    active = read_active_issue(root=root)
+    explicit_key = first_issue_key(str(event.get("issue_key") or ""))
+    if explicit_key:
+        return with_cached_status(IssueInference(explicit_key, 1.0, "explicit event issue key"), local_state)
+
+    active = read_current_active_issue(root=root)
     if active:
         return IssueInference(
             active["issue_key"],
@@ -330,10 +359,6 @@ def infer_issue(event: JsonDict, state: JsonDict | None = None, *, root: str | P
             "active Linear issue state",
             status=str(active.get("issue_status") or active.get("status") or "") or None,
         )
-
-    explicit_key = first_issue_key(str(event.get("issue_key") or ""))
-    if explicit_key:
-        return with_cached_status(IssueInference(explicit_key, 1.0, "explicit event issue key"), local_state)
 
     branch = str(event.get("branch") or current_branch(root) or "")
     key = first_issue_key(branch)
@@ -1112,27 +1137,32 @@ def read_stdin_json() -> JsonDict:
 
 
 def pre_tool_guard_decision(payload: JsonDict, *, root: str | Path | None = None) -> PreToolGuardDecision:
-    if read_active_issue(root=root):
-        return PreToolGuardDecision(False)
-
     tool = tool_name(payload)
     normalized_tool = tool.lower()
-    if normalized_tool in {"apply_patch", "edit", "write"}:
-        return PreToolGuardDecision(True, linear_kickoff_required_message())
-
+    requires_active_state = normalized_tool in {"apply_patch", "edit", "write"}
     if normalized_tool == "bash":
         command = tool_command(payload)
         if is_linear_start_command(command):
             return PreToolGuardDecision(False)
         if looks_like_branch_creation(command):
-            return PreToolGuardDecision(True, linear_kickoff_required_message())
+            requires_active_state = True
+
+    if requires_active_state:
+        active = read_active_issue(root=root)
+        if active:
+            problem = active_issue_context_problem(active, root=root)
+            if problem:
+                return PreToolGuardDecision(True, linear_kickoff_required_message(problem))
+            return PreToolGuardDecision(False)
+        return PreToolGuardDecision(True, linear_kickoff_required_message())
 
     return PreToolGuardDecision(False)
 
 
-def linear_kickoff_required_message() -> str:
+def linear_kickoff_required_message(reason: str | None = None) -> str:
+    prefix = f"{reason}. " if reason else ""
     return (
-        "Linear kickoff is required before writing code or creating branches. "
+        f"{prefix}Linear kickoff is required before writing code or creating branches. "
         "Run the automatic Linear kickoff workflow first: confirm or create the Linear issue, "
         "create the Linear-named branch, push the empty kickoff commit, open the draft PR, "
         "link Linear and GitHub, then retry this tool call."
@@ -1223,13 +1253,83 @@ def looks_like_git_commit(command: str) -> bool:
 def looks_like_branch_creation(command: str) -> bool:
     if not command:
         return False
-    patterns = (
-        r"(^|[;&|]\s*)git\s+switch\s+(?:[^\n;&|]*\s)?-(?:[^\n;&|]*c|c[^\n;&|]*)(\s|$)",
-        r"(^|[;&|]\s*)git\s+checkout\s+(?:[^\n;&|]*\s)?-(?:[^\n;&|]*b|b[^\n;&|]*)(\s|$)",
-        r"(^|[;&|]\s*)git\s+branch\s+(?!-)(\S+)",
-        r"(^|[;&|]\s*)git\s+worktree\s+add\b[^\n;&|]*\s-b\s+",
-    )
-    return any(re.search(pattern, command, re.IGNORECASE) for pattern in patterns)
+    return any(git_tokens_create_branch(tokens) for tokens in shell_command_tokens(command))
+
+
+def shell_command_tokens(command: str) -> list[list[str]]:
+    tokens: list[list[str]] = []
+    for segment in re.split(r"\s*(?:&&|\|\||;|\|)\s*", command):
+        if not segment.strip():
+            continue
+        try:
+            parsed = shlex.split(segment)
+        except ValueError:
+            continue
+        if parsed:
+            tokens.append(parsed)
+    return tokens
+
+
+def git_tokens_create_branch(tokens: list[str]) -> bool:
+    try:
+        git_index = tokens.index("git")
+    except ValueError:
+        return False
+    args = skip_git_global_options(tokens[git_index + 1 :])
+    if not args:
+        return False
+    command = args[0]
+    rest = args[1:]
+
+    if command == "switch":
+        return has_long_option(rest, {"--create", "--force-create"}) or has_short_option(rest, {"c", "C"})
+    if command == "checkout":
+        return has_long_option(rest, {"--branch", "--orphan"}) or has_short_option(rest, {"b", "B"})
+    if command == "branch":
+        if has_long_option(rest, {"--copy", "--force-copy"}) or has_short_option(rest, {"c", "C"}):
+            return True
+        return bool(rest and not rest[0].startswith("-"))
+    if command == "worktree" and rest and rest[0] == "add":
+        add_args = rest[1:]
+        return has_long_option(add_args, {"--branch"}) or has_short_option(add_args, {"b", "B"})
+
+    return False
+
+
+def skip_git_global_options(args: list[str]) -> list[str]:
+    index = 0
+    value_options = {"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--config-env"}
+    while index < len(args):
+        arg = args[index]
+        if arg == "--":
+            index += 1
+            break
+        if arg in value_options:
+            index += 2
+            continue
+        if any(arg.startswith(f"{option}=") for option in value_options if option.startswith("--")):
+            index += 1
+            continue
+        if arg.startswith("-"):
+            index += 1
+            continue
+        break
+    return args[index:]
+
+
+def has_long_option(args: list[str], options: set[str]) -> bool:
+    return any(arg == option or arg.startswith(f"{option}=") for arg in args for option in options)
+
+
+def has_short_option(args: list[str], letters: set[str]) -> bool:
+    for arg in args:
+        if arg == "--":
+            return False
+        if arg.startswith("--"):
+            continue
+        if arg.startswith("-") and any(letter in arg[1:] for letter in letters):
+            return True
+    return False
 
 
 def is_linear_start_command(command: str) -> bool:

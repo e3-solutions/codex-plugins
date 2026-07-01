@@ -62,12 +62,23 @@ def run_step(command: str) -> dict:
     print(f"Running: {command}", file=sys.stderr)
     completed = subprocess.run(argv, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
     output = "\n".join(part for part in (completed.stdout.strip(), completed.stderr.strip()) if part)
-    normalized_output = output.lower()
-    if completed.returncode == 0 or any(word in normalized_output for word in ("already", "exists", "configured")):
+    if completed.returncode == 0 or is_idempotent_setup_success(argv, output):
         return {"command": command, "ok": True, "message": output}
     if argv[:3] == ["gh", "auth", "status"]:
         output = f"{output}\nRun: gh auth login".strip()
     return {"command": command, "ok": False, "message": output or str(completed.returncode)}
+
+
+def is_idempotent_setup_success(argv: list[str], output: str) -> bool:
+    idempotent_prefixes = (
+        ["codex", "plugin", "marketplace", "add"],
+        ["codex", "plugin", "add"],
+        ["codex", "mcp", "add"],
+    )
+    if not any(argv[: len(prefix)] == prefix for prefix in idempotent_prefixes):
+        return False
+    normalized_output = output.lower()
+    return any(phrase in normalized_output for phrase in ("already", "exists", "configured"))
 
 
 def missing_executable_message(executable: str) -> str:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -13,6 +14,22 @@ linear_sync = importlib.util.module_from_spec(spec)
 assert spec.loader is not None
 sys.modules[spec.name] = linear_sync
 spec.loader.exec_module(linear_sync)
+
+SETUP_PATH = ROOT / "plugins" / "linear-progress-sync" / "scripts" / "setup.py"
+setup_spec = importlib.util.spec_from_file_location("linear_setup", SETUP_PATH)
+linear_setup = importlib.util.module_from_spec(setup_spec)
+assert setup_spec.loader is not None
+setup_spec.loader.exec_module(linear_setup)
+
+
+def init_git_repo(path: Path, branch: str = "arya/cor-1-work") -> Path:
+    path.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=path, check=True)
+    subprocess.run(["git", "config", "user.email", "codex@example.test"], cwd=path, check=True)
+    subprocess.run(["git", "config", "user.name", "Codex Test"], cwd=path, check=True)
+    subprocess.run(["git", "commit", "--allow-empty", "-m", "init"], cwd=path, check=True)
+    subprocess.run(["git", "switch", "-q", "-c", branch], cwd=path, check=True)
+    return path
 
 
 def test_terminal_statuses_are_never_changed(tmp_path, monkeypatch):
@@ -133,6 +150,60 @@ def test_active_linear_issue_wins_over_branch_and_commit_inference(tmp_path, mon
     assert inference.reason == "active Linear issue state"
 
 
+def test_explicit_event_issue_key_wins_over_active_state(tmp_path, monkeypatch):
+    monkeypatch.setenv("LINEAR_SYNC_STATE_DIR", str(tmp_path))
+    linear_sync.write_active_issue(
+        {
+            "issue_key": "COR-33",
+            "issue_url": "https://linear.app/coreedge/issue/COR-33/test",
+            "issue_title": "Active issue",
+            "branch": "arya/cor-33-active-issue",
+        },
+        root=tmp_path,
+    )
+
+    inference = linear_sync.infer_issue(
+        {
+            "issue_key": "COR-99",
+            "branch": "arya/cor-33-active-issue",
+            "commit_subject": "COR-33 active issue",
+        },
+        root=tmp_path,
+    )
+
+    assert inference.issue_key == "COR-99"
+    assert inference.confidence == 1.0
+    assert inference.reason == "explicit event issue key"
+
+
+def test_active_state_branch_mismatch_blocks_writes_and_does_not_infer_active(tmp_path, monkeypatch):
+    state_dir = tmp_path / "state"
+    monkeypatch.setenv("LINEAR_SYNC_STATE_DIR", str(state_dir))
+    repo = init_git_repo(tmp_path / "repo", branch="arya/cor-99-new-work")
+    linear_sync.write_active_issue(
+        {
+            "issue_key": "COR-33",
+            "issue_title": "Old work",
+            "branch": "arya/cor-33-old-work",
+        },
+        root=repo,
+    )
+
+    decision = linear_sync.pre_tool_guard_decision({"tool_name": "apply_patch"}, root=repo)
+    inference = linear_sync.infer_issue(
+        {
+            "branch": "arya/cor-99-new-work",
+            "commit_subject": "Continue new work",
+        },
+        root=repo,
+    )
+
+    assert decision.blocked is True
+    assert "does not match current branch" in decision.message
+    assert inference.issue_key == "COR-99"
+    assert inference.reason == "issue key found in branch name"
+
+
 def test_active_linear_issue_state_round_trips_and_malformed_fails_closed(tmp_path, monkeypatch):
     monkeypatch.setenv("LINEAR_SYNC_STATE_DIR", str(tmp_path))
     payload = {
@@ -194,6 +265,23 @@ def test_pre_tool_guard_blocks_writes_and_branch_creation_without_active_state(t
     assert write_decision.blocked is True
     assert branch_decision.blocked is True
     assert "Linear kickoff" in write_decision.message
+
+
+def test_pre_tool_guard_blocks_long_form_branch_creation_without_active_state(tmp_path, monkeypatch):
+    monkeypatch.setenv("LINEAR_SYNC_STATE_DIR", str(tmp_path))
+
+    commands = [
+        "git switch --create arya/new-work",
+        "git checkout --branch arya/new-work",
+        "git checkout -B arya/new-work",
+    ]
+
+    for command in commands:
+        decision = linear_sync.pre_tool_guard_decision(
+            {"tool_name": "Bash", "command": command},
+            root=tmp_path,
+        )
+        assert decision.blocked is True, command
 
 
 def test_pre_tool_guard_allows_read_only_and_kickoff_commands_without_active_state(tmp_path, monkeypatch):
@@ -275,6 +363,21 @@ def test_setup_script_exists_and_exposes_dry_run():
     text = script.read_text(encoding="utf-8")
     assert "--dry-run" in text
     assert "--with-git-hook" in text
+
+
+def test_setup_run_step_does_not_treat_auth_failure_as_idempotent_success(monkeypatch):
+    class Completed:
+        returncode = 1
+        stdout = ""
+        stderr = "not configured already; run gh auth login"
+
+    monkeypatch.setattr(linear_setup.shutil, "which", lambda executable: f"/usr/bin/{executable}")
+    monkeypatch.setattr(linear_setup.subprocess, "run", lambda *args, **kwargs: Completed())
+
+    result = linear_setup.run_step("gh auth status")
+
+    assert result["ok"] is False
+    assert "gh auth login" in result["message"]
 
 
 def test_session_progress_throttling_works(tmp_path, monkeypatch):
