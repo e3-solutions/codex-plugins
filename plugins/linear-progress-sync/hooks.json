@@ -5,7 +5,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 ./scripts/session_start.py"
+            "command": "sh -c 'script=$(ls -td \"$HOME\"/.codex/plugins/cache/*/linear-progress-sync/*/scripts/session_start.py 2>/dev/null | head -n 1); [ -n \"$script\" ] && exec python3 \"$script\" || exit 0'"
           }
         ]
       }
@@ -16,7 +16,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 ./scripts/post_tool_use.py"
+            "command": "sh -c 'script=$(ls -td \"$HOME\"/.codex/plugins/cache/*/linear-progress-sync/*/scripts/post_tool_use.py 2>/dev/null | head -n 1); [ -n \"$script\" ] && exec python3 \"$script\" || exit 0'"
           }
         ]
       },
@@ -25,7 +25,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 ./scripts/post_tool_use.py"
+            "command": "sh -c 'script=$(ls -td \"$HOME\"/.codex/plugins/cache/*/linear-progress-sync/*/scripts/post_tool_use.py 2>/dev/null | head -n 1); [ -n \"$script\" ] && exec python3 \"$script\" || exit 0'"
           }
         ]
       }
@@ -35,7 +35,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 ./scripts/stop_progress.py"
+            "command": "sh -c 'script=$(ls -td \"$HOME\"/.codex/plugins/cache/*/linear-progress-sync/*/scripts/stop_progress.py 2>/dev/null | head -n 1); [ -n \"$script\" ] && exec python3 \"$script\" || exit 0'"
           }
         ]
       }

@@ -157,3 +157,13 @@ def test_worker_failure_does_not_lose_queued_event(tmp_path, monkeypatch):
     result = linear_sync.drain_once(root=tmp_path, executor=failing_executor)
     assert result["failed"] == 1
     assert list((tmp_path / "events").glob("*.json"))
+
+
+def test_plugin_hooks_do_not_use_repo_relative_script_paths():
+    for rel in (
+        "plugins/linear-progress-sync/hooks.json",
+        "plugins/linear-progress-sync/hooks/hooks.json",
+    ):
+        text = (ROOT / rel).read_text()
+        assert "./scripts/" not in text
+        assert ".codex/plugins/cache" in text
