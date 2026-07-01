@@ -16,12 +16,12 @@ Process queued Linear progress sync events in the foreground with visible Linear
    ```
 
 2. For each `eligible` event returned:
-   - Use `mcp__linear.get_issue` for `issue_key`.
+   - Use `mcp__codex_apps__linear._fetch` for `issue_key`.
    - If the issue is terminal (`Done`, `Completed`, `Closed`, `Canceled`, or equivalent), do not modify Linear. Run the event's `skip_command` with a terminal-state reason.
-   - Use `mcp__linear.list_comments` and check whether the exact commit SHA, short SHA, or event ID is already present.
+   - Use `mcp__codex_apps__linear._list_comments` and check whether the exact commit SHA, short SHA, or event ID is already present.
    - If a matching comment already exists, run the event's `ack_command` and do not add a duplicate comment.
-   - Otherwise call `mcp__linear.save_comment` with the provided `comment_body`.
-   - Read comments back with `mcp__linear.list_comments`.
+   - Otherwise call `mcp__codex_apps__linear._save_comment` with the provided `comment_body`.
+   - Read comments back with `mcp__codex_apps__linear._list_comments`.
    - Run the event's `ack_command` only after the new comment is visible.
 
 3. If Linear write approval is denied, MCP tools are unavailable, or read-back does not show the comment, leave the event queued and explain the failure.

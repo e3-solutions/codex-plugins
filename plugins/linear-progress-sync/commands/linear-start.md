@@ -16,7 +16,7 @@ Start Linear-linked implementation work before any code edits.
 
 1. Resolve this repo's Linear destination.
    - Run `python3 <plugin-root>/scripts/linear_start.py repo-binding --root <root>`.
-   - If no binding exists and this command is not using an existing `issue`, list Linear teams/projects with the connected Linear app tools and ask the user once which team/project this repo should use.
+   - If no binding exists and this command is not using an existing `issue`, call `mcp__codex_apps__linear._list_teams` and `mcp__codex_apps__linear._list_projects`, then ask the user once which team/project this repo should use.
    - Save the answer with:
 
      ```bash
@@ -29,9 +29,9 @@ Start Linear-linked implementation work before any code edits.
    - Future kickoff in this repo uses the saved binding automatically.
 
 2. Resolve the Linear issue.
-   - If `issue` is present, read it with the connected Linear app issue lookup tool.
-   - Otherwise create the issue with the connected Linear app issue save/create tool using `team`, `project`, `title`, and `assignee: "me"` when appropriate.
-   - Read the issue back after create/update so the branch name, URL, title, team, and project are confirmed.
+   - If `issue` is present, read it with `mcp__codex_apps__linear._fetch` using the known issue identifier.
+   - Otherwise create the issue with `mcp__codex_apps__linear._save_issue` using `team`, `project`, `title`, and `assignee: "me"` when appropriate.
+   - Read the issue back with `mcp__codex_apps__linear._fetch` after create/update so the branch name, URL, title, team, and project are confirmed.
 
 3. Choose the branch name.
    - Use the Linear issue's returned git branch name when present.
@@ -52,8 +52,8 @@ Start Linear-linked implementation work before any code edits.
 
 5. Link Linear back to GitHub.
    - Read the helper JSON output.
-   - Use the connected Linear app issue save/update tool to attach the PR link when `pr_url` is present.
-   - Use the connected Linear app comment tool to add the branch, draft PR URL, and kickoff commit summary.
+   - Use `mcp__codex_apps__linear._save_issue` to attach the PR link when `pr_url` is present.
+   - Use `mcp__codex_apps__linear._save_comment` to add the branch, draft PR URL, and kickoff commit summary.
    - Move to `In Progress` only if the state exists and is non-terminal.
 
 ## Safety Rules

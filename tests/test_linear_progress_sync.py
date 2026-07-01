@@ -380,7 +380,7 @@ def test_setup_plan_is_global_by_default_and_does_not_install_repo_hook(tmp_path
     assert "codex plugin marketplace add" in commands
     assert "codex plugin add linear-progress-sync@coreedge-local" in commands
     assert "codex mcp add linear --url https://mcp.linear.app/mcp" in commands
-    assert "codex mcp login linear" in commands
+    assert "codex mcp login linear" not in commands
     assert "install_git_hook.py" not in commands
     assert plan["per_repo_setup_required"] is False
 
@@ -483,10 +483,20 @@ def test_plugin_exposes_linear_start_command_and_pre_tool_guard_hook():
     command = ROOT / "plugins/linear-progress-sync/commands/linear-start.md"
     assert command.exists()
     command_text = command.read_text(encoding="utf-8")
+    sync_command_text = (ROOT / "plugins/linear-progress-sync/commands/sync-linear-progress.md").read_text(
+        encoding="utf-8"
+    )
     assert "linear_start.py" in command_text
     assert "repo-binding" in command_text
     assert "configure-repo" in command_text
     assert "mcp__linear." not in command_text
+    assert "mcp__linear." not in sync_command_text
+    assert "mcp__codex_apps__linear._list_teams" in command_text
+    assert "mcp__codex_apps__linear._list_projects" in command_text
+    assert "mcp__codex_apps__linear._save_issue" in command_text
+    assert "mcp__codex_apps__linear._fetch" in command_text
+    assert "mcp__codex_apps__linear._save_comment" in command_text
+    assert "mcp__codex_apps__linear._list_comments" in sync_command_text
     for rel in (
         "plugins/linear-progress-sync/hooks.json",
         "plugins/linear-progress-sync/hooks/hooks.json",

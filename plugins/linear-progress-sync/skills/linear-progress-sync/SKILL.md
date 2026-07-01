@@ -18,11 +18,11 @@ Before writing code, creating a branch, or opening implementation changes, check
 If it is missing, run the Linear kickoff workflow before editing:
 
 1. Run `scripts/linear_start.py repo-binding --root <root>`.
-2. If this repo has no saved team/project and no existing issue was provided, ask the user once which Linear team/project the repo should use, then save it with `scripts/linear_start.py configure-repo`.
-3. Use the existing Linear MCP/app connection to get or create the Linear issue in the saved team/project.
-4. Read the issue back and use Linear's generated git branch name when present.
+2. If this repo has no saved team/project and no existing issue was provided, call `mcp__codex_apps__linear._list_teams` and `mcp__codex_apps__linear._list_projects`, ask the user once which Linear team/project the repo should use, then save it with `scripts/linear_start.py configure-repo`.
+3. Use `mcp__codex_apps__linear._save_issue` to create the issue in the saved team/project, or `mcp__codex_apps__linear._fetch` to read an existing issue.
+4. Read the issue back with `mcp__codex_apps__linear._fetch` and use Linear's generated git branch name when present.
 5. Run `/linear-start` or `scripts/linear_start.py kickoff` to create/switch the branch, push an empty kickoff commit, create a draft PR, and write active state.
-6. Add the PR link/comment back to Linear through Linear MCP/app tools.
+6. Add the PR link/comment back to Linear with `mcp__codex_apps__linear._save_issue` and `mcp__codex_apps__linear._save_comment`.
 
 The human should not need to remember `/linear-start`; use it as the explicit/manual entrypoint when active state is missing.
 
@@ -44,6 +44,13 @@ Set up the plugin, GitHub CLI check, and Linear MCP once:
 
 ```bash
 python3 plugins/linear-progress-sync/scripts/setup.py
+```
+
+Authenticate GitHub and Linear manually when needed:
+
+```bash
+gh auth login
+codex mcp login linear
 ```
 
 Inspect or save the Linear team/project binding for a repo:

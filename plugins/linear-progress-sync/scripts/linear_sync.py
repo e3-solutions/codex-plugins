@@ -585,7 +585,6 @@ def setup_plan(
         shlex.join(["codex", "plugin", "marketplace", "add", str(plugin_root)]),
         shlex.join(["codex", "plugin", "add", "linear-progress-sync@coreedge-local"]),
         shlex.join(["codex", "mcp", "add", "linear", "--url", LINEAR_MCP_URL]),
-        shlex.join(["codex", "mcp", "login", "linear"]),
     ]
     if with_git_hook:
         hook_script = plugin_root / "plugins" / "linear-progress-sync" / "scripts" / "install_git_hook.py"
@@ -597,7 +596,8 @@ def setup_plan(
         "per_repo_setup_required": False,
         "optional_git_hook": with_git_hook,
         "notes": [
-            "Default setup is user-level: plugin marketplace, plugin install, GitHub auth check, and Linear MCP auth.",
+            "Default setup is user-level: plugin marketplace, plugin install, GitHub auth check, and Linear MCP registration.",
+            "GitHub and Linear auth are manual prerequisites: run gh auth login and codex mcp login linear when needed.",
             "Per-repo Git hook setup is optional and only needed to sync commits made outside Codex.",
             "Start a new Codex thread after installing or updating the plugin so hooks and skills reload.",
         ],

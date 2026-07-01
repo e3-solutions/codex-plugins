@@ -12,15 +12,14 @@ cd codex-plugins
 python3 plugins/linear-progress-sync/scripts/setup.py
 ```
 
-Then restart Codex or start a new Codex thread.
-
-If GitHub CLI or Linear is not logged in, the setup script will stop on the auth step and tell you what to run. After auth, rerun setup.
+Make sure GitHub CLI and Linear are authenticated:
 
 ```bash
 gh auth login
 codex mcp login linear
-python3 plugins/linear-progress-sync/scripts/setup.py
 ```
+
+Then restart Codex or start a new Codex thread.
 
 Preview setup without changing Codex config:
 
@@ -34,7 +33,6 @@ python3 plugins/linear-progress-sync/scripts/setup.py --dry-run
 - adds this repo as a Codex plugin marketplace
 - installs `linear-progress-sync@coreedge-local`
 - configures Linear MCP with `codex mcp add linear --url https://mcp.linear.app/mcp`
-- starts Linear auth with `codex mcp login linear`
 
 This is user-level setup. You do not need to install anything separately in every repo for normal Codex work.
 
