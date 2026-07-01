@@ -195,3 +195,61 @@ def test_codex_prompt_requires_success_sentinel():
     prompt = linear_sync.build_codex_prompt(event, inference)
     assert "LINEAR_SYNC_OK COR-9" in prompt
     assert "do not print LINEAR_SYNC_OK" in prompt
+
+
+def test_foreground_prepare_returns_eligible_event_without_mutation(tmp_path, monkeypatch):
+    monkeypatch.setenv("LINEAR_SYNC_STATE_DIR", str(tmp_path))
+    linear_sync.enqueue_event(
+        "post_commit",
+        {
+            "id": "evt-fg",
+            "branch": "nitish/cor-10-work",
+            "commit_sha": "fg123",
+            "short_sha": "fg123",
+            "commit_subject": "COR-10 foreground sync",
+            "changed_files": ["app.py"],
+        },
+        root=tmp_path,
+    )
+    plan = linear_sync.foreground_sync_plan(root=tmp_path)
+    state = linear_sync.read_state(tmp_path)
+    assert plan["eligible"][0]["issue_key"] == "COR-10"
+    assert "Codex progress update" in plan["eligible"][0]["comment_body"]
+    assert "foreground_sync.py ack" in plan["eligible"][0]["ack_command"]
+    assert "evt-fg" not in state["processed_event_ids"]
+    assert list((tmp_path / "events").glob("*.json"))
+
+
+def test_foreground_ack_marks_synced_and_removes_event(tmp_path, monkeypatch):
+    monkeypatch.setenv("LINEAR_SYNC_STATE_DIR", str(tmp_path))
+    linear_sync.enqueue_event(
+        "post_commit",
+        {
+            "id": "evt-ack",
+            "branch": "nitish/cor-11-work",
+            "commit_sha": "ack123",
+            "commit_subject": "COR-11 foreground ack",
+        },
+        root=tmp_path,
+    )
+    result = linear_sync.ack_foreground_event("evt-ack", "COR-11", root=tmp_path)
+    state = linear_sync.read_state(tmp_path)
+    assert result["ok"] is True
+    assert "evt-ack" in state["processed_event_ids"]
+    assert "ack123" in state["synced_commit_shas"]
+    assert not list((tmp_path / "events").glob("*.json"))
+
+
+def test_foreground_skip_logs_noop_and_removes_event(tmp_path, monkeypatch):
+    monkeypatch.setenv("LINEAR_SYNC_STATE_DIR", str(tmp_path))
+    linear_sync.enqueue_event(
+        "post_commit",
+        {"id": "evt-skip", "branch": "nitish/cor-12-work", "commit_sha": "skip123"},
+        root=tmp_path,
+    )
+    result = linear_sync.skip_foreground_event("evt-skip", reason="terminal issue", issue_key="COR-12", root=tmp_path)
+    state = linear_sync.read_state(tmp_path)
+    assert result["ok"] is True
+    assert state["local_noops"][-1]["reason"] == "terminal issue"
+    assert "evt-skip" in state["processed_event_ids"]
+    assert not list((tmp_path / "events").glob("*.json"))

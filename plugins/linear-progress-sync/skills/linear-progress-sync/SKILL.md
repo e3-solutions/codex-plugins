@@ -37,6 +37,19 @@ Run the daily safety sweep:
 python3 plugins/linear-progress-sync/scripts/daily_sweep.py
 ```
 
+
+Prepare foreground sync events:
+
+```bash
+python3 plugins/linear-progress-sync/scripts/foreground_sync.py prepare --root /path/to/repo
+```
+
+Acknowledge only after the Linear comment is visibly confirmed:
+
+```bash
+python3 plugins/linear-progress-sync/scripts/foreground_sync.py ack --root /path/to/repo --event-id <id> --issue-key <KEY>
+```
+
 Inspect local state:
 
 ```bash

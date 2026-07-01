@@ -509,6 +509,203 @@ def safe_unlink(path: Path) -> None:
         pass
 
 
+
+def build_linear_comment(event: JsonDict) -> str:
+    if event.get("type") == "session_progress":
+        summary = str(event.get("summary") or "Codex made meaningful local progress.")
+        current_state = str(event.get("diff_stat") or "Local files changed; inspect repo diff for details.")
+        return "\n".join(
+            [
+                "Codex session progress update",
+                "",
+                "Summary:",
+                f"- {summary}",
+                "",
+                "Current state:",
+                f"- {current_state}",
+            ]
+        )
+
+    short_sha = str(event.get("short_sha") or str(event.get("commit_sha") or "")[:7] or "unknown")
+    subject = str(event.get("commit_subject") or "Commit progress")
+    changed = [str(path) for path in event.get("changed_files") or [] if str(path).strip()]
+    changed_lines = changed[:8] or ["No changed-file list captured for this event"]
+    return "\n".join(
+        [
+            "Codex progress update",
+            "",
+            f"Commit: `{short_sha}` — {subject}",
+            "",
+            "Summary:",
+            f"- {subject}",
+            "",
+            "Changed areas:",
+            *[f"- {path}" for path in changed_lines],
+            "",
+            "Status:",
+            "- Work appears to be in progress.",
+        ]
+    )
+
+
+def foreground_sync_plan(
+    *,
+    root: str | Path | None = None,
+    limit: int = 5,
+    now: datetime | None = None,
+) -> JsonDict:
+    local_state = read_state(root)
+    eligible: list[JsonDict] = []
+    held: list[JsonDict] = []
+    skipped: list[JsonDict] = []
+    for path, event in load_events(root):
+        event_id = str(event.get("id") or path.stem)
+        inference = infer_issue(event, local_state, root=root)
+        item = {
+            "event_id": event_id,
+            "event_type": event.get("type"),
+            "event": event,
+            "inference": inference.__dict__,
+        }
+        if event_id in set(local_state.get("processed_event_ids") or []):
+            skipped.append({**item, "reason": "already processed locally"})
+            continue
+        if inference.confidence < 0.5 or not inference.issue_key:
+            skipped.append({**item, "reason": "issue inference confidence below 0.5"})
+            continue
+        if inference.confidence < 0.8:
+            held.append({**item, "reason": "issue inference confidence below Linear write threshold"})
+            continue
+        if is_terminal_status(inference.status):
+            skipped.append({**item, "reason": f"cached issue status is terminal: {inference.status}"})
+            continue
+        if event.get("type") == "session_progress" and should_throttle_session_progress(
+            local_state,
+            inference.issue_key,
+            now=now,
+        ):
+            skipped.append({**item, "reason": "session progress throttled"})
+            continue
+        commit_sha = str(event.get("commit_sha") or "")
+        if event.get("type") == "post_commit" and already_synced_commit(local_state, commit_sha, inference.issue_key):
+            skipped.append({**item, "reason": "duplicate commit/issue update already synced locally"})
+            continue
+        eligible.append(
+            {
+                **item,
+                "issue_key": inference.issue_key,
+                "comment_body": build_linear_comment(event),
+                "ack_command": foreground_ack_command(event, inference, root=root),
+                "skip_command": foreground_skip_command(event_id, inference.issue_key, root=root),
+            }
+        )
+        if len(eligible) >= limit:
+            break
+    return {
+        "repo": str(repo_root(root)),
+        "eligible": eligible,
+        "held": held,
+        "skipped": skipped,
+        "instructions": [
+            "For each eligible event, read the Linear issue and existing comments first.",
+            "Never modify terminal Linear issues.",
+            "If a matching comment already exists, run the ack command without adding a duplicate comment.",
+            "After creating a comment, read comments back and run the ack command only when the comment is visible.",
+            "If Linear write is denied or uncertain, leave the event queued.",
+        ],
+    }
+
+
+def foreground_ack_command(event: JsonDict, inference: IssueInference, *, root: str | Path | None = None) -> str:
+    script = Path(__file__).with_name("foreground_sync.py")
+    parts = [
+        sys.executable,
+        str(script),
+        "ack",
+        "--root",
+        str(repo_root(root)),
+        "--event-id",
+        str(event.get("id") or ""),
+        "--issue-key",
+        str(inference.issue_key or ""),
+    ]
+    if event.get("commit_sha"):
+        parts.extend(["--commit-sha", str(event.get("commit_sha"))])
+    return " ".join(shlex.quote(part) for part in parts)
+
+
+def foreground_skip_command(event_id: str, issue_key: str | None, *, root: str | Path | None = None) -> str:
+    script = Path(__file__).with_name("foreground_sync.py")
+    parts = [
+        sys.executable,
+        str(script),
+        "skip",
+        "--root",
+        str(repo_root(root)),
+        "--event-id",
+        event_id,
+        "--reason",
+        "foreground sync skipped",
+    ]
+    if issue_key:
+        parts.extend(["--issue-key", issue_key])
+    return " ".join(shlex.quote(part) for part in parts)
+
+
+def ack_foreground_event(
+    event_id: str,
+    issue_key: str,
+    *,
+    commit_sha: str | None = None,
+    root: str | Path | None = None,
+    now: datetime | None = None,
+) -> JsonDict:
+    local_state = read_state(root)
+    matched_path: Path | None = None
+    matched_event: JsonDict | None = None
+    for path, event in load_events(root):
+        if str(event.get("id") or path.stem) == event_id:
+            matched_path = path
+            matched_event = event
+            break
+    if matched_event is None or matched_path is None:
+        return {"ok": False, "event_id": event_id, "reason": "event not found"}
+    mark_processed(local_state, event_id)
+    if matched_event.get("type") == "post_commit":
+        mark_commit_synced(local_state, commit_sha or matched_event.get("commit_sha"), issue_key)
+    if matched_event.get("type") == "session_progress":
+        mark_session_progress(local_state, issue_key, now=now)
+    local_state.setdefault("failures", {}).pop(event_id, None)
+    safe_unlink(matched_path)
+    save_state(local_state, root)
+    return {"ok": True, "event_id": event_id, "issue_key": issue_key, "action": "acked"}
+
+
+def skip_foreground_event(
+    event_id: str,
+    *,
+    reason: str,
+    issue_key: str | None = None,
+    root: str | Path | None = None,
+) -> JsonDict:
+    local_state = read_state(root)
+    matched_path: Path | None = None
+    matched_event: JsonDict | None = None
+    for path, event in load_events(root):
+        if str(event.get("id") or path.stem) == event_id:
+            matched_path = path
+            matched_event = event
+            break
+    if matched_event is None or matched_path is None:
+        return {"ok": False, "event_id": event_id, "reason": "event not found"}
+    inference = IssueInference(issue_key, 1.0 if issue_key else 0.0, "foreground skip")
+    log_noop(local_state, matched_event, reason, inference)
+    mark_processed(local_state, event_id)
+    local_state.setdefault("failures", {}).pop(event_id, None)
+    safe_unlink(matched_path)
+    save_state(local_state, root)
+    return {"ok": True, "event_id": event_id, "issue_key": issue_key, "action": "skipped", "reason": reason}
+
 def build_codex_prompt(event: JsonDict, inference: IssueInference) -> str:
     event_json = json.dumps(event, indent=2, sort_keys=True)
     if event.get("type") == "session_progress":

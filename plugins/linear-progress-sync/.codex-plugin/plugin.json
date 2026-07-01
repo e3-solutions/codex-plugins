@@ -1,6 +1,6 @@
 {
   "name": "linear-progress-sync",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "Safely sync Codex and Git development progress into Linear comments.",
   "author": {
     "name": "Core Edge Solution"

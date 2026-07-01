@@ -48,6 +48,25 @@ python3 plugins/linear-progress-sync/scripts/install_git_hook.py
 
 If an existing `.git/hooks/post-commit` hook exists, the installer backs it up before writing the Linear sync hook. Use `--force` only if you intentionally want to replace the existing hook without a backup.
 
+
+## Foreground Sync Command
+
+If background sync cannot complete Linear writes because MCP approval is hidden or cancelled, process queued events in the active Codex thread:
+
+```text
+/sync-linear-progress root=/path/to/target-repo
+```
+
+The command prepares eligible queued events, asks Codex to use visible Linear MCP calls, and only acknowledges a queued event after the Linear comment is visible on read-back.
+
+You can inspect the same plan manually:
+
+```bash
+python3 /path/to/codex-plugins/plugins/linear-progress-sync/scripts/foreground_sync.py prepare --root /path/to/target-repo
+```
+
+After a comment is confirmed visible, the command runs the generated `ack_command`. If approval is denied or the comment is not visible, the event remains queued.
+
 ## Test With One Commit
 
 1. Make a small commit on a branch that contains a Linear issue key, for example `nitish/cor-2341-test-sync`.
