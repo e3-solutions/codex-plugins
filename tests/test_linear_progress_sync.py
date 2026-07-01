@@ -110,6 +110,173 @@ def test_branch_issue_key_wins_over_fuzzy_inference(tmp_path, monkeypatch):
     assert inference.confidence >= 0.8
 
 
+def test_active_linear_issue_wins_over_branch_and_commit_inference(tmp_path, monkeypatch):
+    monkeypatch.setenv("LINEAR_SYNC_STATE_DIR", str(tmp_path))
+    linear_sync.write_active_issue(
+        {
+            "issue_key": "COR-33",
+            "issue_url": "https://linear.app/coreedge/issue/COR-33/test",
+            "issue_title": "Active issue",
+            "branch": "arya/cor-33-active-issue",
+        },
+        root=tmp_path,
+    )
+    event = {
+        "branch": "arya/cor-999-wrong-branch",
+        "commit_subject": "COR-888 wrong commit",
+    }
+
+    inference = linear_sync.infer_issue(event, root=tmp_path)
+
+    assert inference.issue_key == "COR-33"
+    assert inference.confidence == 1.0
+    assert inference.reason == "active Linear issue state"
+
+
+def test_active_linear_issue_state_round_trips_and_malformed_fails_closed(tmp_path, monkeypatch):
+    monkeypatch.setenv("LINEAR_SYNC_STATE_DIR", str(tmp_path))
+    payload = {
+        "issue_key": "COR-34",
+        "issue_url": "https://linear.app/coreedge/issue/COR-34/test",
+        "issue_title": "Round trip",
+        "branch": "arya/cor-34-round-trip",
+        "pr_url": "https://github.com/e3-solutions/codex-plugins/pull/34",
+    }
+
+    linear_sync.write_active_issue(payload, root=tmp_path)
+
+    assert linear_sync.read_active_issue(root=tmp_path)["issue_key"] == "COR-34"
+    (tmp_path / "active.json").write_text("{not json", encoding="utf-8")
+    assert linear_sync.read_active_issue(root=tmp_path) is None
+
+
+def test_linear_branch_name_wins_over_fallback():
+    issue = {
+        "identifier": "COR-35",
+        "title": "Use Linear branch naming",
+        "branchName": "arya/cor-35-linear-owned-name",
+    }
+
+    assert linear_sync.linear_issue_branch_name(issue) == "arya/cor-35-linear-owned-name"
+    assert linear_sync.select_branch_name(issue) == "arya/cor-35-linear-owned-name"
+
+
+def test_fallback_branch_name_uses_issue_key_and_title_slug():
+    assert (
+        linear_sync.fallback_branch_name("COR-36", "Make Linear setup easier!")
+        == "arya/COR-36-make-linear-setup-easier"
+    )
+
+
+def test_pr_title_and_body_link_linear_without_closing():
+    title = linear_sync.pr_title_for_issue("COR-37", "Create kickoff flow")
+    body = linear_sync.pr_body_for_issue(
+        "COR-37",
+        "Create kickoff flow",
+        "https://linear.app/coreedge/issue/COR-37/create-kickoff-flow",
+    )
+
+    assert title == "COR-37: Create kickoff flow"
+    assert "Refs COR-37" in body
+    assert "Fixes" not in body
+    assert "https://linear.app/coreedge/issue/COR-37/create-kickoff-flow" in body
+
+
+def test_pre_tool_guard_blocks_writes_and_branch_creation_without_active_state(tmp_path, monkeypatch):
+    monkeypatch.setenv("LINEAR_SYNC_STATE_DIR", str(tmp_path))
+
+    write_decision = linear_sync.pre_tool_guard_decision({"tool_name": "apply_patch"}, root=tmp_path)
+    branch_decision = linear_sync.pre_tool_guard_decision(
+        {"tool_name": "Bash", "command": "git switch -c arya/new-work"},
+        root=tmp_path,
+    )
+
+    assert write_decision.blocked is True
+    assert branch_decision.blocked is True
+    assert "Linear kickoff" in write_decision.message
+
+
+def test_pre_tool_guard_allows_read_only_and_kickoff_commands_without_active_state(tmp_path, monkeypatch):
+    monkeypatch.setenv("LINEAR_SYNC_STATE_DIR", str(tmp_path))
+
+    read_decision = linear_sync.pre_tool_guard_decision(
+        {"tool_name": "Bash", "command": "git status --short"},
+        root=tmp_path,
+    )
+    kickoff_decision = linear_sync.pre_tool_guard_decision(
+        {"tool_name": "Bash", "command": "python3 plugins/linear-progress-sync/scripts/linear_start.py kickoff"},
+        root=tmp_path,
+    )
+
+    assert read_decision.blocked is False
+    assert kickoff_decision.blocked is False
+
+
+def test_enqueue_event_carries_active_issue_key(tmp_path, monkeypatch):
+    monkeypatch.setenv("LINEAR_SYNC_STATE_DIR", str(tmp_path))
+    linear_sync.write_active_issue(
+        {
+            "issue_key": "COR-38",
+            "issue_title": "Carry active issue",
+            "branch": "arya/cor-38-carry-active-issue",
+        },
+        root=tmp_path,
+    )
+
+    event = linear_sync.enqueue_event("file_change", {"changed_files": ["app.py"]}, root=tmp_path)
+
+    assert event["issue_key"] == "COR-38"
+
+
+def test_linear_start_dry_run_plan_contains_git_and_gh_commands(tmp_path):
+    plan = linear_sync.linear_start_plan(
+        issue_key="COR-39",
+        issue_title="Start with Linear",
+        issue_url="https://linear.app/coreedge/issue/COR-39/start-with-linear",
+        branch="arya/cor-39-start-with-linear",
+        root=tmp_path,
+    )
+
+    commands = "\n".join(plan["commands"])
+    assert "git switch" in commands
+    assert "git commit --allow-empty -m 'chore: start COR-39'" in commands
+    assert "git push -u origin arya/cor-39-start-with-linear" in commands
+    assert "gh pr create --draft" in commands
+    assert plan["active_state"]["issue_key"] == "COR-39"
+
+
+def test_setup_plan_is_global_by_default_and_does_not_install_repo_hook(tmp_path):
+    plan = linear_sync.setup_plan(plugin_repo_root=ROOT, target_repo_root=tmp_path)
+    commands = "\n".join(plan["commands"])
+
+    assert "gh auth status" in commands
+    assert "codex plugin marketplace add" in commands
+    assert "codex plugin add linear-progress-sync@coreedge-local" in commands
+    assert "codex mcp add linear --url https://mcp.linear.app/mcp" in commands
+    assert "install_git_hook.py" not in commands
+    assert plan["per_repo_setup_required"] is False
+
+
+def test_setup_plan_can_include_optional_repo_git_hook(tmp_path):
+    plan = linear_sync.setup_plan(
+        plugin_repo_root=ROOT,
+        target_repo_root=tmp_path,
+        with_git_hook=True,
+    )
+    commands = "\n".join(plan["commands"])
+
+    assert "install_git_hook.py" in commands
+    assert str(tmp_path) in commands
+
+
+def test_setup_script_exists_and_exposes_dry_run():
+    script = ROOT / "plugins/linear-progress-sync/scripts/setup.py"
+    assert script.exists()
+    text = script.read_text(encoding="utf-8")
+    assert "--dry-run" in text
+    assert "--with-git-hook" in text
+
+
 def test_session_progress_throttling_works(tmp_path, monkeypatch):
     monkeypatch.setenv("LINEAR_SYNC_STATE_DIR", str(tmp_path))
     state = linear_sync.default_state()
@@ -167,6 +334,19 @@ def test_plugin_hooks_do_not_use_repo_relative_script_paths():
         text = (ROOT / rel).read_text()
         assert "./scripts/" not in text
         assert ".codex/plugins/cache" in text
+
+
+def test_plugin_exposes_linear_start_command_and_pre_tool_guard_hook():
+    command = ROOT / "plugins/linear-progress-sync/commands/linear-start.md"
+    assert command.exists()
+    assert "linear_start.py" in command.read_text(encoding="utf-8")
+    for rel in (
+        "plugins/linear-progress-sync/hooks.json",
+        "plugins/linear-progress-sync/hooks/hooks.json",
+    ):
+        text = (ROOT / rel).read_text(encoding="utf-8")
+        assert '"PreToolUse"' in text
+        assert "pre_tool_use.py" in text
 
 
 def test_dry_run_keeps_event_queued_and_unsynced(tmp_path, monkeypatch):

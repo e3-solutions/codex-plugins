@@ -1,0 +1,92 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import json
+import shlex
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+from linear_sync import cli_root_arg, setup_plan
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Set up linear-progress-sync once for Codex.")
+    cli_root_arg(parser)
+    parser.add_argument(
+        "--with-git-hook",
+        action="store_true",
+        help="Also install the optional repo post-commit hook for non-Codex commits.",
+    )
+    parser.add_argument("--dry-run", action="store_true", help="Print the setup plan without running commands.")
+    parser.add_argument("--json", action="store_true", help="Print machine-readable setup output.")
+    args = parser.parse_args()
+
+    repo_root = Path(__file__).resolve().parents[3]
+    plan = setup_plan(plugin_repo_root=repo_root, target_repo_root=args.root, with_git_hook=args.with_git_hook)
+    if args.dry_run:
+        print(json.dumps(plan, indent=2, sort_keys=True))
+        return
+
+    result = run_setup_plan(plan)
+    if args.json:
+        print(json.dumps(result, indent=2, sort_keys=True))
+    else:
+        print_summary(result)
+    if not result["ok"]:
+        raise SystemExit(1)
+
+
+def run_setup_plan(plan: dict) -> dict:
+    results: list[dict] = []
+    for command in plan["commands"]:
+        results.append(run_step(command))
+        if not results[-1]["ok"]:
+            break
+    return {"ok": all(item["ok"] for item in results), "results": results, "plan": plan}
+
+
+def run_step(command: str) -> dict:
+    argv = shlex.split(command)
+    if not argv:
+        return {"command": command, "ok": True, "message": "empty command skipped"}
+    executable = argv[0]
+    if shutil.which(executable) is None:
+        return {
+            "command": command,
+            "ok": False,
+            "message": missing_executable_message(executable),
+        }
+    print(f"Running: {command}", file=sys.stderr)
+    completed = subprocess.run(argv, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+    output = "\n".join(part for part in (completed.stdout.strip(), completed.stderr.strip()) if part)
+    normalized_output = output.lower()
+    if completed.returncode == 0 or any(word in normalized_output for word in ("already", "exists", "configured")):
+        return {"command": command, "ok": True, "message": output}
+    if argv[:3] == ["gh", "auth", "status"]:
+        output = f"{output}\nRun: gh auth login".strip()
+    return {"command": command, "ok": False, "message": output or str(completed.returncode)}
+
+
+def missing_executable_message(executable: str) -> str:
+    if executable == "gh":
+        return "GitHub CLI is required. Install it, then run: gh auth login"
+    if executable == "codex":
+        return "Codex CLI is required. Install/sign in to Codex, then rerun this setup script."
+    return f"Required executable not found: {executable}"
+
+
+def print_summary(result: dict) -> None:
+    for item in result["results"]:
+        status = "ok" if item["ok"] else "failed"
+        print(f"[{status}] {item['command']}")
+        if item.get("message"):
+            print(item["message"])
+    if result["ok"]:
+        print("Setup complete. Start a new Codex thread so plugin hooks and skills reload.")
+
+
+if __name__ == "__main__":
+    main()

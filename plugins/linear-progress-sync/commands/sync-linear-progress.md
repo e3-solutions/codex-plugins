@@ -12,7 +12,7 @@ Process queued Linear progress sync events in the foreground with visible Linear
 1. Run the foreground prepare command:
 
    ```bash
-   python3 /Users/nitishjoshi/Projects/codex-plugins/plugins/linear-progress-sync/scripts/foreground_sync.py prepare --root <root> --limit <limit>
+   python3 <plugin-root>/scripts/foreground_sync.py prepare --root <root> --limit <limit>
    ```
 
 2. For each `eligible` event returned:

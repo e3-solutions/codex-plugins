@@ -35,6 +35,7 @@ STATE_DIR_ENV = "LINEAR_SYNC_STATE_DIR"
 DRY_RUN_ENV = "LINEAR_SYNC_DRY_RUN"
 CODEX_COMMAND_ENV = "LINEAR_SYNC_CODEX_COMMAND"
 THROTTLE_SECONDS = 30 * 60
+LINEAR_MCP_URL = "https://mcp.linear.app/mcp"
 IGNORED_FILE_PREFIXES = (
     ".codex/linear-sync/",
     ".git/",
@@ -56,6 +57,12 @@ class IssueInference:
 class WorkerResult:
     ok: bool
     message: str
+
+
+@dataclass(frozen=True)
+class PreToolGuardDecision:
+    blocked: bool
+    message: str = ""
 
 
 def repo_root(start: str | Path | None = None) -> Path:
@@ -124,6 +131,37 @@ def save_state(state: JsonDict, root: str | Path | None = None) -> None:
     write_json_atomic(base / "state.json", state)
 
 
+def active_issue_path(root: str | Path | None = None) -> Path:
+    return ensure_state(root) / "active.json"
+
+
+def read_active_issue(*, root: str | Path | None = None) -> JsonDict | None:
+    path = active_issue_path(root)
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    issue_key = data.get("issue_key") or data.get("issue_identifier") or data.get("identifier")
+    if not isinstance(issue_key, str) or not issue_key.strip():
+        return None
+    data["issue_key"] = issue_key.strip().upper()
+    return data
+
+
+def write_active_issue(payload: JsonDict, *, root: str | Path | None = None) -> JsonDict:
+    issue_key = payload.get("issue_key") or payload.get("issue_identifier") or payload.get("identifier")
+    if not isinstance(issue_key, str) or not issue_key.strip():
+        raise ValueError("active Linear issue state requires issue_key")
+    active = dict(payload)
+    active["issue_key"] = issue_key.strip().upper()
+    active.setdefault("created_at", now_iso())
+    active.setdefault("repo", str(repo_root(root)))
+    write_json_atomic(active_issue_path(root), active)
+    return active
+
+
 def write_json_atomic(path: Path, payload: JsonDict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + f".{uuid.uuid4().hex}.tmp")
@@ -149,6 +187,11 @@ def enqueue_event(event_type: str, payload: JsonDict | None = None, *, root: str
     event.setdefault("created_at", now_iso())
     event.setdefault("repo", str(repo_root(root)))
     event.setdefault("branch", current_branch(root))
+    active = read_active_issue(root=root)
+    if active:
+        event.setdefault("issue_key", active["issue_key"])
+        if active.get("pr_url"):
+            event.setdefault("pr_url", active.get("pr_url"))
     event_path = base / "events" / f"{safe_file_name(event['id'])}.json"
     write_json_atomic(event_path, event)
     return event
@@ -279,6 +322,19 @@ def git_author(*, root: str | Path | None = None) -> str | None:
 
 def infer_issue(event: JsonDict, state: JsonDict | None = None, *, root: str | Path | None = None) -> IssueInference:
     local_state = state or read_state(root)
+    active = read_active_issue(root=root)
+    if active:
+        return IssueInference(
+            active["issue_key"],
+            1.0,
+            "active Linear issue state",
+            status=str(active.get("issue_status") or active.get("status") or "") or None,
+        )
+
+    explicit_key = first_issue_key(str(event.get("issue_key") or ""))
+    if explicit_key:
+        return with_cached_status(IssueInference(explicit_key, 1.0, "explicit event issue key"), local_state)
+
     branch = str(event.get("branch") or current_branch(root) or "")
     key = first_issue_key(branch)
     if key:
@@ -306,6 +362,203 @@ def infer_issue(event: JsonDict, state: JsonDict | None = None, *, root: str | P
 def first_issue_key(text: str) -> str | None:
     match = ISSUE_RE.search(text or "")
     return match.group(1).upper() if match else None
+
+
+def linear_issue_branch_name(issue: JsonDict) -> str | None:
+    for key in ("branchName", "gitBranchName", "gitBranch", "branch_name"):
+        value = issue.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    for key in ("git", "branch"):
+        value = issue.get(key)
+        if isinstance(value, dict):
+            nested_name = linear_issue_branch_name(value)
+            if nested_name:
+                return nested_name
+    return None
+
+
+def issue_identifier(issue: JsonDict) -> str:
+    value = issue.get("identifier") or issue.get("issue_key") or issue.get("key") or issue.get("id")
+    return str(value or "").strip().upper()
+
+
+def issue_title(issue: JsonDict) -> str:
+    return str(issue.get("title") or "").strip()
+
+
+def slugify_title(title: str, *, max_length: int = 64) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "-", title.lower()).strip("-")
+    slug = re.sub(r"-+", "-", slug)
+    return (slug[:max_length].rstrip("-") or "work")
+
+
+def fallback_branch_name(issue_key: str, title: str, *, prefix: str = "arya") -> str:
+    return f"{prefix}/{issue_key.upper()}-{slugify_title(title)}"
+
+
+def select_branch_name(issue: JsonDict, *, prefix: str = "arya") -> str:
+    return linear_issue_branch_name(issue) or fallback_branch_name(
+        issue_identifier(issue),
+        issue_title(issue),
+        prefix=prefix,
+    )
+
+
+def pr_title_for_issue(issue_key: str, title: str) -> str:
+    return f"{issue_key.upper()}: {title.strip() or 'Linear work'}"
+
+
+def pr_body_for_issue(issue_key: str, title: str, issue_url: str | None = None) -> str:
+    lines = [
+        f"Refs {issue_key.upper()}",
+        "",
+        f"Linear issue: {title.strip() or issue_key.upper()}",
+    ]
+    if issue_url:
+        lines.append(str(issue_url))
+    lines.extend(["", "This draft PR was created before implementation so Linear, branch, and PR stay linked."])
+    return "\n".join(lines)
+
+
+def linear_start_plan(
+    *,
+    issue_key: str,
+    issue_title: str,
+    issue_url: str | None,
+    branch: str | None,
+    root: str | Path | None = None,
+) -> JsonDict:
+    branch = branch or fallback_branch_name(issue_key, issue_title)
+    title = pr_title_for_issue(issue_key, issue_title)
+    body = pr_body_for_issue(issue_key, issue_title, issue_url)
+    active_state = {
+        "issue_key": issue_key.upper(),
+        "issue_title": issue_title,
+        "issue_url": issue_url,
+        "branch": branch,
+        "repo": str(repo_root(root)),
+    }
+    return {
+        "active_state": active_state,
+        "commands": [
+            f"git switch {shlex.quote(branch)} || git switch -c {shlex.quote(branch)}",
+            shlex.join(["git", "commit", "--allow-empty", "-m", f"chore: start {issue_key.upper()}"]),
+            shlex.join(["git", "push", "-u", "origin", branch]),
+            shlex.join(["gh", "pr", "create", "--draft", "--title", title, "--body", body]),
+        ],
+        "pr_title": title,
+        "pr_body": body,
+    }
+
+
+def setup_plan(
+    *,
+    plugin_repo_root: str | Path,
+    target_repo_root: str | Path | None = None,
+    with_git_hook: bool = False,
+) -> JsonDict:
+    plugin_root = Path(plugin_repo_root).expanduser().resolve()
+    target_root = Path(target_repo_root or os.getcwd()).expanduser().resolve()
+    commands = [
+        shlex.join(["gh", "auth", "status"]),
+        shlex.join(["codex", "plugin", "marketplace", "add", str(plugin_root)]),
+        shlex.join(["codex", "plugin", "add", "linear-progress-sync@coreedge-local"]),
+        shlex.join(["codex", "mcp", "add", "linear", "--url", LINEAR_MCP_URL]),
+    ]
+    if with_git_hook:
+        hook_script = plugin_root / "plugins" / "linear-progress-sync" / "scripts" / "install_git_hook.py"
+        commands.append(shlex.join([sys.executable, str(hook_script), "--root", str(target_root)]))
+    return {
+        "commands": commands,
+        "plugin_repo_root": str(plugin_root),
+        "target_repo_root": str(target_root),
+        "per_repo_setup_required": False,
+        "optional_git_hook": with_git_hook,
+        "notes": [
+            "Default setup is user-level: plugin marketplace, plugin install, Linear MCP, and gh auth check.",
+            "Per-repo Git hook setup is optional and only needed to sync commits made outside Codex.",
+            "Start a new Codex thread after installing or updating the plugin so hooks and skills reload.",
+        ],
+    }
+
+
+def run_linear_start(
+    *,
+    issue_key: str,
+    issue_title: str,
+    issue_url: str | None = None,
+    branch: str | None = None,
+    root: str | Path | None = None,
+    dry_run: bool = False,
+) -> JsonDict:
+    plan = linear_start_plan(
+        issue_key=issue_key,
+        issue_title=issue_title,
+        issue_url=issue_url,
+        branch=branch,
+        root=root,
+    )
+    if dry_run:
+        return {**plan, "dry_run": True}
+
+    target_branch = str(plan["active_state"]["branch"])
+    if current_branch(root) != target_branch:
+        switch_args = ["switch", target_branch] if local_branch_exists(target_branch, root=root) else ["switch", "-c", target_branch]
+        require_success(run_git(switch_args, root=root), f"switch to {target_branch}")
+
+    require_success(
+        run_git(["commit", "--allow-empty", "-m", f"chore: start {issue_key.upper()}"], root=root),
+        "create kickoff commit",
+    )
+    require_success(run_git(["push", "-u", "origin", target_branch], root=root), f"push {target_branch}")
+
+    pr_result = run_local_command(
+        ["gh", "pr", "create", "--draft", "--title", plan["pr_title"], "--body", plan["pr_body"]],
+        root=root,
+    )
+    require_success(pr_result, "create draft pull request")
+    pr_url = extract_pr_url(pr_result.stdout)
+    active_state = dict(plan["active_state"])
+    if pr_url:
+        active_state["pr_url"] = pr_url
+        pr_number = extract_pr_number(pr_url)
+        if pr_number is not None:
+            active_state["pr_number"] = pr_number
+    active = write_active_issue(active_state, root=root)
+    return {**plan, "active_state": active, "pr_url": pr_url}
+
+
+def local_branch_exists(branch: str, *, root: str | Path | None = None) -> bool:
+    return run_git(["rev-parse", "--verify", f"refs/heads/{branch}"], root=root).returncode == 0
+
+
+def run_local_command(args: list[str], *, root: str | Path | None = None) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        args,
+        cwd=repo_root(root),
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+
+
+def require_success(result: subprocess.CompletedProcess[str], action: str) -> None:
+    if result.returncode == 0:
+        return
+    output = "\n".join(part for part in (result.stdout.strip(), result.stderr.strip()) if part)
+    raise RuntimeError(f"Failed to {action}: {output or result.returncode}")
+
+
+def extract_pr_url(output: str) -> str | None:
+    match = re.search(r"https://github\.com/[^\s]+/pull/\d+", output or "")
+    return match.group(0) if match else None
+
+
+def extract_pr_number(url: str) -> int | None:
+    match = re.search(r"/pull/(\d+)(?:$|[^\d])", url or "")
+    return int(match.group(1)) if match else None
 
 
 def infer_from_stale_cache(event: JsonDict, state: JsonDict) -> IssueInference:
@@ -858,6 +1111,34 @@ def read_stdin_json() -> JsonDict:
     return payload if isinstance(payload, dict) else {"payload": payload}
 
 
+def pre_tool_guard_decision(payload: JsonDict, *, root: str | Path | None = None) -> PreToolGuardDecision:
+    if read_active_issue(root=root):
+        return PreToolGuardDecision(False)
+
+    tool = tool_name(payload)
+    normalized_tool = tool.lower()
+    if normalized_tool in {"apply_patch", "edit", "write"}:
+        return PreToolGuardDecision(True, linear_kickoff_required_message())
+
+    if normalized_tool == "bash":
+        command = tool_command(payload)
+        if is_linear_start_command(command):
+            return PreToolGuardDecision(False)
+        if looks_like_branch_creation(command):
+            return PreToolGuardDecision(True, linear_kickoff_required_message())
+
+    return PreToolGuardDecision(False)
+
+
+def linear_kickoff_required_message() -> str:
+    return (
+        "Linear kickoff is required before writing code or creating branches. "
+        "Run the automatic Linear kickoff workflow first: confirm or create the Linear issue, "
+        "create the Linear-named branch, push the empty kickoff commit, open the draft PR, "
+        "link Linear and GitHub, then retry this tool call."
+    )
+
+
 def handle_post_tool_use(payload: JsonDict, *, root: str | Path | None = None) -> JsonDict | None:
     tool = tool_name(payload)
     if tool.lower() == "bash":
@@ -937,6 +1218,22 @@ def tool_success(payload: JsonDict) -> bool:
 
 def looks_like_git_commit(command: str) -> bool:
     return bool(re.search(r"(^|[;&|]\s*)git\s+commit(\s|$)", command))
+
+
+def looks_like_branch_creation(command: str) -> bool:
+    if not command:
+        return False
+    patterns = (
+        r"(^|[;&|]\s*)git\s+switch\s+(?:[^\n;&|]*\s)?-(?:[^\n;&|]*c|c[^\n;&|]*)(\s|$)",
+        r"(^|[;&|]\s*)git\s+checkout\s+(?:[^\n;&|]*\s)?-(?:[^\n;&|]*b|b[^\n;&|]*)(\s|$)",
+        r"(^|[;&|]\s*)git\s+branch\s+(?!-)(\S+)",
+        r"(^|[;&|]\s*)git\s+worktree\s+add\b[^\n;&|]*\s-b\s+",
+    )
+    return any(re.search(pattern, command, re.IGNORECASE) for pattern in patterns)
+
+
+def is_linear_start_command(command: str) -> bool:
+    return "linear_start.py" in (command or "") or "/linear-start" in (command or "")
 
 
 def changed_paths_from_payload(payload: JsonDict) -> list[str]:
