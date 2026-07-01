@@ -14,10 +14,11 @@ python3 plugins/linear-progress-sync/scripts/setup.py
 
 Then restart Codex or start a new Codex thread.
 
-If GitHub CLI is not logged in:
+If GitHub CLI or Linear is not logged in, the setup script will stop on the auth step and tell you what to run. After auth, rerun setup.
 
 ```bash
 gh auth login
+codex mcp login linear
 python3 plugins/linear-progress-sync/scripts/setup.py
 ```
 
@@ -33,12 +34,15 @@ python3 plugins/linear-progress-sync/scripts/setup.py --dry-run
 - adds this repo as a Codex plugin marketplace
 - installs `linear-progress-sync@coreedge-local`
 - configures Linear MCP with `codex mcp add linear --url https://mcp.linear.app/mcp`
+- starts Linear auth with `codex mcp login linear`
 
 This is user-level setup. You do not need to install anything separately in every repo for normal Codex work.
 
 ## Normal Use
 
 Start a coding task in Codex. The plugin makes Codex run Linear kickoff before edits: Linear issue, branch, empty kickoff commit, draft PR, and local active state.
+
+The first time a repo needs a new Linear issue, Codex asks which Linear team/project that repo should use and saves it in `~/.codex/linear-sync/repos.json`. Future tasks in that repo reuse the saved team/project automatically.
 
 Codex commits are then synced back to the active Linear issue automatically.
 

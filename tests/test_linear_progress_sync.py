@@ -32,6 +32,10 @@ def init_git_repo(path: Path, branch: str = "arya/cor-1-work") -> Path:
     return path
 
 
+def add_origin(repo: Path, url: str) -> None:
+    subprocess.run(["git", "remote", "add", "origin", url], cwd=repo, check=True)
+
+
 def test_terminal_statuses_are_never_changed(tmp_path, monkeypatch):
     monkeypatch.setenv("LINEAR_SYNC_STATE_DIR", str(tmp_path))
     state = linear_sync.default_state()
@@ -274,6 +278,9 @@ def test_pre_tool_guard_blocks_long_form_branch_creation_without_active_state(tm
         "git switch --create arya/new-work",
         "git checkout --branch arya/new-work",
         "git checkout -B arya/new-work",
+        "git switch --track origin/arya/new-work",
+        "git checkout --track origin/arya/new-work",
+        "git branch --track arya/new-work origin/main",
     ]
 
     for command in commands:
@@ -322,6 +329,8 @@ def test_linear_start_dry_run_plan_contains_git_and_gh_commands(tmp_path):
         issue_title="Start with Linear",
         issue_url="https://linear.app/coreedge/issue/COR-39/start-with-linear",
         branch="arya/cor-39-start-with-linear",
+        team="Engineering",
+        project="Codex Plugins",
         root=tmp_path,
     )
 
@@ -331,6 +340,36 @@ def test_linear_start_dry_run_plan_contains_git_and_gh_commands(tmp_path):
     assert "git push -u origin arya/cor-39-start-with-linear" in commands
     assert "gh pr create --draft" in commands
     assert plan["active_state"]["issue_key"] == "COR-39"
+    assert plan["active_state"]["team"] == "Engineering"
+    assert plan["active_state"]["project"] == "Codex Plugins"
+
+
+def test_repo_identity_normalizes_github_origin(tmp_path):
+    repo = init_git_repo(tmp_path / "repo")
+    add_origin(repo, "git@github.com:e3-solutions/codex-plugins.git")
+
+    assert linear_sync.repo_identity(repo) == "e3-solutions/codex-plugins"
+
+
+def test_repo_linear_binding_round_trips_by_repo_identity(tmp_path, monkeypatch):
+    config_dir = tmp_path / "config"
+    monkeypatch.setenv("LINEAR_SYNC_CONFIG_DIR", str(config_dir))
+    repo = init_git_repo(tmp_path / "repo")
+    add_origin(repo, "https://github.com/e3-solutions/codex-plugins.git")
+
+    missing = linear_sync.repo_binding_status(root=repo)
+    saved = linear_sync.save_repo_linear_binding(
+        team="Engineering",
+        project="Codex Plugins",
+        root=repo,
+    )
+    loaded = linear_sync.repo_binding_status(root=repo)
+
+    assert missing["configured"] is False
+    assert saved["repo"] == "e3-solutions/codex-plugins"
+    assert loaded["configured"] is True
+    assert loaded["binding"] == {"team": "Engineering", "project": "Codex Plugins"}
+    assert "e3-solutions/codex-plugins" in (config_dir / "repos.json").read_text(encoding="utf-8")
 
 
 def test_setup_plan_is_global_by_default_and_does_not_install_repo_hook(tmp_path):
@@ -341,6 +380,7 @@ def test_setup_plan_is_global_by_default_and_does_not_install_repo_hook(tmp_path
     assert "codex plugin marketplace add" in commands
     assert "codex plugin add linear-progress-sync@coreedge-local" in commands
     assert "codex mcp add linear --url https://mcp.linear.app/mcp" in commands
+    assert "codex mcp login linear" in commands
     assert "install_git_hook.py" not in commands
     assert plan["per_repo_setup_required"] is False
 
@@ -442,7 +482,11 @@ def test_plugin_hooks_do_not_use_repo_relative_script_paths():
 def test_plugin_exposes_linear_start_command_and_pre_tool_guard_hook():
     command = ROOT / "plugins/linear-progress-sync/commands/linear-start.md"
     assert command.exists()
-    assert "linear_start.py" in command.read_text(encoding="utf-8")
+    command_text = command.read_text(encoding="utf-8")
+    assert "linear_start.py" in command_text
+    assert "repo-binding" in command_text
+    assert "configure-repo" in command_text
+    assert "mcp__linear." not in command_text
     for rel in (
         "plugins/linear-progress-sync/hooks.json",
         "plugins/linear-progress-sync/hooks/hooks.json",

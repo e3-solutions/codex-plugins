@@ -74,6 +74,7 @@ def is_idempotent_setup_success(argv: list[str], output: str) -> bool:
         ["codex", "plugin", "marketplace", "add"],
         ["codex", "plugin", "add"],
         ["codex", "mcp", "add"],
+        ["codex", "mcp", "login"],
     )
     if not any(argv[: len(prefix)] == prefix for prefix in idempotent_prefixes):
         return False

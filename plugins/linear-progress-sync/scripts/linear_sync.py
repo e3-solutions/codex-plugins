@@ -32,6 +32,7 @@ TERMINAL_STATUSES = {
 }
 SAFE_PROGRESS_STATUS = "In Progress"
 STATE_DIR_ENV = "LINEAR_SYNC_STATE_DIR"
+CONFIG_DIR_ENV = "LINEAR_SYNC_CONFIG_DIR"
 DRY_RUN_ENV = "LINEAR_SYNC_DRY_RUN"
 CODEX_COMMAND_ENV = "LINEAR_SYNC_CODEX_COMMAND"
 THROTTLE_SECONDS = 30 * 60
@@ -129,6 +130,94 @@ def read_state(root: str | Path | None = None) -> JsonDict:
 def save_state(state: JsonDict, root: str | Path | None = None) -> None:
     base = ensure_state(root)
     write_json_atomic(base / "state.json", state)
+
+
+def global_config_dir() -> Path:
+    override = os.environ.get(CONFIG_DIR_ENV)
+    if override:
+        return Path(override).expanduser().resolve()
+    return Path.home() / ".codex" / "linear-sync"
+
+
+def repo_bindings_path() -> Path:
+    return global_config_dir() / "repos.json"
+
+
+def read_repo_bindings() -> JsonDict:
+    path = repo_bindings_path()
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, OSError, json.JSONDecodeError):
+        return {"repos": {}}
+    if not isinstance(data, dict):
+        return {"repos": {}}
+    repos = data.get("repos")
+    if not isinstance(repos, dict):
+        data["repos"] = {}
+    return data
+
+
+def save_repo_bindings(config: JsonDict) -> JsonDict:
+    config.setdefault("repos", {})
+    write_json_atomic(repo_bindings_path(), config)
+    return config
+
+
+def repo_identity(root: str | Path | None = None) -> str:
+    remote = git_output(["remote", "get-url", "origin"], root=root)
+    normalized = normalize_repo_remote(remote)
+    return normalized or str(repo_root(root))
+
+
+def normalize_repo_remote(remote: str) -> str | None:
+    value = str(remote or "").strip()
+    if not value:
+        return None
+    value = re.sub(r"\.git$", "", value)
+    match = re.match(r"^(?:git@|ssh://git@|https?://)(?:[^/:]+)[:/](.+)$", value)
+    if match:
+        return match.group(1).strip("/")
+    return value.strip("/")
+
+
+def repo_binding_status(*, root: str | Path | None = None) -> JsonDict:
+    repo = repo_identity(root)
+    config = read_repo_bindings()
+    repos = config.get("repos") if isinstance(config.get("repos"), dict) else {}
+    binding = repos.get(repo) if isinstance(repos, dict) else None
+    configured = (
+        isinstance(binding, dict)
+        and isinstance(binding.get("team"), str)
+        and bool(binding.get("team", "").strip())
+        and isinstance(binding.get("project"), str)
+        and bool(binding.get("project", "").strip())
+    )
+    return {
+        "repo": repo,
+        "configured": configured,
+        "binding": {"team": binding["team"], "project": binding["project"]} if configured else None,
+        "config_path": str(repo_bindings_path()),
+    }
+
+
+def save_repo_linear_binding(
+    *,
+    team: str,
+    project: str,
+    root: str | Path | None = None,
+) -> JsonDict:
+    if not team.strip() or not project.strip():
+        raise ValueError("repo Linear binding requires both team and project")
+    repo = repo_identity(root)
+    config = read_repo_bindings()
+    repos = config.setdefault("repos", {})
+    repos[repo] = {"team": team.strip(), "project": project.strip()}
+    save_repo_bindings(config)
+    return {
+        "repo": repo,
+        "binding": repos[repo],
+        "config_path": str(repo_bindings_path()),
+    }
 
 
 def active_issue_path(root: str | Path | None = None) -> Path:
@@ -452,6 +541,8 @@ def linear_start_plan(
     issue_title: str,
     issue_url: str | None,
     branch: str | None,
+    team: str | None = None,
+    project: str | None = None,
     root: str | Path | None = None,
 ) -> JsonDict:
     branch = branch or fallback_branch_name(issue_key, issue_title)
@@ -464,6 +555,10 @@ def linear_start_plan(
         "branch": branch,
         "repo": str(repo_root(root)),
     }
+    if team:
+        active_state["team"] = team
+    if project:
+        active_state["project"] = project
     return {
         "active_state": active_state,
         "commands": [
@@ -490,6 +585,7 @@ def setup_plan(
         shlex.join(["codex", "plugin", "marketplace", "add", str(plugin_root)]),
         shlex.join(["codex", "plugin", "add", "linear-progress-sync@coreedge-local"]),
         shlex.join(["codex", "mcp", "add", "linear", "--url", LINEAR_MCP_URL]),
+        shlex.join(["codex", "mcp", "login", "linear"]),
     ]
     if with_git_hook:
         hook_script = plugin_root / "plugins" / "linear-progress-sync" / "scripts" / "install_git_hook.py"
@@ -501,7 +597,7 @@ def setup_plan(
         "per_repo_setup_required": False,
         "optional_git_hook": with_git_hook,
         "notes": [
-            "Default setup is user-level: plugin marketplace, plugin install, Linear MCP, and gh auth check.",
+            "Default setup is user-level: plugin marketplace, plugin install, GitHub auth check, and Linear MCP auth.",
             "Per-repo Git hook setup is optional and only needed to sync commits made outside Codex.",
             "Start a new Codex thread after installing or updating the plugin so hooks and skills reload.",
         ],
@@ -514,6 +610,8 @@ def run_linear_start(
     issue_title: str,
     issue_url: str | None = None,
     branch: str | None = None,
+    team: str | None = None,
+    project: str | None = None,
     root: str | Path | None = None,
     dry_run: bool = False,
 ) -> JsonDict:
@@ -522,6 +620,8 @@ def run_linear_start(
         issue_title=issue_title,
         issue_url=issue_url,
         branch=branch,
+        team=team,
+        project=project,
         root=root,
     )
     if dry_run:
@@ -1282,11 +1382,11 @@ def git_tokens_create_branch(tokens: list[str]) -> bool:
     rest = args[1:]
 
     if command == "switch":
-        return has_long_option(rest, {"--create", "--force-create"}) or has_short_option(rest, {"c", "C"})
+        return has_long_option(rest, {"--create", "--force-create", "--track"}) or has_short_option(rest, {"c", "C", "t"})
     if command == "checkout":
-        return has_long_option(rest, {"--branch", "--orphan"}) or has_short_option(rest, {"b", "B"})
+        return has_long_option(rest, {"--branch", "--orphan", "--track"}) or has_short_option(rest, {"b", "B", "t"})
     if command == "branch":
-        if has_long_option(rest, {"--copy", "--force-copy"}) or has_short_option(rest, {"c", "C"}):
+        if has_long_option(rest, {"--copy", "--force-copy", "--track"}) or has_short_option(rest, {"c", "C", "t"}):
             return True
         return bool(rest and not rest[0].startswith("-"))
     if command == "worktree" and rest and rest[0] == "add":
