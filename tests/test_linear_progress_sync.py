@@ -167,3 +167,31 @@ def test_plugin_hooks_do_not_use_repo_relative_script_paths():
         text = (ROOT / rel).read_text()
         assert "./scripts/" not in text
         assert ".codex/plugins/cache" in text
+
+
+def test_dry_run_keeps_event_queued_and_unsynced(tmp_path, monkeypatch):
+    monkeypatch.setenv("LINEAR_SYNC_STATE_DIR", str(tmp_path))
+    linear_sync.enqueue_event(
+        "post_commit",
+        {
+            "id": "evt-dry",
+            "branch": "nitish/cor-8-work",
+            "commit_sha": "dry123",
+            "commit_subject": "COR-8 useful work",
+        },
+        root=tmp_path,
+    )
+    result = linear_sync.drain_once(root=tmp_path, dry_run=True)
+    state = linear_sync.read_state(tmp_path)
+    assert result["reviewed"] == 1
+    assert "dry123" not in state["synced_commit_shas"]
+    assert "evt-dry" not in state["processed_event_ids"]
+    assert list((tmp_path / "events").glob("*.json"))
+
+
+def test_codex_prompt_requires_success_sentinel():
+    event = {"type": "post_commit", "commit_sha": "abc", "commit_subject": "COR-9 work"}
+    inference = linear_sync.IssueInference("COR-9", 0.95, "branch")
+    prompt = linear_sync.build_codex_prompt(event, inference)
+    assert "LINEAR_SYNC_OK COR-9" in prompt
+    assert "do not print LINEAR_SYNC_OK" in prompt

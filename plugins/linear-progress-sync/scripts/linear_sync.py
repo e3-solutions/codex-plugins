@@ -477,14 +477,8 @@ def drain_once(
 
         prompt = build_codex_prompt(event, inference)
         if dry_run or os.environ.get(DRY_RUN_ENV) == "1":
-            write_review_queue(event, inference, "dry run: Linear write skipped", root=root)
-            mark_processed(local_state, event_id)
-            if event.get("type") == "post_commit":
-                mark_commit_synced(local_state, commit_sha, inference.issue_key)
-            if event.get("type") == "session_progress":
-                mark_session_progress(local_state, inference.issue_key, now=now)
-            safe_unlink(path)
-            processed += 1
+            write_review_queue(event, inference, "dry run: Linear write skipped; event left queued", root=root)
+            reviewed += 1
             continue
 
         result = (executor or run_codex_update)(prompt, event, inference)
@@ -549,6 +543,8 @@ Hard safety rules:
 - Optionally move issue {inference.issue_key} to In Progress only if the current Linear state is non-terminal.
 - If issue {inference.issue_key} is already terminal, do not modify Linear.
 - Do not create duplicate comments if this exact commit/update already appears on the issue.
+- After the Linear comment is actually created, print exactly: LINEAR_SYNC_OK {inference.issue_key}
+- If you cannot access Linear tools or cannot confirm the comment was created, do not print LINEAR_SYNC_OK.
 
 Issue inference:
 - issue_key: {inference.issue_key}
@@ -583,8 +579,11 @@ def run_codex_update(prompt: str, event: JsonDict, inference: IssueInference) ->
         timeout=180,
         check=False,
     )
+    output = "\n".join(part for part in (result.stdout.strip(), result.stderr.strip()) if part)
     if result.returncode != 0:
-        return WorkerResult(False, result.stderr.strip() or result.stdout.strip() or "codex exec failed")
+        return WorkerResult(False, output or "codex exec failed")
+    if "LINEAR_SYNC_OK" not in result.stdout:
+        return WorkerResult(False, output or "codex exec did not confirm Linear update")
     return WorkerResult(True, result.stdout.strip())
 
 
