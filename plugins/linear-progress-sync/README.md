@@ -9,14 +9,19 @@ For a new teammate:
 ```bash
 git clone https://github.com/e3-solutions/codex-plugins
 cd codex-plugins
-python3 plugins/linear-progress-sync/scripts/setup.py
 ```
 
-Make sure GitHub CLI and Linear are authenticated:
+Authenticate GitHub CLI and Linear:
 
 ```bash
 gh auth login
 codex mcp login linear
+```
+
+Run setup:
+
+```bash
+python3 plugins/linear-progress-sync/scripts/setup.py
 ```
 
 Then restart Codex or start a new Codex thread.

@@ -248,11 +248,15 @@ def read_current_active_issue(*, root: str | Path | None = None) -> JsonDict | N
 
 def active_issue_context_problem(active: JsonDict, *, root: str | Path | None = None) -> str | None:
     active_repo = str(active.get("repo") or "").strip()
+    if not active_repo:
+        return "active Linear issue state missing repo"
     current_repo = str(repo_root(root))
     if active_repo and normalize_path(active_repo) != normalize_path(current_repo):
         return f"active Linear issue repo {active_repo} does not match current repo {current_repo}"
 
     active_branch = str(active.get("branch") or "").strip()
+    if not active_branch:
+        return "active Linear issue state missing branch"
     branch = current_branch(root)
     if active_branch and branch and active_branch != branch:
         return f"active Linear issue branch {active_branch} does not match current branch {branch}"
@@ -1242,10 +1246,10 @@ def pre_tool_guard_decision(payload: JsonDict, *, root: str | Path | None = None
     requires_active_state = normalized_tool in {"apply_patch", "edit", "write"}
     if normalized_tool == "bash":
         command = tool_command(payload)
-        if is_linear_start_command(command):
-            return PreToolGuardDecision(False)
         if looks_like_branch_creation(command):
             requires_active_state = True
+        elif is_linear_start_command(command):
+            return PreToolGuardDecision(False)
 
     if requires_active_state:
         active = read_active_issue(root=root)

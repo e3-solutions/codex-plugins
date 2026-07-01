@@ -271,6 +271,19 @@ def test_pre_tool_guard_blocks_writes_and_branch_creation_without_active_state(t
     assert "Linear kickoff" in write_decision.message
 
 
+def test_pre_tool_guard_blocks_writes_with_incomplete_active_state(tmp_path, monkeypatch):
+    monkeypatch.setenv("LINEAR_SYNC_STATE_DIR", str(tmp_path))
+    linear_sync.write_json_atomic(
+        tmp_path / "active.json",
+        {"issue_key": "COR-40"},
+    )
+
+    decision = linear_sync.pre_tool_guard_decision({"tool_name": "apply_patch"}, root=tmp_path)
+
+    assert decision.blocked is True
+    assert "missing repo" in decision.message
+
+
 def test_pre_tool_guard_blocks_long_form_branch_creation_without_active_state(tmp_path, monkeypatch):
     monkeypatch.setenv("LINEAR_SYNC_STATE_DIR", str(tmp_path))
 
@@ -281,6 +294,22 @@ def test_pre_tool_guard_blocks_long_form_branch_creation_without_active_state(tm
         "git switch --track origin/arya/new-work",
         "git checkout --track origin/arya/new-work",
         "git branch --track arya/new-work origin/main",
+    ]
+
+    for command in commands:
+        decision = linear_sync.pre_tool_guard_decision(
+            {"tool_name": "Bash", "command": command},
+            root=tmp_path,
+        )
+        assert decision.blocked is True, command
+
+
+def test_pre_tool_guard_blocks_chained_branch_creation_after_kickoff_helper(tmp_path, monkeypatch):
+    monkeypatch.setenv("LINEAR_SYNC_STATE_DIR", str(tmp_path))
+    commands = [
+        "python3 plugins/linear-progress-sync/scripts/linear_start.py repo-binding --root . && git switch -c arya/bypass",
+        "echo linear_start.py; git switch -c arya/bypass",
+        "/linear-start && git checkout -B arya/bypass",
     ]
 
     for command in commands:
@@ -403,6 +432,13 @@ def test_setup_script_exists_and_exposes_dry_run():
     text = script.read_text(encoding="utf-8")
     assert "--dry-run" in text
     assert "--with-git-hook" in text
+
+
+def test_readmes_put_auth_before_setup_command():
+    for rel in ("README.md", "plugins/linear-progress-sync/README.md"):
+        text = (ROOT / rel).read_text(encoding="utf-8")
+        assert text.index("gh auth login") < text.index("python3 plugins/linear-progress-sync/scripts/setup.py")
+        assert text.index("codex mcp login linear") < text.index("python3 plugins/linear-progress-sync/scripts/setup.py")
 
 
 def test_setup_run_step_does_not_treat_auth_failure_as_idempotent_success(monkeypatch):

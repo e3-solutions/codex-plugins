@@ -40,17 +40,17 @@ The human should not need to remember `/linear-start`; use it as the explicit/ma
 
 ## Useful Commands
 
-Set up the plugin, GitHub CLI check, and Linear MCP once:
-
-```bash
-python3 plugins/linear-progress-sync/scripts/setup.py
-```
-
 Authenticate GitHub and Linear manually when needed:
 
 ```bash
 gh auth login
 codex mcp login linear
+```
+
+Set up the plugin, GitHub CLI check, and Linear MCP once:
+
+```bash
+python3 plugins/linear-progress-sync/scripts/setup.py
 ```
 
 Inspect or save the Linear team/project binding for a repo:
