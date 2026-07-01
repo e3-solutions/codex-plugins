@@ -181,16 +181,76 @@ def collect_commit_event(sha: str | None = None, *, root: str | Path | None = No
     commit_sha = sha or git_output(["rev-parse", "HEAD"], root=root)
     subject = git_output(["show", "-s", "--format=%s", commit_sha], root=root)
     body = git_output(["show", "-s", "--format=%b", commit_sha], root=root)
-    files_raw = git_output(["diff-tree", "--no-commit-id", "--name-only", "-r", commit_sha], root=root)
+    files_raw = git_output(["diff-tree", "--root", "--no-commit-id", "--name-only", "-r", commit_sha], root=root)
+    if not files_raw.strip():
+        files_raw = git_output(["show", "--name-only", "--format=", commit_sha], root=root)
+    changed_files = [line for line in files_raw.splitlines() if line.strip()]
     return {
         "commit_sha": commit_sha,
         "short_sha": commit_sha[:7],
         "commit_subject": subject,
         "commit_body": body,
-        "changed_files": [line for line in files_raw.splitlines() if line.strip()],
+        "changed_files": changed_files,
+        "diff_stat": git_output(["show", "--stat", "--format=", commit_sha], root=root),
+        "summary_bullets": summarize_changed_files(changed_files, subject=subject),
         "branch": current_branch(root),
     }
 
+
+
+def summarize_changed_files(changed_files: list[str], *, subject: str | None = None) -> list[str]:
+    files = [normalize_repo_path(path) for path in changed_files if str(path).strip()]
+    if not files:
+        return [subject] if subject else ["Updated project files"]
+    bullets: list[str] = []
+    if any(path.startswith("src/react/") for path in files):
+        bullets.append("Added or updated the React dashboard UI, styles, and type definitions.")
+    if any(path.startswith("src/core/") for path in files):
+        bullets.append("Added or updated core usage aggregation, contracts, and pricing logic.")
+    if any(path.startswith("src/adapters/") for path in files):
+        bullets.append("Added or updated adapter code for feeding resource usage data into the dashboard.")
+    if any(path.startswith("db/") or path.startswith("supabase/") for path in files):
+        bullets.append("Added or updated database/Supabase schema needed by the usage dashboard.")
+    if any(path.startswith("test/") or path.startswith("tests/") for path in files):
+        bullets.append("Added or updated tests for the changed usage/dashboard behavior.")
+    if any(path.startswith("docs/") or path.lower().endswith("readme.md") for path in files):
+        bullets.append("Updated documentation and integration notes for adopting the dashboard.")
+    if any(path in {"package.json", "pyproject.toml", "package-lock.json", "pnpm-lock.yaml", "yarn.lock"} for path in files):
+        bullets.append("Updated package metadata or project dependencies for the new work.")
+    if not bullets:
+        top_dirs = sorted({path.split("/", 1)[0] for path in files})[:3]
+        bullets.append(f"Updated {len(files)} file(s) across {', '.join(top_dirs)}.")
+    return bullets[:4]
+
+
+def changed_area_lines(changed_files: list[str], *, limit: int = 8) -> list[str]:
+    files = [normalize_repo_path(path) for path in changed_files if str(path).strip()]
+    if not files:
+        return ["No changed-file list captured for this event"]
+    groups: list[tuple[str, Callable[[str], bool]]] = [
+        ("React dashboard UI", lambda p: p.startswith("src/react/")),
+        ("Core usage aggregation/pricing", lambda p: p.startswith("src/core/")),
+        ("Data adapters", lambda p: p.startswith("src/adapters/")),
+        ("Database/Supabase schema", lambda p: p.startswith("db/") or p.startswith("supabase/")),
+        ("Tests", lambda p: p.startswith("test/") or p.startswith("tests/")),
+        ("Docs", lambda p: p.startswith("docs/") or p.lower().endswith("readme.md")),
+        ("Package/API surface", lambda p: p in {"package.json", "pyproject.toml"} or p.startswith("src/index")),
+    ]
+    lines: list[str] = []
+    used: set[str] = set()
+    for label, predicate in groups:
+        matched = [path for path in files if path not in used and predicate(path)]
+        if matched:
+            used.update(matched)
+            sample = ", ".join(matched[:3])
+            suffix = f" (+{len(matched) - 3} more)" if len(matched) > 3 else ""
+            lines.append(f"{label}: {sample}{suffix}")
+    for path in files:
+        if path not in used:
+            lines.append(path)
+        if len(lines) >= limit:
+            break
+    return lines[:limit]
 
 def git_output(args: list[str], *, root: str | Path | None = None) -> str:
     result = run_git(args, root=root)
@@ -529,7 +589,10 @@ def build_linear_comment(event: JsonDict) -> str:
     short_sha = str(event.get("short_sha") or str(event.get("commit_sha") or "")[:7] or "unknown")
     subject = str(event.get("commit_subject") or "Commit progress")
     changed = [str(path) for path in event.get("changed_files") or [] if str(path).strip()]
-    changed_lines = changed[:8] or ["No changed-file list captured for this event"]
+    bullets = [str(item) for item in event.get("summary_bullets") or [] if str(item).strip()]
+    if not bullets:
+        bullets = summarize_changed_files(changed, subject=subject)
+    changed_lines = changed_area_lines(changed)
     return "\n".join(
         [
             "Codex progress update",
@@ -537,10 +600,10 @@ def build_linear_comment(event: JsonDict) -> str:
             f"Commit: `{short_sha}` — {subject}",
             "",
             "Summary:",
-            f"- {subject}",
+            *[f"- {bullet}" for bullet in bullets[:4]],
             "",
             "Changed areas:",
-            *[f"- {path}" for path in changed_lines],
+            *[f"- {line}" for line in changed_lines],
             "",
             "Status:",
             "- Work appears to be in progress.",

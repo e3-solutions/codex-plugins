@@ -253,3 +253,30 @@ def test_foreground_skip_logs_noop_and_removes_event(tmp_path, monkeypatch):
     assert state["local_noops"][-1]["reason"] == "terminal issue"
     assert "evt-skip" in state["processed_event_ids"]
     assert not list((tmp_path / "events").glob("*.json"))
+
+
+def test_commit_comment_uses_path_based_summary_and_grouped_areas():
+    event = {
+        "type": "post_commit",
+        "short_sha": "b7753aa",
+        "commit_subject": "Implement reusable usage dashboard",
+        "changed_files": [
+            "src/react/UsageDashboard.js",
+            "src/react/UsageDashboard.css",
+            "src/core/aggregate.js",
+            "db/supabase/001_usage_dashboard.sql",
+            "docs/adapter-contract.md",
+            "test/aggregate.test.mjs",
+        ],
+    }
+    comment = linear_sync.build_linear_comment(event)
+    assert "Added or updated the React dashboard UI" in comment
+    assert "Added or updated core usage aggregation" in comment
+    assert "Database/Supabase schema" in comment
+    assert "React dashboard UI: src/react/UsageDashboard.js" in comment
+    assert "Tests: test/aggregate.test.mjs" in comment
+
+
+def test_changed_file_summary_falls_back_to_subject_when_empty():
+    assert linear_sync.summarize_changed_files([], subject="Do useful work") == ["Do useful work"]
+    assert linear_sync.changed_area_lines([]) == ["No changed-file list captured for this event"]
