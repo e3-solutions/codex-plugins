@@ -59,6 +59,7 @@ READ_ONLY_BASH_EXECUTABLES = {
     "file",
     "which",
 }
+SHELL_COMMAND_PUNCTUATION = ";&|<>"
 
 
 @dataclass(frozen=True)
@@ -1617,75 +1618,34 @@ def looks_like_branch_creation(command: str) -> bool:
 
 
 def shell_command_tokens(command: str) -> list[list[str]]:
-    tokens: list[list[str]] = []
-    for segment in shell_command_segments(command):
-        if not segment.strip():
-            continue
-        try:
-            parsed = shlex.split(segment)
-        except ValueError:
-            continue
-        if parsed:
-            tokens.append(parsed)
-    return tokens
+    try:
+        lexer = shlex.shlex(
+            (command or "").replace("\n", " ; "),
+            posix=True,
+            punctuation_chars=SHELL_COMMAND_PUNCTUATION,
+        )
+        lexer.whitespace_split = True
+        lexer.commenters = ""
+        parsed = list(lexer)
+    except ValueError:
+        return []
 
-
-def shell_command_segments(command: str) -> list[str]:
-    segments: list[str] = []
+    segments: list[list[str]] = []
     current: list[str] = []
-    in_single = False
-    in_double = False
-    escaped = False
-    text = command or ""
-    index = 0
-    while index < len(text):
-        char = text[index]
-        if escaped:
-            current.append(char)
-            escaped = False
-            index += 1
-            continue
-        if char == "\\" and not in_single:
-            current.append(char)
-            escaped = True
-            index += 1
-            continue
-        if char == "'" and not in_double:
-            in_single = not in_single
-            current.append(char)
-            index += 1
-            continue
-        if char == '"' and not in_single:
-            in_double = not in_double
-            current.append(char)
-            index += 1
-            continue
-        if not in_single and not in_double:
-            if text.startswith("&&", index) or text.startswith("||", index):
-                append_shell_segment(segments, current)
+    for token in parsed:
+        if shell_token_is_separator(token):
+            if current:
+                segments.append(current)
                 current = []
-                index += 2
-                continue
-            if char in {";", "|", "\n"}:
-                append_shell_segment(segments, current)
-                current = []
-                index += 1
-                continue
-            if char == "&" and not text.startswith("&>", index):
-                append_shell_segment(segments, current)
-                current = []
-                index += 1
-                continue
-        current.append(char)
-        index += 1
-    append_shell_segment(segments, current)
+            continue
+        current.append(token)
+    if current:
+        segments.append(current)
     return segments
 
 
-def append_shell_segment(segments: list[str], current: list[str]) -> None:
-    segment = "".join(current).strip()
-    if segment:
-        segments.append(segment)
+def shell_token_is_separator(token: str) -> bool:
+    return bool(token) and all(char in SHELL_COMMAND_PUNCTUATION for char in token)
 
 
 def git_tokens_create_branch(tokens: list[str]) -> bool:
@@ -1933,12 +1893,18 @@ def strip_env_prefix(tokens: list[str]) -> list[str]:
     index = 0
     if tokens and Path(tokens[0]).name == "env":
         index = 1
-        env_value_options = {"-u", "--unset", "-C", "--chdir", "-S", "--split-string"}
+        env_value_options = {"-u", "--unset", "-C", "--chdir"}
         while index < len(tokens):
             token = tokens[index]
             if token in {"-i", "--ignore-environment", "-0", "--null"}:
                 index += 1
                 continue
+            if token in {"-S", "--split-string"}:
+                if index + 1 >= len(tokens):
+                    return []
+                return strip_env_prefix([*safe_shlex_split(tokens[index + 1]), *tokens[index + 2 :]])
+            if token.startswith("--split-string="):
+                return strip_env_prefix([*safe_shlex_split(token.split("=", 1)[1]), *tokens[index + 1 :]])
             if token in env_value_options:
                 index += 2
                 continue
@@ -1956,6 +1922,13 @@ def strip_env_prefix(tokens: list[str]) -> list[str]:
             continue
         break
     return tokens[index:]
+
+
+def safe_shlex_split(value: str) -> list[str]:
+    try:
+        return shlex.split(value)
+    except ValueError:
+        return []
 
 
 def git_tokens_are_read_only(tokens: list[str]) -> bool:

@@ -539,6 +539,24 @@ def test_pre_tool_guard_blocks_ref_writing_git_commands_with_active_state(tmp_pa
         assert "only through the Linear kickoff workflow" in decision.message
 
 
+def test_pre_tool_guard_blocks_env_split_string_branch_creation_with_active_state(tmp_path, monkeypatch):
+    state_dir = tmp_path / "state"
+    monkeypatch.setenv("LINEAR_SYNC_STATE_DIR", str(state_dir))
+    repo = init_git_repo(tmp_path / "repo", branch="arya/cor-64-active")
+    linear_sync.write_active_issue(
+        active_payload(repo, issue_key="COR-64", issue_title="Active env split guard", pr_number=64),
+        root=repo,
+    )
+
+    decision = linear_sync.pre_tool_guard_decision(
+        {"tool_name": "Bash", "command": 'env -S "git switch -c arya/cor-65-bypass"'},
+        root=repo,
+    )
+
+    assert decision.blocked is True
+    assert "only through the Linear kickoff workflow" in decision.message
+
+
 def test_pre_tool_guard_blocks_switch_and_checkout_with_active_state(tmp_path, monkeypatch):
     state_dir = tmp_path / "state"
     monkeypatch.setenv("LINEAR_SYNC_STATE_DIR", str(state_dir))
