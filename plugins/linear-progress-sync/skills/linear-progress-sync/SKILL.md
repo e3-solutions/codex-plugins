@@ -9,13 +9,15 @@ Use this skill when working with the local `linear-progress-sync` plugin.
 
 ## Automatic Kickoff Rule
 
-Before writing code, creating a branch, or opening implementation changes, check for:
+For repos that use Linear sync, before writing code, creating a branch, or opening implementation changes, check for:
 
 ```bash
 .codex/linear-sync/active.json
 ```
 
-If it is missing, run the Linear kickoff workflow before editing:
+Repos with a saved Linear team/project binding in `~/.codex/linear-sync/repos.json` or an existing active state are Linear-sync repos. Repos without either are not blocked by hooks; ask before opting them into Linear sync.
+
+If active state is missing in a Linear-sync repo, run the Linear kickoff workflow before editing:
 
 1. Run `scripts/linear_start.py repo-binding --root <root>`.
 2. If this repo has no saved team/project and no existing issue was provided, call `mcp__codex_apps__linear._list_teams` and `mcp__codex_apps__linear._list_projects`, ask the user once which Linear team/project the repo should use, then save it with `scripts/linear_start.py configure-repo`.
@@ -31,7 +33,7 @@ The human should not need to remember `/linear-start`; use it as the explicit/ma
 
 - Never mark Linear issues Done, Completed, Closed, Canceled, or any terminal state.
 - Only add comments and optionally move a confirmed non-terminal issue to `In Progress`.
-- Do not write code or create a branch unless `.codex/linear-sync/active.json` exists, except while running the kickoff helper itself.
+- In Linear-sync repos, do not write code or create a branch unless `.codex/linear-sync/active.json` exists, except while running the kickoff helper itself.
 - Normal progress sync must use the active Linear issue first; branch/commit/fuzzy inference is legacy fallback only.
 - If confidence is below `0.8`, do not write to Linear.
 - If confidence is between `0.5` and `0.8`, write only to `.codex/linear-sync/review_queue.jsonl`.

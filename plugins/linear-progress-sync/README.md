@@ -48,9 +48,11 @@ This is user-level setup. You do not need to install anything separately in ever
 
 ## Normal Use
 
-Start a coding task in Codex. The plugin makes Codex run Linear kickoff before edits: Linear issue, branch, empty kickoff commit, draft PR, and local active state.
+Start a coding task in a repo that uses Linear sync. The plugin makes Codex run Linear kickoff before edits: Linear issue, branch, empty kickoff commit, draft PR, and local active state.
 
 The first time a repo needs a new Linear issue, Codex asks which Linear team/project that repo should use and saves it in `~/.codex/linear-sync/repos.json`. Future tasks in that repo reuse the saved team/project automatically.
+
+Repos without saved Linear team/project binding are left alone by the write guard, so installing this plugin does not block unrelated Codex threads.
 
 Standard Codex commits are then synced back to the active Linear issue automatically.
 

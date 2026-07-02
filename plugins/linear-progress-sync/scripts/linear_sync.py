@@ -1493,9 +1493,12 @@ def pre_tool_guard_decision(payload: JsonDict, *, root: str | Path | None = None
     tool = tool_name(payload)
     normalized_tool = tool.lower()
     requires_active_state = normalized_tool in {"apply_patch", "edit", "write"}
+    guard_enabled = linear_guard_enabled(root=root)
     if normalized_tool == "bash":
         command = tool_command(payload)
         if is_linear_start_command(command):
+            return PreToolGuardDecision(False)
+        if not guard_enabled:
             return PreToolGuardDecision(False)
         if looks_like_branch_creation(command):
             return PreToolGuardDecision(True, linear_branch_creation_blocked_message())
@@ -1505,12 +1508,21 @@ def pre_tool_guard_decision(payload: JsonDict, *, root: str | Path | None = None
             requires_active_state = True
 
     if requires_active_state:
+        if not guard_enabled:
+            return PreToolGuardDecision(False)
         problem = active_issue_write_problem(root=root)
         if problem:
             return PreToolGuardDecision(True, linear_kickoff_required_message(problem))
         return PreToolGuardDecision(False)
 
     return PreToolGuardDecision(False)
+
+
+def linear_guard_enabled(*, root: str | Path | None = None) -> bool:
+    loaded = load_active_issue(root=root)
+    if loaded.exists:
+        return True
+    return bool(repo_binding_status(root=root).get("configured"))
 
 
 def linear_branch_creation_blocked_message() -> str:
