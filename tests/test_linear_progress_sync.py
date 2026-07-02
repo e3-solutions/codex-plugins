@@ -483,6 +483,26 @@ def test_linear_start_requires_clean_worktree_before_kickoff(tmp_path, monkeypat
     assert linear_sync.local_branch_exists("arya/cor-43-reject-dirty-kickoff", root=repo) is False
 
 
+def test_clean_worktree_ignores_plugin_owned_state_in_fresh_repo(tmp_path, monkeypatch):
+    monkeypatch.delenv("LINEAR_SYNC_STATE_DIR", raising=False)
+    repo = init_git_repo(tmp_path / "repo", branch="arya/cor-44-work")
+    linear_sync.ensure_state(repo)
+
+    assert linear_sync.worktree_status_entries(root=repo) == []
+
+
+def test_clean_worktree_still_reports_unrelated_codex_files(tmp_path, monkeypatch):
+    monkeypatch.delenv("LINEAR_SYNC_STATE_DIR", raising=False)
+    repo = init_git_repo(tmp_path / "repo", branch="arya/cor-45-work")
+    linear_sync.ensure_state(repo)
+    other = repo / ".codex" / "other.json"
+    other.write_text("{}\n", encoding="utf-8")
+
+    entries = linear_sync.worktree_status_entries(root=repo)
+
+    assert any(".codex/other.json" in entry for entry in entries)
+
+
 def test_repo_identity_normalizes_github_origin(tmp_path):
     repo = init_git_repo(tmp_path / "repo")
     add_origin(repo, "git@github.com:e3-solutions/codex-plugins.git")

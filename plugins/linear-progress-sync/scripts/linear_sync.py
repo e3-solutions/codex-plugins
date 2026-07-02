@@ -694,9 +694,20 @@ def require_clean_worktree(*, root: str | Path | None = None) -> None:
 
 
 def worktree_status_entries(*, root: str | Path | None = None) -> list[str]:
-    result = run_git(["status", "--porcelain"], root=root)
+    result = run_git(["status", "--porcelain", "--untracked-files=all"], root=root)
     require_success(result, "check worktree status")
-    return [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    return [line.strip() for line in result.stdout.splitlines() if line.strip() and status_entry_is_meaningful(line)]
+
+
+def status_entry_is_meaningful(entry: str) -> bool:
+    return any(meaningful_file(path) for path in status_entry_paths(entry))
+
+
+def status_entry_paths(entry: str) -> list[str]:
+    payload = entry[3:] if len(entry) > 3 else entry
+    if " -> " in payload:
+        return [part.strip() for part in payload.split(" -> ") if part.strip()]
+    return [payload.strip()] if payload.strip() else []
 
 
 def run_local_command(args: list[str], *, root: str | Path | None = None) -> subprocess.CompletedProcess[str]:
@@ -1491,7 +1502,10 @@ def changed_paths_from_payload(payload: JsonDict) -> list[str]:
 
 
 def normalize_repo_path(path: str) -> str:
-    return path.replace("\\", "/").lstrip("./")
+    normalized = path.replace("\\", "/")
+    while normalized.startswith("./"):
+        normalized = normalized[2:]
+    return normalized
 
 
 def meaningful_file(path: str) -> bool:
