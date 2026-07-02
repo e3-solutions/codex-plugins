@@ -475,6 +475,26 @@ def test_pre_tool_guard_blocks_unknown_bash_without_active_state(tmp_path, monke
         assert "pre-kickoff read-only allowlist" in decision.message
 
 
+def test_pre_tool_guard_blocks_unbound_repo_without_active_state(tmp_path, monkeypatch):
+    state_dir = tmp_path / "state"
+    config_dir = tmp_path / "config"
+    monkeypatch.setenv("LINEAR_SYNC_STATE_DIR", str(state_dir))
+    monkeypatch.setenv("LINEAR_SYNC_CONFIG_DIR", str(config_dir))
+    repo = init_git_repo(tmp_path / "repo", branch="arya/no-linear-binding")
+
+    write_decision = linear_sync.pre_tool_guard_decision({"tool_name": "apply_patch"}, root=repo)
+    branch_decision = linear_sync.pre_tool_guard_decision(
+        {"tool_name": "Bash", "command": "git switch -c arya/normal-work"},
+        root=repo,
+    )
+
+    assert write_decision.blocked is True
+    assert branch_decision.blocked is True
+    assert write_decision.message.startswith("LINEAR DESTINATION REQUIRED")
+    assert "No Linear team/project is saved for this repo" in write_decision.message
+    assert branch_decision.message.startswith("LINEAR DESTINATION REQUIRED")
+
+
 def test_pre_tool_guard_blocks_writes_with_incomplete_active_state(tmp_path, monkeypatch):
     monkeypatch.setenv("LINEAR_SYNC_STATE_DIR", str(tmp_path))
     linear_sync.write_json_atomic(

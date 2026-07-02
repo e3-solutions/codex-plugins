@@ -43,7 +43,7 @@ The human should not need to remember `/linear-start`; use it as the explicit/ma
 
 - Never mark Linear issues Done, Completed, Closed, Canceled, or any terminal state.
 - Only add comments and optionally move a confirmed non-terminal issue to `In Progress`.
-- Do not write code or create a branch unless `.codex/linear-sync/active.json` exists, except while running the kickoff helper itself.
+- In Linear-sync repos, do not write code or create a branch unless `.codex/linear-sync/active.json` exists, except while running the kickoff helper itself.
 - Normal progress sync must use the active Linear issue first; branch/commit/fuzzy inference is legacy fallback only.
 - If confidence is below `0.8`, do not write to Linear.
 - If confidence is between `0.5` and `0.8`, write only to `.codex/linear-sync/review_queue.jsonl`.
