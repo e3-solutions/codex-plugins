@@ -78,7 +78,15 @@ def is_idempotent_setup_success(argv: list[str], output: str) -> bool:
     if not any(argv[: len(prefix)] == prefix for prefix in idempotent_prefixes):
         return False
     normalized_output = output.lower()
-    return any(phrase in normalized_output for phrase in ("already", "exists", "configured"))
+    idempotent_phrases = (
+        "already exists",
+        "already installed",
+        "already added",
+        "already configured",
+        "exists already",
+        "is already",
+    )
+    return any(phrase in normalized_output for phrase in idempotent_phrases)
 
 
 def missing_executable_message(executable: str) -> str:

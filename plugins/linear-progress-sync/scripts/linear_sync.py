@@ -44,6 +44,21 @@ IGNORED_FILE_PREFIXES = (
 IGNORED_FILE_NAMES = {
     ".DS_Store",
 }
+READ_ONLY_BASH_EXECUTABLES = {
+    "pwd",
+    "ls",
+    "cat",
+    "head",
+    "tail",
+    "wc",
+    "rg",
+    "grep",
+    "egrep",
+    "fgrep",
+    "nl",
+    "file",
+    "which",
+}
 
 
 @dataclass(frozen=True)
@@ -64,6 +79,13 @@ class WorkerResult:
 class PreToolGuardDecision:
     blocked: bool
     message: str = ""
+
+
+@dataclass(frozen=True)
+class ActiveIssueRead:
+    exists: bool
+    active: JsonDict | None = None
+    problem: str | None = None
 
 
 def repo_root(start: str | Path | None = None) -> Path:
@@ -224,49 +246,67 @@ def active_issue_path(root: str | Path | None = None) -> Path:
     return ensure_state(root) / "active.json"
 
 
-def read_active_issue(*, root: str | Path | None = None) -> JsonDict | None:
+def load_active_issue(*, root: str | Path | None = None) -> ActiveIssueRead:
     path = active_issue_path(root)
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
-    except (FileNotFoundError, OSError, json.JSONDecodeError):
-        return None
+    except FileNotFoundError:
+        return ActiveIssueRead(False)
+    except json.JSONDecodeError:
+        return ActiveIssueRead(True, problem="active Linear issue state is malformed")
+    except OSError as exc:
+        return ActiveIssueRead(True, problem=f"active Linear issue state could not be read: {exc}")
     if not isinstance(data, dict):
-        return None
+        return ActiveIssueRead(True, problem="active Linear issue state must be a JSON object")
     issue_key = data.get("issue_key") or data.get("issue_identifier") or data.get("identifier")
     if not isinstance(issue_key, str) or not issue_key.strip():
-        return None
+        return ActiveIssueRead(True, problem="active Linear issue state missing issue_key")
     data["issue_key"] = issue_key.strip().upper()
-    return data
+    return ActiveIssueRead(True, active=data)
 
 
-def read_current_active_issue(*, root: str | Path | None = None) -> JsonDict | None:
-    active = read_active_issue(root=root)
-    if not active or active_issue_context_problem(active, root=root):
+def read_active_issue(*, root: str | Path | None = None) -> JsonDict | None:
+    loaded = load_active_issue(root=root)
+    if loaded.problem:
         return None
-    return active
+    return loaded.active
 
 
-def active_issue_context_problem(active: JsonDict, *, root: str | Path | None = None) -> str | None:
-    active_repo = str(active.get("repo") or "").strip()
-    if not active_repo:
-        return "active Linear issue state missing repo"
-    current_repo = str(repo_root(root))
-    if active_repo and normalize_path(active_repo) != normalize_path(current_repo):
-        return f"active Linear issue repo {active_repo} does not match current repo {current_repo}"
+def active_issue_fail_closed_problem(*, root: str | Path | None = None) -> str | None:
+    loaded = load_active_issue(root=root)
+    if not loaded.exists:
+        return None
+    if loaded.problem:
+        return loaded.problem
+    if not loaded.active:
+        return "active Linear issue state could not be read"
+    return active_issue_context_problem(loaded.active, root=root)
 
-    active_branch = str(active.get("branch") or "").strip()
-    if not active_branch:
-        return "active Linear issue state missing branch"
-    branch = current_branch(root)
-    if not branch:
-        return "active Linear issue current branch could not be verified"
-    if active_branch != branch:
-        return f"active Linear issue branch {active_branch} does not match current branch {branch}"
 
-    for field in ("issue_title", "issue_url", "pr_url"):
+def active_issue_write_problem(*, root: str | Path | None = None) -> str | None:
+    loaded = load_active_issue(root=root)
+    if not loaded.exists:
+        return "Linear kickoff has not created active issue state"
+    if loaded.problem:
+        return loaded.problem
+    if not loaded.active:
+        return "active Linear issue state could not be read"
+    return active_issue_context_problem(loaded.active, root=root)
+
+
+def active_issue_schema_problem(active: JsonDict, *, require_linear_linked_at: bool = False) -> str | None:
+    issue_key = active.get("issue_key") or active.get("issue_identifier") or active.get("identifier")
+    if not isinstance(issue_key, str) or not issue_key.strip():
+        return "active Linear issue state missing issue_key"
+
+    for field in ("repo", "branch", "issue_title", "issue_url", "pr_url"):
         value = active.get(field)
         if not isinstance(value, str) or not value.strip():
             return f"active Linear issue state missing {field}"
+    if require_linear_linked_at:
+        value = active.get("linear_linked_at")
+        if not isinstance(value, str) or not value.strip():
+            return "active Linear issue state missing linear_linked_at"
 
     pr_number = active.get("pr_number")
     if pr_number is None or str(pr_number).strip() == "":
@@ -275,6 +315,33 @@ def active_issue_context_problem(active: JsonDict, *, root: str | Path | None = 
         int(pr_number)
     except (TypeError, ValueError):
         return "active Linear issue state has invalid pr_number"
+
+    return None
+
+
+def read_current_active_issue(*, root: str | Path | None = None) -> JsonDict | None:
+    loaded = load_active_issue(root=root)
+    if loaded.problem or not loaded.active or active_issue_context_problem(loaded.active, root=root):
+        return None
+    return loaded.active
+
+
+def active_issue_context_problem(active: JsonDict, *, root: str | Path | None = None) -> str | None:
+    schema_problem = active_issue_schema_problem(active)
+    if schema_problem:
+        return schema_problem
+
+    active_repo = str(active.get("repo") or "").strip()
+    current_repo = str(repo_root(root))
+    if active_repo and normalize_path(active_repo) != normalize_path(current_repo):
+        return f"active Linear issue repo {active_repo} does not match current repo {current_repo}"
+
+    active_branch = str(active.get("branch") or "").strip()
+    branch = current_branch(root)
+    if not branch:
+        return "active Linear issue current branch could not be verified"
+    if active_branch != branch:
+        return f"active Linear issue branch {active_branch} does not match current branch {branch}"
 
     return None
 
@@ -291,6 +358,9 @@ def write_active_issue(payload: JsonDict, *, root: str | Path | None = None) -> 
     active["issue_key"] = issue_key.strip().upper()
     active.setdefault("created_at", now_iso())
     active.setdefault("repo", str(repo_root(root)))
+    problem = active_issue_schema_problem(active, require_linear_linked_at=True)
+    if problem:
+        raise ValueError(problem)
     write_json_atomic(active_issue_path(root), active)
     return active
 
@@ -455,18 +525,24 @@ def git_author(*, root: str | Path | None = None) -> str | None:
 
 def infer_issue(event: JsonDict, state: JsonDict | None = None, *, root: str | Path | None = None) -> IssueInference:
     local_state = state or read_state(root)
-    explicit_key = first_issue_key(str(event.get("issue_key") or ""))
-    if explicit_key:
-        return with_cached_status(IssueInference(explicit_key, 1.0, "explicit event issue key"), local_state)
-
-    active = read_current_active_issue(root=root)
-    if active:
+    loaded_active = load_active_issue(root=root)
+    if loaded_active.exists:
+        if loaded_active.problem:
+            return IssueInference(None, 0.0, loaded_active.problem)
+        active = loaded_active.active
+        problem = active_issue_context_problem(active, root=root) if active else "active Linear issue state could not be read"
+        if problem:
+            return IssueInference(None, 0.0, problem)
         return IssueInference(
             active["issue_key"],
             1.0,
             "active Linear issue state",
             status=str(active.get("issue_status") or active.get("status") or "") or None,
         )
+
+    explicit_key = first_issue_key(str(event.get("issue_key") or ""))
+    if explicit_key:
+        return with_cached_status(IssueInference(explicit_key, 1.0, "explicit event issue key"), local_state)
 
     branch = str(event.get("branch") or current_branch(root) or "")
     key = first_issue_key(branch)
@@ -564,13 +640,15 @@ def linear_start_plan(
     project: str | None = None,
     root: str | Path | None = None,
 ) -> JsonDict:
+    if not issue_url or not str(issue_url).strip():
+        raise ValueError("Linear kickoff requires issue_url before creating GitHub or Git state")
     branch = branch or fallback_branch_name(issue_key, issue_title)
     title = pr_title_for_issue(issue_key, issue_title)
-    body = pr_body_for_issue(issue_key, issue_title, issue_url)
+    body = pr_body_for_issue(issue_key, issue_title, str(issue_url).strip())
     active_state = {
         "issue_key": issue_key.upper(),
         "issue_title": issue_title,
-        "issue_url": issue_url,
+        "issue_url": str(issue_url).strip(),
         "branch": branch,
         "repo": str(repo_root(root)),
     }
@@ -670,11 +748,73 @@ def run_linear_start(
     pr_number = extract_pr_number(pr_url)
     if pr_number is None:
         raise RuntimeError("Failed to create draft pull request: pull request URL did not include a PR number")
-    active_state = dict(plan["active_state"])
-    active_state["pr_url"] = pr_url
-    active_state["pr_number"] = pr_number
-    active = write_active_issue(active_state, root=root)
-    return {**plan, "active_state": active, "pr_url": pr_url}
+    pending_active_state = dict(plan["active_state"])
+    pending_active_state["pr_url"] = pr_url
+    pending_active_state["pr_number"] = pr_number
+    return {
+        **plan,
+        "pending_active_state": pending_active_state,
+        "pr_url": pr_url,
+        "activation_command": linear_start_activation_command(pending_active_state, root=root),
+    }
+
+
+def activate_linear_start(
+    *,
+    issue_key: str,
+    issue_title: str,
+    issue_url: str,
+    branch: str,
+    pr_url: str,
+    pr_number: int | str,
+    team: str | None = None,
+    project: str | None = None,
+    root: str | Path | None = None,
+    linked_at: str | None = None,
+) -> JsonDict:
+    active_state: JsonDict = {
+        "issue_key": issue_key.upper(),
+        "issue_title": issue_title,
+        "issue_url": issue_url,
+        "branch": branch,
+        "repo": str(repo_root(root)),
+        "pr_url": pr_url,
+        "pr_number": int(pr_number),
+        "linear_linked_at": linked_at or now_iso(),
+    }
+    if team:
+        active_state["team"] = team
+    if project:
+        active_state["project"] = project
+    return write_active_issue(active_state, root=root)
+
+
+def linear_start_activation_command(active_state: JsonDict, *, root: str | Path | None = None) -> str:
+    script = Path(__file__).with_name("linear_start.py")
+    parts = [
+        sys.executable,
+        str(script),
+        "activate",
+        "--root",
+        str(repo_root(root)),
+        "--issue-key",
+        str(active_state.get("issue_key") or ""),
+        "--issue-title",
+        str(active_state.get("issue_title") or ""),
+        "--issue-url",
+        str(active_state.get("issue_url") or ""),
+        "--branch",
+        str(active_state.get("branch") or ""),
+        "--pr-url",
+        str(active_state.get("pr_url") or ""),
+        "--pr-number",
+        str(active_state.get("pr_number") or ""),
+    ]
+    for key, flag in (("team", "--team"), ("project", "--project")):
+        value = active_state.get(key)
+        if value:
+            parts.extend([flag, str(value)])
+    return " ".join(shlex.quote(part) for part in parts)
 
 
 def local_branch_exists(branch: str, *, root: str | Path | None = None) -> bool:
@@ -711,8 +851,19 @@ def plugin_owned_status_path(path: str) -> bool:
 def status_entry_paths(entry: str) -> list[str]:
     payload = entry[3:] if len(entry) > 3 else entry
     if " -> " in payload:
-        return [part.strip() for part in payload.split(" -> ") if part.strip()]
-    return [payload.strip()] if payload.strip() else []
+        return [decode_status_path(part) for part in payload.split(" -> ") if part.strip()]
+    return [decode_status_path(payload)] if payload.strip() else []
+
+
+def decode_status_path(path: str) -> str:
+    value = path.strip()
+    try:
+        parts = shlex.split(value)
+    except ValueError:
+        return value.strip('"')
+    if len(parts) == 1:
+        return parts[0]
+    return value.strip('"')
 
 
 def run_local_command(args: list[str], *, root: str | Path | None = None) -> subprocess.CompletedProcess[str]:
@@ -926,7 +1077,24 @@ def drain_once(
     failed = 0
     reviewed = 0
     skipped = 0
-    for path, event in load_events(root):
+    events = load_events(root)
+    active_problem = active_issue_fail_closed_problem(root=root)
+    if active_problem and events:
+        local_state.setdefault("failures", {})["active_state"] = {
+            "count": len(events),
+            "last_error": active_problem,
+            "last_failed_at": now_iso(),
+        }
+        save_state(local_state, root)
+        return {
+            "processed": 0,
+            "reviewed": 0,
+            "skipped": 0,
+            "failed": len(events),
+            "active_state_error": active_problem,
+        }
+
+    for path, event in events:
         event_id = str(event.get("id") or path.stem)
         if event_id in set(local_state.get("processed_event_ids") or []):
             safe_unlink(path)
@@ -1056,7 +1224,34 @@ def foreground_sync_plan(
     eligible: list[JsonDict] = []
     held: list[JsonDict] = []
     skipped: list[JsonDict] = []
-    for path, event in load_events(root):
+    events = load_events(root)
+    active_problem = active_issue_fail_closed_problem(root=root)
+    if active_problem:
+        for path, event in events:
+            event_id = str(event.get("id") or path.stem)
+            held.append(
+                {
+                    "event_id": event_id,
+                    "event_type": event.get("type"),
+                    "event": event,
+                    "inference": IssueInference(None, 0.0, active_problem).__dict__,
+                    "reason": active_problem,
+                }
+            )
+            if len(held) >= limit:
+                break
+        return {
+            "repo": str(repo_root(root)),
+            "eligible": eligible,
+            "held": held,
+            "skipped": skipped,
+            "instructions": [
+                "Fix the active Linear issue state before writing Linear updates.",
+                "Do not acknowledge queued events until active state is valid and the Linear comment is confirmed visible.",
+            ],
+        }
+
+    for path, event in events:
         event_id = str(event.get("id") or path.stem)
         inference = infer_issue(event, local_state, root=root)
         item = {
@@ -1299,21 +1494,29 @@ def pre_tool_guard_decision(payload: JsonDict, *, root: str | Path | None = None
     requires_active_state = normalized_tool in {"apply_patch", "edit", "write"}
     if normalized_tool == "bash":
         command = tool_command(payload)
-        if looks_like_branch_creation(command):
-            requires_active_state = True
-        elif is_linear_start_command(command):
+        if is_linear_start_command(command):
             return PreToolGuardDecision(False)
+        if looks_like_branch_creation(command):
+            return PreToolGuardDecision(True, linear_branch_creation_blocked_message())
+        if bash_command_is_read_only(command):
+            return PreToolGuardDecision(False)
+        else:
+            requires_active_state = True
 
     if requires_active_state:
-        active = read_active_issue(root=root)
-        if active:
-            problem = active_issue_context_problem(active, root=root)
-            if problem:
-                return PreToolGuardDecision(True, linear_kickoff_required_message(problem))
-            return PreToolGuardDecision(False)
-        return PreToolGuardDecision(True, linear_kickoff_required_message())
+        problem = active_issue_write_problem(root=root)
+        if problem:
+            return PreToolGuardDecision(True, linear_kickoff_required_message(problem))
+        return PreToolGuardDecision(False)
 
     return PreToolGuardDecision(False)
+
+
+def linear_branch_creation_blocked_message() -> str:
+    return (
+        "Create or reset implementation branches only through the Linear kickoff workflow. "
+        "Run the automatic Linear kickoff workflow first so Linear, the branch, and the draft PR stay linked."
+    )
 
 
 def linear_kickoff_required_message(reason: str | None = None) -> str:
@@ -1415,7 +1618,7 @@ def looks_like_branch_creation(command: str) -> bool:
 
 def shell_command_tokens(command: str) -> list[list[str]]:
     tokens: list[list[str]] = []
-    for segment in re.split(r"\s*(?:&&|\|\||;|\|)\s*", command):
+    for segment in shell_command_segments(command):
         if not segment.strip():
             continue
         try:
@@ -1427,30 +1630,148 @@ def shell_command_tokens(command: str) -> list[list[str]]:
     return tokens
 
 
+def shell_command_segments(command: str) -> list[str]:
+    segments: list[str] = []
+    current: list[str] = []
+    in_single = False
+    in_double = False
+    escaped = False
+    text = command or ""
+    index = 0
+    while index < len(text):
+        char = text[index]
+        if escaped:
+            current.append(char)
+            escaped = False
+            index += 1
+            continue
+        if char == "\\" and not in_single:
+            current.append(char)
+            escaped = True
+            index += 1
+            continue
+        if char == "'" and not in_double:
+            in_single = not in_single
+            current.append(char)
+            index += 1
+            continue
+        if char == '"' and not in_single:
+            in_double = not in_double
+            current.append(char)
+            index += 1
+            continue
+        if not in_single and not in_double:
+            if text.startswith("&&", index) or text.startswith("||", index):
+                append_shell_segment(segments, current)
+                current = []
+                index += 2
+                continue
+            if char in {";", "|", "\n"}:
+                append_shell_segment(segments, current)
+                current = []
+                index += 1
+                continue
+            if char == "&" and not text.startswith("&>", index):
+                append_shell_segment(segments, current)
+                current = []
+                index += 1
+                continue
+        current.append(char)
+        index += 1
+    append_shell_segment(segments, current)
+    return segments
+
+
+def append_shell_segment(segments: list[str], current: list[str]) -> None:
+    segment = "".join(current).strip()
+    if segment:
+        segments.append(segment)
+
+
 def git_tokens_create_branch(tokens: list[str]) -> bool:
-    try:
-        git_index = tokens.index("git")
-    except ValueError:
+    executable_tokens = strip_env_prefix(tokens)
+    if not executable_tokens or read_only_shell_executable(Path(executable_tokens[0]).name):
         return False
-    args = skip_git_global_options(tokens[git_index + 1 :])
+    git_index = git_token_index(executable_tokens)
+    if git_index is None:
+        return False
+    args = skip_git_global_options(executable_tokens[git_index + 1 :])
     if not args:
         return False
     command = args[0]
     rest = args[1:]
 
-    if command == "switch":
-        return has_long_option(rest, {"--create", "--force-create", "--track"}) or has_short_option(rest, {"c", "C", "t"})
-    if command == "checkout":
-        return has_long_option(rest, {"--branch", "--orphan", "--track"}) or has_short_option(rest, {"b", "B", "t"})
+    if command in {"switch", "checkout"}:
+        return True
     if command == "branch":
-        if has_long_option(rest, {"--copy", "--force-copy", "--track"}) or has_short_option(rest, {"c", "C", "t"}):
-            return True
-        return bool(rest and not rest[0].startswith("-"))
+        return git_branch_args_create_branch(rest)
+    if command == "update-ref":
+        return True
+    if command == "symbolic-ref":
+        return True
+    if command == "stash" and rest and rest[0] == "branch":
+        return True
     if command == "worktree" and rest and rest[0] == "add":
-        add_args = rest[1:]
-        return has_long_option(add_args, {"--branch"}) or has_short_option(add_args, {"b", "B"})
+        return True
 
     return False
+
+
+def git_token_index(tokens: list[str]) -> int | None:
+    for index, token in enumerate(tokens):
+        if Path(token).name == "git":
+            return index
+    return None
+
+
+def git_branch_args_create_branch(args: list[str]) -> bool:
+    if not args:
+        return False
+    if has_long_option(args, {"--copy", "--force-copy", "--track"}) or has_short_option(args, {"c", "C", "t"}):
+        return True
+    if has_long_option(args, {"--delete", "--move", "--list", "--all", "--remotes", "--show-current"}):
+        return False
+    if has_short_option(args, {"d", "D", "m", "M", "a", "r"}):
+        return False
+    operands = git_branch_operands(args)
+    if has_long_option(args, {"--force", "--create-reflog"}) or has_short_option(args, {"f"}):
+        return bool(operands)
+    return bool(operands)
+
+
+def git_branch_operands(args: list[str]) -> list[str]:
+    operands: list[str] = []
+    value_options = {
+        "--contains",
+        "--no-contains",
+        "--merged",
+        "--no-merged",
+        "--points-at",
+        "--format",
+        "--sort",
+        "--color",
+        "--column",
+        "--set-upstream-to",
+        "-u",
+    }
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        if arg == "--":
+            operands.extend(args[index + 1 :])
+            break
+        if arg in value_options:
+            index += 2
+            continue
+        if any(arg.startswith(f"{option}=") for option in value_options if option.startswith("--")):
+            index += 1
+            continue
+        if arg.startswith("-"):
+            index += 1
+            continue
+        operands.append(arg)
+        index += 1
+    return operands
 
 
 def skip_git_global_options(args: list[str]) -> list[str]:
@@ -1489,8 +1810,272 @@ def has_short_option(args: list[str], letters: set[str]) -> bool:
     return False
 
 
+def bash_command_is_read_only(command: str) -> bool:
+    if (
+        shell_command_has_write_redirection(command)
+        or shell_command_has_substitution(command)
+        or shell_command_has_grouping(command)
+    ):
+        return False
+    segments = shell_command_tokens(command)
+    return bool(segments) and all(command_tokens_are_read_only(tokens) for tokens in segments)
+
+
+def command_tokens_are_read_only(tokens: list[str]) -> bool:
+    if not tokens or command_tokens_have_write_redirection(tokens):
+        return False
+    tokens = strip_env_prefix(tokens)
+    if not tokens:
+        return False
+    executable = Path(tokens[0]).name
+    if executable == "git":
+        return git_tokens_are_read_only(tokens)
+    if executable in READ_ONLY_BASH_EXECUTABLES:
+        return True
+    if executable == "sed":
+        return not has_short_option(tokens[1:], {"i"}) and not has_long_option(tokens[1:], {"--in-place"})
+    if executable == "find":
+        unsafe = {"-delete", "-exec", "-execdir", "-ok", "-okdir"}
+        return not any(token in unsafe for token in tokens[1:])
+    if executable in {"test", "[", "true", "false", "echo"}:
+        return True
+    return False
+
+
+def read_only_shell_executable(executable: str) -> bool:
+    return executable in READ_ONLY_BASH_EXECUTABLES or executable in {"test", "[", "true", "false", "echo"}
+
+
+def command_tokens_have_write_redirection(tokens: list[str]) -> bool:
+    return any(re.match(r"^(?:\d*>>?|&>)(?:.+)?$", token) for token in tokens)
+
+
+def shell_command_has_write_redirection(command: str) -> bool:
+    in_single = False
+    in_double = False
+    escaped = False
+    for char in command or "":
+        if escaped:
+            escaped = False
+            continue
+        if char == "\\" and not in_single:
+            escaped = True
+            continue
+        if char == "'" and not in_double:
+            in_single = not in_single
+            continue
+        if char == '"' and not in_single:
+            in_double = not in_double
+            continue
+        if char == ">" and not in_single and not in_double:
+            return True
+    return False
+
+
+def shell_command_has_grouping(command: str) -> bool:
+    in_single = False
+    in_double = False
+    escaped = False
+    for char in command or "":
+        if escaped:
+            escaped = False
+            continue
+        if char == "\\" and not in_single:
+            escaped = True
+            continue
+        if char == "'" and not in_double:
+            in_single = not in_single
+            continue
+        if char == '"' and not in_single:
+            in_double = not in_double
+            continue
+        if char in {"(", ")", "{", "}"} and not in_single and not in_double:
+            return True
+    return False
+
+
+def shell_command_has_substitution(command: str) -> bool:
+    in_single = False
+    in_double = False
+    escaped = False
+    text = command or ""
+    index = 0
+    while index < len(text):
+        char = text[index]
+        if escaped:
+            escaped = False
+            index += 1
+            continue
+        if char == "\\" and not in_single:
+            escaped = True
+            index += 1
+            continue
+        if char == "'" and not in_double:
+            in_single = not in_single
+            index += 1
+            continue
+        if char == '"' and not in_single:
+            in_double = not in_double
+            index += 1
+            continue
+        if not in_single and (
+            text.startswith("$(", index)
+            or text.startswith("<(", index)
+            or text.startswith(">(", index)
+            or char == "`"
+        ):
+            return True
+        index += 1
+    return False
+
+
+def strip_env_prefix(tokens: list[str]) -> list[str]:
+    index = 0
+    if tokens and Path(tokens[0]).name == "env":
+        index = 1
+        env_value_options = {"-u", "--unset", "-C", "--chdir", "-S", "--split-string"}
+        while index < len(tokens):
+            token = tokens[index]
+            if token in {"-i", "--ignore-environment", "-0", "--null"}:
+                index += 1
+                continue
+            if token in env_value_options:
+                index += 2
+                continue
+            if any(token.startswith(f"{option}=") for option in env_value_options if option.startswith("--")):
+                index += 1
+                continue
+            break
+    while index < len(tokens):
+        token = tokens[index]
+        if token == "--":
+            index += 1
+            break
+        if "=" in token and not token.startswith("-") and token.split("=", 1)[0]:
+            index += 1
+            continue
+        break
+    return tokens[index:]
+
+
+def git_tokens_are_read_only(tokens: list[str]) -> bool:
+    git_index = git_token_index(tokens)
+    if git_index is None:
+        return False
+    args = skip_git_global_options(tokens[git_index + 1 :])
+    if not args:
+        return False
+    command = args[0]
+    rest = args[1:]
+    always_read_only = {
+        "status",
+        "diff",
+        "log",
+        "show",
+        "rev-parse",
+        "ls-files",
+        "grep",
+        "describe",
+        "merge-base",
+    }
+    if command in always_read_only:
+        return True
+    if command == "remote":
+        return git_remote_args_are_read_only(rest)
+    if command == "config":
+        return git_config_args_are_read_only(rest)
+    if command == "branch":
+        return git_branch_args_are_read_only(rest)
+    return False
+
+
+def git_remote_args_are_read_only(args: list[str]) -> bool:
+    if not args:
+        return True
+    if args[0] in {"-v", "--verbose"}:
+        return True
+    return args[0] in {"get-url", "show", "prune", "update"} and not any(arg in {"--add", "--delete"} for arg in args[1:])
+
+
+def git_config_args_are_read_only(args: list[str]) -> bool:
+    if not args:
+        return False
+    read_flags = {"--get", "--get-all", "--get-regexp", "--list", "-l", "--show-origin", "--show-scope"}
+    if any(arg in read_flags or arg.startswith("--get-urlmatch") for arg in args):
+        return True
+    non_value_options = {"--global", "--system", "--local", "--worktree", "--file", "-f"}
+    filtered = [arg for arg in args if arg not in non_value_options]
+    return len(filtered) == 1 and not filtered[0].startswith("-")
+
+
+def git_branch_args_are_read_only(args: list[str]) -> bool:
+    if not args:
+        return True
+    if git_branch_args_create_branch(args):
+        return False
+    if has_long_option(args, {"--delete", "--move", "--copy", "--force-copy"}):
+        return False
+    if has_short_option(args, {"d", "D", "m", "M", "c", "C"}):
+        return False
+    allowed_options = {
+        "--list",
+        "--all",
+        "--remotes",
+        "--show-current",
+        "--contains",
+        "--no-contains",
+        "--merged",
+        "--no-merged",
+        "--points-at",
+        "--format",
+        "--sort",
+        "--color",
+        "--column",
+        "--verbose",
+    }
+    for arg in args:
+        if arg == "--":
+            return True
+        if arg.startswith("--") and not any(arg == option or arg.startswith(f"{option}=") for option in allowed_options):
+            return False
+        if arg.startswith("-") and not arg.startswith("--") and not set(arg[1:]) <= {"a", "r", "v"}:
+            return False
+    return True
+
+
 def is_linear_start_command(command: str) -> bool:
-    return "linear_start.py" in (command or "") or "/linear-start" in (command or "")
+    if shell_command_has_write_redirection(command):
+        return False
+    segments = shell_command_tokens(command or "")
+    return bool(segments) and all(command_tokens_are_linear_start(tokens) for tokens in segments)
+
+
+def command_tokens_are_linear_start(tokens: list[str]) -> bool:
+    tokens = strip_env_prefix(tokens)
+    if not tokens:
+        return False
+    executable = Path(tokens[0]).name
+    script_index = 0
+    if executable in {"python", "python3"}:
+        if len(tokens) < 2:
+            return False
+        script_index = 1
+    elif executable == "linear_start.py":
+        script_index = 0
+    elif tokens[0] == "/linear-start":
+        return True
+    else:
+        return False
+    script = Path(tokens[script_index]).name
+    if script != "linear_start.py":
+        return False
+    return len(tokens) > script_index + 1 and tokens[script_index + 1] in {
+        "kickoff",
+        "activate",
+        "repo-binding",
+        "configure-repo",
+    }
+
 
 
 def changed_paths_from_payload(payload: JsonDict) -> list[str]:

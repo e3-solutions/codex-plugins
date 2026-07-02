@@ -38,6 +38,26 @@ def add_origin(repo: Path, url: str) -> None:
     subprocess.run(["git", "remote", "add", "origin", url], cwd=repo, check=True)
 
 
+def active_payload(
+    repo: Path,
+    *,
+    issue_key: str = "COR-33",
+    issue_title: str = "Active issue",
+    branch: str | None = None,
+    pr_number: int = 33,
+) -> dict:
+    return {
+        "issue_key": issue_key,
+        "issue_url": f"https://linear.app/coreedge/issue/{issue_key}/test",
+        "issue_title": issue_title,
+        "branch": branch or linear_sync.current_branch(repo),
+        "repo": str(repo),
+        "pr_url": f"https://github.com/e3-solutions/codex-plugins/pull/{pr_number}",
+        "pr_number": pr_number,
+        "linear_linked_at": "2026-07-01T00:00:00+00:00",
+    }
+
+
 def test_terminal_statuses_are_never_changed(tmp_path, monkeypatch):
     monkeypatch.setenv("LINEAR_SYNC_STATE_DIR", str(tmp_path))
     state = linear_sync.default_state()
@@ -137,17 +157,7 @@ def test_active_linear_issue_wins_over_branch_and_commit_inference(tmp_path, mon
     state_dir = tmp_path / "state"
     monkeypatch.setenv("LINEAR_SYNC_STATE_DIR", str(state_dir))
     repo = init_git_repo(tmp_path / "repo", branch="arya/cor-33-active-issue")
-    linear_sync.write_active_issue(
-        {
-            "issue_key": "COR-33",
-            "issue_url": "https://linear.app/coreedge/issue/COR-33/test",
-            "issue_title": "Active issue",
-            "branch": "arya/cor-33-active-issue",
-            "pr_url": "https://github.com/e3-solutions/codex-plugins/pull/33",
-            "pr_number": 33,
-        },
-        root=repo,
-    )
+    linear_sync.write_active_issue(active_payload(repo), root=repo)
     event = {
         "branch": "arya/cor-999-wrong-branch",
         "commit_subject": "COR-888 wrong commit",
@@ -160,17 +170,11 @@ def test_active_linear_issue_wins_over_branch_and_commit_inference(tmp_path, mon
     assert inference.reason == "active Linear issue state"
 
 
-def test_explicit_event_issue_key_wins_over_active_state(tmp_path, monkeypatch):
-    monkeypatch.setenv("LINEAR_SYNC_STATE_DIR", str(tmp_path))
-    linear_sync.write_active_issue(
-        {
-            "issue_key": "COR-33",
-            "issue_url": "https://linear.app/coreedge/issue/COR-33/test",
-            "issue_title": "Active issue",
-            "branch": "arya/cor-33-active-issue",
-        },
-        root=tmp_path,
-    )
+def test_active_state_wins_over_explicit_event_issue_key(tmp_path, monkeypatch):
+    state_dir = tmp_path / "state"
+    monkeypatch.setenv("LINEAR_SYNC_STATE_DIR", str(state_dir))
+    repo = init_git_repo(tmp_path / "repo", branch="arya/cor-33-active-issue")
+    linear_sync.write_active_issue(active_payload(repo), root=repo)
 
     inference = linear_sync.infer_issue(
         {
@@ -178,12 +182,12 @@ def test_explicit_event_issue_key_wins_over_active_state(tmp_path, monkeypatch):
             "branch": "arya/cor-33-active-issue",
             "commit_subject": "COR-33 active issue",
         },
-        root=tmp_path,
+        root=repo,
     )
 
-    assert inference.issue_key == "COR-99"
+    assert inference.issue_key == "COR-33"
     assert inference.confidence == 1.0
-    assert inference.reason == "explicit event issue key"
+    assert inference.reason == "active Linear issue state"
 
 
 def test_active_state_branch_mismatch_blocks_writes_and_does_not_infer_active(tmp_path, monkeypatch):
@@ -191,11 +195,7 @@ def test_active_state_branch_mismatch_blocks_writes_and_does_not_infer_active(tm
     monkeypatch.setenv("LINEAR_SYNC_STATE_DIR", str(state_dir))
     repo = init_git_repo(tmp_path / "repo", branch="arya/cor-99-new-work")
     linear_sync.write_active_issue(
-        {
-            "issue_key": "COR-33",
-            "issue_title": "Old work",
-            "branch": "arya/cor-33-old-work",
-        },
+        active_payload(repo, issue_key="COR-33", issue_title="Old work", branch="arya/cor-33-old-work"),
         root=repo,
     )
 
@@ -210,8 +210,8 @@ def test_active_state_branch_mismatch_blocks_writes_and_does_not_infer_active(tm
 
     assert decision.blocked is True
     assert "does not match current branch" in decision.message
-    assert inference.issue_key == "COR-99"
-    assert inference.reason == "issue key found in branch name"
+    assert inference.issue_key is None
+    assert "does not match current branch" in inference.reason
 
 
 def test_active_linear_issue_state_round_trips_and_malformed_fails_closed(tmp_path, monkeypatch):
@@ -222,6 +222,8 @@ def test_active_linear_issue_state_round_trips_and_malformed_fails_closed(tmp_pa
         "issue_title": "Round trip",
         "branch": "arya/cor-34-round-trip",
         "pr_url": "https://github.com/e3-solutions/codex-plugins/pull/34",
+        "pr_number": 34,
+        "linear_linked_at": "2026-07-01T00:00:00+00:00",
     }
 
     linear_sync.write_active_issue(payload, root=tmp_path)
@@ -229,6 +231,66 @@ def test_active_linear_issue_state_round_trips_and_malformed_fails_closed(tmp_pa
     assert linear_sync.read_active_issue(root=tmp_path)["issue_key"] == "COR-34"
     (tmp_path / "active.json").write_text("{not json", encoding="utf-8")
     assert linear_sync.read_active_issue(root=tmp_path) is None
+
+
+def test_legacy_active_state_without_link_timestamp_still_reads_when_pr_evidence_exists(tmp_path, monkeypatch):
+    state_dir = tmp_path / "state"
+    monkeypatch.setenv("LINEAR_SYNC_STATE_DIR", str(state_dir))
+    repo = init_git_repo(tmp_path / "repo", branch="arya/cor-52-legacy")
+    legacy = active_payload(repo, issue_key="COR-52", issue_title="Legacy active state", pr_number=52)
+    legacy.pop("linear_linked_at")
+    linear_sync.write_json_atomic(linear_sync.active_issue_path(root=repo), legacy)
+
+    active = linear_sync.read_current_active_issue(root=repo)
+    decision = linear_sync.pre_tool_guard_decision({"tool_name": "apply_patch"}, root=repo)
+
+    assert active["issue_key"] == "COR-52"
+    assert decision.blocked is False
+
+
+def test_malformed_active_state_prevents_drain_linear_write(tmp_path, monkeypatch):
+    state_dir = tmp_path / "state"
+    monkeypatch.setenv("LINEAR_SYNC_STATE_DIR", str(state_dir))
+    repo = init_git_repo(tmp_path / "repo", branch="arya/cor-77-work")
+    linear_sync.active_issue_path(root=repo).write_text("{not json", encoding="utf-8")
+    linear_sync.enqueue_event(
+        "post_commit",
+        {
+            "id": "evt-malformed-active",
+            "commit_sha": "bad123",
+            "commit_subject": "COR-77 should not fall back",
+        },
+        root=repo,
+    )
+    calls = []
+
+    result = linear_sync.drain_once(
+        root=repo,
+        executor=lambda prompt, event, inference: calls.append(event) or linear_sync.WorkerResult(True, "ok"),
+    )
+
+    assert result["failed"] == 1
+    assert "active_state_error" in result
+    assert calls == []
+    assert list((state_dir / "events").glob("*.json"))
+
+
+def test_malformed_active_state_holds_foreground_sync(tmp_path, monkeypatch):
+    state_dir = tmp_path / "state"
+    monkeypatch.setenv("LINEAR_SYNC_STATE_DIR", str(state_dir))
+    repo = init_git_repo(tmp_path / "repo", branch="arya/cor-78-work")
+    linear_sync.active_issue_path(root=repo).write_text("{not json", encoding="utf-8")
+    linear_sync.enqueue_event(
+        "post_commit",
+        {"id": "evt-fg-malformed", "commit_sha": "fgbad", "commit_subject": "COR-78 hold"},
+        root=repo,
+    )
+
+    plan = linear_sync.foreground_sync_plan(root=repo)
+
+    assert plan["eligible"] == []
+    assert plan["held"][0]["event_id"] == "evt-fg-malformed"
+    assert "malformed" in plan["held"][0]["reason"]
 
 
 def test_linear_branch_name_wins_over_fallback():
@@ -294,15 +356,12 @@ def test_pre_tool_guard_blocks_active_state_without_pr_evidence(tmp_path, monkey
     state_dir = tmp_path / "state"
     monkeypatch.setenv("LINEAR_SYNC_STATE_DIR", str(state_dir))
     repo = init_git_repo(tmp_path / "repo", branch="arya/cor-40-work")
-    linear_sync.write_active_issue(
-        {
-            "issue_key": "COR-40",
-            "issue_title": "Missing PR evidence",
-            "issue_url": "https://linear.app/coreedge/issue/COR-40/missing-pr-evidence",
-            "branch": "arya/cor-40-work",
-            "repo": str(repo),
-        },
-        root=repo,
+    incomplete = active_payload(repo, issue_key="COR-40", issue_title="Missing PR evidence", pr_number=40)
+    incomplete.pop("pr_url")
+    incomplete.pop("pr_number")
+    linear_sync.write_json_atomic(
+        linear_sync.active_issue_path(root=repo),
+        incomplete,
     )
 
     decision = linear_sync.pre_tool_guard_decision({"tool_name": "apply_patch"}, root=repo)
@@ -325,6 +384,7 @@ def test_pre_tool_guard_blocks_when_current_branch_cannot_be_verified(tmp_path, 
             "repo": str(repo),
             "pr_url": "https://github.com/e3-solutions/codex-plugins/pull/41",
             "pr_number": 41,
+            "linear_linked_at": "2026-07-01T00:00:00+00:00",
         },
         root=repo,
     )
@@ -340,11 +400,22 @@ def test_pre_tool_guard_blocks_long_form_branch_creation_without_active_state(tm
 
     commands = [
         "git switch --create arya/new-work",
+        "git status --short\ngit switch -c arya/new-work",
+        "git status --short\ngit checkout -b arya/new-work",
         "git checkout --branch arya/new-work",
         "git checkout -B arya/new-work",
+        "git switch --orphan arya/new-work",
         "git switch --track origin/arya/new-work",
         "git checkout --track origin/arya/new-work",
         "git branch --track arya/new-work origin/main",
+        "git branch -f arya/new-work origin/main",
+        "git branch --force arya/new-work origin/main",
+        "git branch --create-reflog arya/new-work origin/main",
+        "git branch --no-track arya/new-work HEAD",
+        "git branch --quiet arya/new-work HEAD",
+        "git branch -q arya/new-work HEAD",
+        "git worktree add ../new-worktree",
+        "git worktree add --orphan arya/new-work ../new-worktree",
     ]
 
     for command in commands:
@@ -353,6 +424,206 @@ def test_pre_tool_guard_blocks_long_form_branch_creation_without_active_state(tm
             root=tmp_path,
         )
         assert decision.blocked is True, command
+
+
+def test_pre_tool_guard_blocks_unsafe_bash_writes_without_active_state(tmp_path, monkeypatch):
+    monkeypatch.setenv("LINEAR_SYNC_STATE_DIR", str(tmp_path))
+    commands = [
+        "touch app.py",
+        "sed -i '' 's/a/b/' app.py",
+        "python3 -c 'open(\"app.py\", \"w\").write(\"x\")'",
+        "cat > app.py",
+        "echo hi > app.py",
+        "echo hi>app.py",
+        "cat README.md>copy.md",
+        "rg foo>out",
+        "echo hi &>out.log",
+        "python3 plugins/linear-progress-sync/scripts/linear_start.py repo-binding --root . > app.py",
+        "/linear-start > app.py",
+    ]
+
+    for command in commands:
+        decision = linear_sync.pre_tool_guard_decision(
+            {"tool_name": "Bash", "command": command},
+            root=tmp_path,
+        )
+        assert decision.blocked is True, command
+        assert "Linear kickoff" in decision.message
+
+
+def test_pre_tool_guard_blocks_shell_substitutions_without_active_state(tmp_path, monkeypatch):
+    monkeypatch.setenv("LINEAR_SYNC_STATE_DIR", str(tmp_path))
+    commands = [
+        "git status $(touch app.py)",
+        "git status `touch app.py`",
+        "cat <(touch app.py)",
+        'echo "don\'t $(touch app.py)"',
+    ]
+
+    for command in commands:
+        decision = linear_sync.pre_tool_guard_decision(
+            {"tool_name": "Bash", "command": command},
+            root=tmp_path,
+        )
+        assert decision.blocked is True, command
+
+
+def test_pre_tool_guard_allows_general_bash_with_active_state(tmp_path, monkeypatch):
+    state_dir = tmp_path / "state"
+    monkeypatch.setenv("LINEAR_SYNC_STATE_DIR", str(state_dir))
+    repo = init_git_repo(tmp_path / "repo", branch="arya/cor-49-active")
+    linear_sync.write_active_issue(
+        active_payload(repo, issue_key="COR-49", issue_title="Active Bash work", pr_number=49),
+        root=repo,
+    )
+    commands = [
+        "python3 -c 'open(\"app.py\", \"w\").write(\"x\")'",
+        "bash -c 'echo hi > app.py'",
+        "cmd='echo hi > app.py'; eval \"$cmd\"",
+        "cat README.md > copy.md",
+    ]
+
+    for command in commands:
+        decision = linear_sync.pre_tool_guard_decision(
+            {"tool_name": "Bash", "command": command},
+            root=repo,
+        )
+        assert decision.blocked is False, command
+
+
+def test_pre_tool_guard_blocks_update_ref_branch_creation_with_active_state(tmp_path, monkeypatch):
+    state_dir = tmp_path / "state"
+    monkeypatch.setenv("LINEAR_SYNC_STATE_DIR", str(state_dir))
+    repo = init_git_repo(tmp_path / "repo", branch="arya/cor-56-active")
+    linear_sync.write_active_issue(
+        active_payload(repo, issue_key="COR-56", issue_title="Active update-ref guard", pr_number=56),
+        root=repo,
+    )
+
+    commands = [
+        "git update-ref refs/heads/arya/cor-57-bypass HEAD",
+        'printf "create refs/heads/arya/cor-57-bypass HEAD\\n" | git update-ref --stdin',
+        "git update-ref --stdin < /tmp/refs.txt",
+    ]
+
+    for command in commands:
+        decision = linear_sync.pre_tool_guard_decision(
+            {"tool_name": "Bash", "command": command},
+            root=repo,
+        )
+        assert decision.blocked is True, command
+        assert "only through the Linear kickoff workflow" in decision.message
+
+
+def test_pre_tool_guard_blocks_ref_writing_git_commands_with_active_state(tmp_path, monkeypatch):
+    state_dir = tmp_path / "state"
+    monkeypatch.setenv("LINEAR_SYNC_STATE_DIR", str(state_dir))
+    repo = init_git_repo(tmp_path / "repo", branch="arya/cor-62-active")
+    linear_sync.write_active_issue(
+        active_payload(repo, issue_key="COR-62", issue_title="Active ref guard", pr_number=62),
+        root=repo,
+    )
+    commands = [
+        "/usr/bin/git switch -c arya/cor-63-bypass",
+        "/usr/bin/git update-ref refs/heads/arya/cor-63-bypass HEAD",
+        "git symbolic-ref refs/heads/arya/cor-63-bypass HEAD",
+        "git stash branch arya/cor-63-bypass",
+    ]
+
+    for command in commands:
+        decision = linear_sync.pre_tool_guard_decision(
+            {"tool_name": "Bash", "command": command},
+            root=repo,
+        )
+        assert decision.blocked is True, command
+        assert "only through the Linear kickoff workflow" in decision.message
+
+
+def test_pre_tool_guard_blocks_switch_and_checkout_with_active_state(tmp_path, monkeypatch):
+    state_dir = tmp_path / "state"
+    monkeypatch.setenv("LINEAR_SYNC_STATE_DIR", str(state_dir))
+    repo = init_git_repo(tmp_path / "repo", branch="arya/cor-58-active")
+    linear_sync.write_active_issue(
+        active_payload(repo, issue_key="COR-58", issue_title="Active switch guard", pr_number=58),
+        root=repo,
+    )
+    commands = [
+        "git switch arya/cor-59-bypass",
+        "git checkout arya/cor-59-bypass",
+    ]
+
+    for command in commands:
+        decision = linear_sync.pre_tool_guard_decision(
+            {"tool_name": "Bash", "command": command},
+            root=repo,
+        )
+        assert decision.blocked is True, command
+        assert "only through the Linear kickoff workflow" in decision.message
+
+
+def test_pre_tool_guard_blocks_background_write_segments_without_active_state(tmp_path, monkeypatch):
+    monkeypatch.setenv("LINEAR_SYNC_STATE_DIR", str(tmp_path))
+    commands = [
+        "git status & touch app.py",
+        "rg foo README.md & touch app.py",
+        "python3 plugins/linear-progress-sync/scripts/linear_start.py repo-binding --root . & touch app.py",
+    ]
+
+    for command in commands:
+        decision = linear_sync.pre_tool_guard_decision(
+            {"tool_name": "Bash", "command": command},
+            root=tmp_path,
+        )
+        assert decision.blocked is True, command
+
+
+def test_pre_tool_guard_allows_quoted_redirection_text_as_read_only(tmp_path, monkeypatch):
+    monkeypatch.setenv("LINEAR_SYNC_STATE_DIR", str(tmp_path))
+
+    commands = [
+        "rg '->' README.md",
+        'rg "foo|bar" README.md',
+        'grep "foo;bar" README.md',
+        'grep "(foo)" README.md',
+        'grep "{foo}" README.md',
+        "rg bash -c README.md",
+        "rg git switch -c README.md",
+        "echo git switch -c",
+        "rg eval README.md",
+        "rg GIT_CONFIG_COUNT=1 README.md",
+        "echo GIT_CONFIG_COUNT=1",
+        "git grep GIT_CONFIG_COUNT=1",
+        "rg env -S README.md",
+        "echo env -S",
+        "find . -name source -print",
+        "find . -name bash -print",
+        "git grep source",
+        "git grep eval",
+        "/usr/bin/git status --short",
+        'git log --pretty=format:"%h|%s"',
+    ]
+
+    for command in commands:
+        decision = linear_sync.pre_tool_guard_decision(
+            {"tool_name": "Bash", "command": command},
+            root=tmp_path,
+        )
+        assert decision.blocked is False, command
+
+
+def test_pre_tool_guard_blocks_branch_creation_even_with_active_state(tmp_path, monkeypatch):
+    state_dir = tmp_path / "state"
+    monkeypatch.setenv("LINEAR_SYNC_STATE_DIR", str(state_dir))
+    repo = init_git_repo(tmp_path / "repo", branch="arya/cor-47-active")
+    linear_sync.write_active_issue(active_payload(repo, issue_key="COR-47", issue_title="Active", pr_number=47), root=repo)
+
+    decision = linear_sync.pre_tool_guard_decision(
+        {"tool_name": "Bash", "command": "git switch -c arya/cor-48-other-work"},
+        root=repo,
+    )
+
+    assert decision.blocked is True
+    assert "only through the Linear kickoff workflow" in decision.message
 
 
 def test_pre_tool_guard_blocks_chained_branch_creation_after_kickoff_helper(tmp_path, monkeypatch):
@@ -392,14 +663,7 @@ def test_enqueue_event_carries_active_issue_key(tmp_path, monkeypatch):
     monkeypatch.setenv("LINEAR_SYNC_STATE_DIR", str(state_dir))
     repo = init_git_repo(tmp_path / "repo", branch="arya/cor-38-carry-active-issue")
     linear_sync.write_active_issue(
-        {
-            "issue_key": "COR-38",
-            "issue_url": "https://linear.app/coreedge/issue/COR-38/carry-active-issue",
-            "issue_title": "Carry active issue",
-            "branch": "arya/cor-38-carry-active-issue",
-            "pr_url": "https://github.com/e3-solutions/codex-plugins/pull/38",
-            "pr_number": 38,
-        },
+        active_payload(repo, issue_key="COR-38", issue_title="Carry active issue", pr_number=38),
         root=repo,
     )
 
@@ -427,6 +691,83 @@ def test_linear_start_dry_run_plan_contains_git_and_gh_commands(tmp_path):
     assert plan["active_state"]["issue_key"] == "COR-39"
     assert plan["active_state"]["team"] == "Engineering"
     assert plan["active_state"]["project"] == "Codex Plugins"
+
+
+def test_linear_start_requires_issue_url_before_side_effects(tmp_path, monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        linear_sync,
+        "run_git",
+        lambda args, root=None: calls.append(args) or subprocess.CompletedProcess(args, 0, "", ""),
+    )
+
+    with pytest.raises(ValueError, match="issue_url"):
+        linear_sync.run_linear_start(
+            issue_key="COR-41",
+            issue_title="Require issue URL",
+            issue_url=None,
+            branch="arya/cor-41-require-url",
+            root=tmp_path,
+        )
+
+    assert calls == []
+
+
+def test_linear_start_returns_pending_state_without_writing_active_state(tmp_path, monkeypatch):
+    state_dir = tmp_path / "state"
+    monkeypatch.setenv("LINEAR_SYNC_STATE_DIR", str(state_dir))
+    repo = init_git_repo(tmp_path / "repo", branch="arya/cor-42-work")
+    calls = []
+
+    monkeypatch.setattr(
+        linear_sync,
+        "run_git",
+        lambda args, root=None: calls.append(args) or subprocess.CompletedProcess(args, 0, "", ""),
+    )
+    monkeypatch.setattr(
+        linear_sync,
+        "run_local_command",
+        lambda args, root=None: subprocess.CompletedProcess(
+            args,
+            0,
+            "https://github.com/e3-solutions/codex-plugins/pull/42\n",
+            "",
+        ),
+    )
+
+    result = linear_sync.run_linear_start(
+        issue_key="COR-42",
+        issue_title="Pending until linked",
+        issue_url="https://linear.app/coreedge/issue/COR-42/pending-until-linked",
+        branch="arya/cor-42-work",
+        root=repo,
+    )
+
+    assert result["pending_active_state"]["pr_number"] == 42
+    assert "linear_start.py activate" in result["activation_command"]
+    assert linear_sync.read_active_issue(root=repo) is None
+
+
+def test_activate_linear_start_writes_linked_active_state(tmp_path, monkeypatch):
+    state_dir = tmp_path / "state"
+    monkeypatch.setenv("LINEAR_SYNC_STATE_DIR", str(state_dir))
+    repo = init_git_repo(tmp_path / "repo", branch="arya/cor-43-activate")
+
+    active = linear_sync.activate_linear_start(
+        issue_key="COR-43",
+        issue_title="Activate after Linear link",
+        issue_url="https://linear.app/coreedge/issue/COR-43/activate-after-linear-link",
+        branch="arya/cor-43-activate",
+        pr_url="https://github.com/e3-solutions/codex-plugins/pull/43",
+        pr_number=43,
+        team="Engineering",
+        project="Codex Plugins",
+        root=repo,
+        linked_at="2026-07-01T00:00:00+00:00",
+    )
+
+    assert active["linear_linked_at"] == "2026-07-01T00:00:00+00:00"
+    assert linear_sync.read_current_active_issue(root=repo)["issue_key"] == "COR-43"
 
 
 def test_linear_start_requires_parseable_pr_url_before_writing_active_state(tmp_path, monkeypatch):
@@ -515,6 +856,15 @@ def test_clean_worktree_still_reports_unrelated_codex_files(tmp_path, monkeypatc
     entries = linear_sync.worktree_status_entries(root=repo)
 
     assert any(".codex/other.json" in entry for entry in entries)
+
+
+def test_clean_worktree_status_parser_handles_renames_and_quoted_paths():
+    assert linear_sync.status_entry_blocks_kickoff('R  ".codex/linear-sync/old state.json" -> "src/app file.py"')
+    assert linear_sync.status_entry_blocks_kickoff('R  "src/app file.py" -> ".codex/linear-sync/new state.json"')
+    assert linear_sync.status_entry_blocks_kickoff('A  "src/app file.py"')
+    assert not linear_sync.status_entry_blocks_kickoff(
+        'R  ".codex/linear-sync/old state.json" -> ".codex/linear-sync/new state.json"'
+    )
 
 
 def test_repo_identity_normalizes_github_origin(tmp_path):
@@ -671,6 +1021,8 @@ def test_plugin_exposes_linear_start_command_and_pre_tool_guard_hook():
         encoding="utf-8"
     )
     assert "linear_start.py" in command_text
+    assert "linear_start.py activate" in command_text
+    assert "activation_command" in command_text
     assert "repo-binding" in command_text
     assert "configure-repo" in command_text
     assert "mcp__linear." not in command_text

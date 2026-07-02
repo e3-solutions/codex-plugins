@@ -9,7 +9,7 @@ Start Linear-linked implementation work before any code edits.
 - `project`: Linear project name or ID. Overrides the saved repo binding for this kickoff.
 - `title`: Linear issue title, required when creating a new issue.
 - `root`: target repository root. If omitted, use the current working repository.
-- `dry-run`: print the local GitHub kickoff plan without changing GitHub or local active state.
+- `dry-run`: print the local GitHub kickoff plan without changing GitHub or active state.
 - `configure`: update the saved Linear team/project binding for this repo.
 
 ## Workflow
@@ -37,7 +37,7 @@ Start Linear-linked implementation work before any code edits.
    - Use the Linear issue's returned git branch name when present.
    - Otherwise use `arya/<ISSUE-KEY>-<title-slug>`.
 
-4. Run the local kickoff helper:
+4. Run the local kickoff helper. This creates the branch, empty kickoff commit, and draft PR, then prints `pending_active_state`; it does not write `active.json` yet.
 
    ```bash
    python3 <plugin-root>/scripts/linear_start.py kickoff \
@@ -55,10 +55,27 @@ Start Linear-linked implementation work before any code edits.
    - Use `mcp__codex_apps__linear._save_issue` to attach the required PR link from `pr_url`.
    - Use `mcp__codex_apps__linear._save_comment` to add the branch, draft PR URL, and kickoff commit summary.
    - Move to `In Progress` only if the state exists and is non-terminal.
+   - Read Linear back with `mcp__codex_apps__linear._fetch` or confirm the saved comment/link is visible before continuing.
+
+6. Activate local state only after Linear link/comment confirmation.
+   - Run the `activation_command` from the helper output, or run:
+
+     ```bash
+     python3 <plugin-root>/scripts/linear_start.py activate \
+       --root <root> \
+       --issue-key <ISSUE-KEY> \
+       --issue-title "<Linear issue title>" \
+       --issue-url "<Linear issue URL>" \
+       --branch "<Linear branch name>" \
+       --pr-url "<GitHub draft PR URL>" \
+       --pr-number <GitHub PR number> \
+       --team "<Linear team>" \
+       --project "<Linear project>"
+     ```
 
 ## Safety Rules
 
-- Do not write code before this workflow succeeds.
+- Do not write code before activation succeeds.
 - Use Linear MCP/app tools only; do not use a direct Linear API client.
 - Use `Refs <ISSUE-KEY>` in PR body text, not `Fixes`, so the kickoff does not imply closure.
 - Leave terminal Linear issues unchanged.

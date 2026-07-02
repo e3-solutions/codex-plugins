@@ -21,8 +21,9 @@ If it is missing, run the Linear kickoff workflow before editing:
 2. If this repo has no saved team/project and no existing issue was provided, call `mcp__codex_apps__linear._list_teams` and `mcp__codex_apps__linear._list_projects`, ask the user once which Linear team/project the repo should use, then save it with `scripts/linear_start.py configure-repo`.
 3. Use `mcp__codex_apps__linear._save_issue` to create the issue in the saved team/project, or `mcp__codex_apps__linear._fetch` to read an existing issue.
 4. Read the issue back with `mcp__codex_apps__linear._fetch` and use Linear's generated git branch name when present.
-5. Run `/linear-start` or `scripts/linear_start.py kickoff` to create/switch the branch, push an empty kickoff commit, create a draft PR, and write active state.
+5. Run `/linear-start` or `scripts/linear_start.py kickoff` to create/switch the branch, push an empty kickoff commit, and create a draft PR. Treat the returned `pending_active_state` as inactive until Linear linking is confirmed.
 6. Add the PR link/comment back to Linear with `mcp__codex_apps__linear._save_issue` and `mcp__codex_apps__linear._save_comment`.
+7. Read Linear back or otherwise confirm the PR link/comment is visible, then run `scripts/linear_start.py activate` with the helper's `activation_command` to write `.codex/linear-sync/active.json`.
 
 The human should not need to remember `/linear-start`; use it as the explicit/manual entrypoint when active state is missing.
 
@@ -74,13 +75,13 @@ python3 plugins/linear-progress-sync/scripts/setup.py --dry-run
 Optionally install the local Git post-commit hook for commits made outside Codex:
 
 ```bash
-python3 plugins/linear-progress-sync/scripts/install_git_hook.py
+python3 plugins/linear-progress-sync/scripts/setup.py --with-git-hook --root /path/to/repo
 ```
 
 Dry-run the GitHub kickoff helper:
 
 ```bash
-python3 plugins/linear-progress-sync/scripts/linear_start.py kickoff --issue-key COR-123 --issue-title "Implement work" --branch arya/cor-123-implement-work --dry-run
+python3 plugins/linear-progress-sync/scripts/linear_start.py kickoff --issue-key COR-123 --issue-title "Implement work" --issue-url "https://linear.app/example/issue/COR-123/implement-work" --branch arya/cor-123-implement-work --dry-run
 ```
 
 Dry-run the queue drain without Linear writes:
