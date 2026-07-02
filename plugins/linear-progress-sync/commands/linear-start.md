@@ -1,0 +1,81 @@
+# /linear-start
+
+Start Linear-linked implementation work before any code edits.
+
+## Arguments
+
+- `issue`: existing Linear issue identifier, for example `COR-123`.
+- `team`: Linear team name or ID. Overrides the saved repo binding for this kickoff.
+- `project`: Linear project name or ID. Overrides the saved repo binding for this kickoff.
+- `title`: Linear issue title, required when creating a new issue.
+- `root`: target repository root. If omitted, use the current working repository.
+- `dry-run`: print the local GitHub kickoff plan without changing GitHub or active state.
+- `configure`: update the saved Linear team/project binding for this repo.
+
+## Workflow
+
+1. Resolve this repo's Linear destination.
+   - Run `python3 <plugin-root>/scripts/linear_start.py repo-binding --root <root>`.
+   - If no binding exists and this command is not using an existing `issue`, call `mcp__codex_apps__linear._list_teams` and `mcp__codex_apps__linear._list_projects`, then ask the user once which team/project this repo should use.
+   - Save the answer with:
+
+     ```bash
+     python3 <plugin-root>/scripts/linear_start.py configure-repo \
+       --root <root> \
+       --team "<Linear team>" \
+       --project "<Linear project>"
+     ```
+
+   - Future kickoff in this repo uses the saved binding automatically.
+
+2. Resolve the Linear issue.
+   - If `issue` is present, read it with `mcp__codex_apps__linear._fetch` using the known issue identifier.
+   - Otherwise create the issue with `mcp__codex_apps__linear._save_issue` using `team`, `project`, `title`, and `assignee: "me"` when appropriate.
+   - Read the issue back with `mcp__codex_apps__linear._fetch` after create/update so the branch name, URL, title, team, and project are confirmed.
+
+3. Choose the branch name.
+   - Use the Linear issue's returned git branch name when present.
+   - Otherwise use `arya/<ISSUE-KEY>-<title-slug>`.
+
+4. Run the local kickoff helper. This creates the branch, empty kickoff commit, and draft PR, then prints `pending_active_state`; it does not write `active.json` yet.
+
+   ```bash
+   python3 <plugin-root>/scripts/linear_start.py kickoff \
+     --root <root> \
+     --issue-key <ISSUE-KEY> \
+     --issue-title "<Linear issue title>" \
+     --issue-url "<Linear issue URL>" \
+     --branch "<Linear branch name>" \
+     --team "<Linear team>" \
+     --project "<Linear project>"
+   ```
+
+5. Link Linear back to GitHub.
+   - Read the helper JSON output.
+   - Use `mcp__codex_apps__linear._save_issue` to attach the required PR link from `pr_url`.
+   - Use `mcp__codex_apps__linear._save_comment` to add the branch, draft PR URL, and kickoff commit summary.
+   - Move to `In Progress` only if the state exists and is non-terminal.
+   - Read Linear back with `mcp__codex_apps__linear._fetch` or confirm the saved comment/link is visible before continuing.
+
+6. Activate local state only after Linear link/comment confirmation.
+   - Run the `activation_command` from the helper output, or run:
+
+     ```bash
+     python3 <plugin-root>/scripts/linear_start.py activate \
+       --root <root> \
+       --issue-key <ISSUE-KEY> \
+       --issue-title "<Linear issue title>" \
+       --issue-url "<Linear issue URL>" \
+       --branch "<Linear branch name>" \
+       --pr-url "<GitHub draft PR URL>" \
+       --pr-number <GitHub PR number> \
+       --team "<Linear team>" \
+       --project "<Linear project>"
+     ```
+
+## Safety Rules
+
+- Do not write code before activation succeeds.
+- Use Linear MCP/app tools only; do not use a direct Linear API client.
+- Use `Refs <ISSUE-KEY>` in PR body text, not `Fixes`, so the kickoff does not imply closure.
+- Leave terminal Linear issues unchanged.

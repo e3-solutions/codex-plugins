@@ -32,9 +32,11 @@ TERMINAL_STATUSES = {
 }
 SAFE_PROGRESS_STATUS = "In Progress"
 STATE_DIR_ENV = "LINEAR_SYNC_STATE_DIR"
+CONFIG_DIR_ENV = "LINEAR_SYNC_CONFIG_DIR"
 DRY_RUN_ENV = "LINEAR_SYNC_DRY_RUN"
 CODEX_COMMAND_ENV = "LINEAR_SYNC_CODEX_COMMAND"
 THROTTLE_SECONDS = 30 * 60
+LINEAR_MCP_URL = "https://mcp.linear.app/mcp"
 IGNORED_FILE_PREFIXES = (
     ".codex/linear-sync/",
     ".git/",
@@ -42,6 +44,22 @@ IGNORED_FILE_PREFIXES = (
 IGNORED_FILE_NAMES = {
     ".DS_Store",
 }
+READ_ONLY_BASH_EXECUTABLES = {
+    "pwd",
+    "ls",
+    "cat",
+    "head",
+    "tail",
+    "wc",
+    "rg",
+    "grep",
+    "egrep",
+    "fgrep",
+    "nl",
+    "file",
+    "which",
+}
+SHELL_COMMAND_PUNCTUATION = ";&|<>"
 
 
 @dataclass(frozen=True)
@@ -56,6 +74,19 @@ class IssueInference:
 class WorkerResult:
     ok: bool
     message: str
+
+
+@dataclass(frozen=True)
+class PreToolGuardDecision:
+    blocked: bool
+    message: str = ""
+
+
+@dataclass(frozen=True)
+class ActiveIssueRead:
+    exists: bool
+    active: JsonDict | None = None
+    problem: str | None = None
 
 
 def repo_root(start: str | Path | None = None) -> Path:
@@ -124,6 +155,217 @@ def save_state(state: JsonDict, root: str | Path | None = None) -> None:
     write_json_atomic(base / "state.json", state)
 
 
+def global_config_dir() -> Path:
+    override = os.environ.get(CONFIG_DIR_ENV)
+    if override:
+        return Path(override).expanduser().resolve()
+    return Path.home() / ".codex" / "linear-sync"
+
+
+def repo_bindings_path() -> Path:
+    return global_config_dir() / "repos.json"
+
+
+def read_repo_bindings() -> JsonDict:
+    path = repo_bindings_path()
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, OSError, json.JSONDecodeError):
+        return {"repos": {}}
+    if not isinstance(data, dict):
+        return {"repos": {}}
+    repos = data.get("repos")
+    if not isinstance(repos, dict):
+        data["repos"] = {}
+    return data
+
+
+def save_repo_bindings(config: JsonDict) -> JsonDict:
+    config.setdefault("repos", {})
+    write_json_atomic(repo_bindings_path(), config)
+    return config
+
+
+def repo_identity(root: str | Path | None = None) -> str:
+    remote = git_output(["remote", "get-url", "origin"], root=root)
+    normalized = normalize_repo_remote(remote)
+    return normalized or str(repo_root(root))
+
+
+def normalize_repo_remote(remote: str) -> str | None:
+    value = str(remote or "").strip()
+    if not value:
+        return None
+    value = re.sub(r"\.git$", "", value)
+    match = re.match(r"^(?:git@|ssh://git@|https?://)(?:[^/:]+)[:/](.+)$", value)
+    if match:
+        return match.group(1).strip("/")
+    return value.strip("/")
+
+
+def repo_binding_status(*, root: str | Path | None = None) -> JsonDict:
+    repo = repo_identity(root)
+    config = read_repo_bindings()
+    repos = config.get("repos") if isinstance(config.get("repos"), dict) else {}
+    binding = repos.get(repo) if isinstance(repos, dict) else None
+    configured = (
+        isinstance(binding, dict)
+        and isinstance(binding.get("team"), str)
+        and bool(binding.get("team", "").strip())
+        and isinstance(binding.get("project"), str)
+        and bool(binding.get("project", "").strip())
+    )
+    return {
+        "repo": repo,
+        "configured": configured,
+        "binding": {"team": binding["team"], "project": binding["project"]} if configured else None,
+        "config_path": str(repo_bindings_path()),
+    }
+
+
+def save_repo_linear_binding(
+    *,
+    team: str,
+    project: str,
+    root: str | Path | None = None,
+) -> JsonDict:
+    if not team.strip() or not project.strip():
+        raise ValueError("repo Linear binding requires both team and project")
+    repo = repo_identity(root)
+    config = read_repo_bindings()
+    repos = config.setdefault("repos", {})
+    repos[repo] = {"team": team.strip(), "project": project.strip()}
+    save_repo_bindings(config)
+    return {
+        "repo": repo,
+        "binding": repos[repo],
+        "config_path": str(repo_bindings_path()),
+    }
+
+
+def active_issue_path(root: str | Path | None = None) -> Path:
+    return ensure_state(root) / "active.json"
+
+
+def load_active_issue(*, root: str | Path | None = None) -> ActiveIssueRead:
+    path = active_issue_path(root)
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return ActiveIssueRead(False)
+    except json.JSONDecodeError:
+        return ActiveIssueRead(True, problem="active Linear issue state is malformed")
+    except OSError as exc:
+        return ActiveIssueRead(True, problem=f"active Linear issue state could not be read: {exc}")
+    if not isinstance(data, dict):
+        return ActiveIssueRead(True, problem="active Linear issue state must be a JSON object")
+    issue_key = data.get("issue_key") or data.get("issue_identifier") or data.get("identifier")
+    if not isinstance(issue_key, str) or not issue_key.strip():
+        return ActiveIssueRead(True, problem="active Linear issue state missing issue_key")
+    data["issue_key"] = issue_key.strip().upper()
+    return ActiveIssueRead(True, active=data)
+
+
+def read_active_issue(*, root: str | Path | None = None) -> JsonDict | None:
+    loaded = load_active_issue(root=root)
+    if loaded.problem:
+        return None
+    return loaded.active
+
+
+def active_issue_fail_closed_problem(*, root: str | Path | None = None) -> str | None:
+    loaded = load_active_issue(root=root)
+    if not loaded.exists:
+        return None
+    if loaded.problem:
+        return loaded.problem
+    if not loaded.active:
+        return "active Linear issue state could not be read"
+    return active_issue_context_problem(loaded.active, root=root)
+
+
+def active_issue_write_problem(*, root: str | Path | None = None) -> str | None:
+    loaded = load_active_issue(root=root)
+    if not loaded.exists:
+        return "Linear kickoff has not created active issue state"
+    if loaded.problem:
+        return loaded.problem
+    if not loaded.active:
+        return "active Linear issue state could not be read"
+    return active_issue_context_problem(loaded.active, root=root)
+
+
+def active_issue_schema_problem(active: JsonDict, *, require_linear_linked_at: bool = False) -> str | None:
+    issue_key = active.get("issue_key") or active.get("issue_identifier") or active.get("identifier")
+    if not isinstance(issue_key, str) or not issue_key.strip():
+        return "active Linear issue state missing issue_key"
+
+    for field in ("repo", "branch", "issue_title", "issue_url", "pr_url"):
+        value = active.get(field)
+        if not isinstance(value, str) or not value.strip():
+            return f"active Linear issue state missing {field}"
+    if require_linear_linked_at:
+        value = active.get("linear_linked_at")
+        if not isinstance(value, str) or not value.strip():
+            return "active Linear issue state missing linear_linked_at"
+
+    pr_number = active.get("pr_number")
+    if pr_number is None or str(pr_number).strip() == "":
+        return "active Linear issue state missing pr_number"
+    try:
+        int(pr_number)
+    except (TypeError, ValueError):
+        return "active Linear issue state has invalid pr_number"
+
+    return None
+
+
+def read_current_active_issue(*, root: str | Path | None = None) -> JsonDict | None:
+    loaded = load_active_issue(root=root)
+    if loaded.problem or not loaded.active or active_issue_context_problem(loaded.active, root=root):
+        return None
+    return loaded.active
+
+
+def active_issue_context_problem(active: JsonDict, *, root: str | Path | None = None) -> str | None:
+    schema_problem = active_issue_schema_problem(active)
+    if schema_problem:
+        return schema_problem
+
+    active_repo = str(active.get("repo") or "").strip()
+    current_repo = str(repo_root(root))
+    if active_repo and normalize_path(active_repo) != normalize_path(current_repo):
+        return f"active Linear issue repo {active_repo} does not match current repo {current_repo}"
+
+    active_branch = str(active.get("branch") or "").strip()
+    branch = current_branch(root)
+    if not branch:
+        return "active Linear issue current branch could not be verified"
+    if active_branch != branch:
+        return f"active Linear issue branch {active_branch} does not match current branch {branch}"
+
+    return None
+
+
+def normalize_path(path: str) -> str:
+    return str(Path(path).expanduser().resolve())
+
+
+def write_active_issue(payload: JsonDict, *, root: str | Path | None = None) -> JsonDict:
+    issue_key = payload.get("issue_key") or payload.get("issue_identifier") or payload.get("identifier")
+    if not isinstance(issue_key, str) or not issue_key.strip():
+        raise ValueError("active Linear issue state requires issue_key")
+    active = dict(payload)
+    active["issue_key"] = issue_key.strip().upper()
+    active.setdefault("created_at", now_iso())
+    active.setdefault("repo", str(repo_root(root)))
+    problem = active_issue_schema_problem(active, require_linear_linked_at=True)
+    if problem:
+        raise ValueError(problem)
+    write_json_atomic(active_issue_path(root), active)
+    return active
+
+
 def write_json_atomic(path: Path, payload: JsonDict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + f".{uuid.uuid4().hex}.tmp")
@@ -149,6 +391,11 @@ def enqueue_event(event_type: str, payload: JsonDict | None = None, *, root: str
     event.setdefault("created_at", now_iso())
     event.setdefault("repo", str(repo_root(root)))
     event.setdefault("branch", current_branch(root))
+    active = read_current_active_issue(root=root)
+    if active:
+        event.setdefault("issue_key", active["issue_key"])
+        if active.get("pr_url"):
+            event.setdefault("pr_url", active.get("pr_url"))
     event_path = base / "events" / f"{safe_file_name(event['id'])}.json"
     write_json_atomic(event_path, event)
     return event
@@ -279,6 +526,25 @@ def git_author(*, root: str | Path | None = None) -> str | None:
 
 def infer_issue(event: JsonDict, state: JsonDict | None = None, *, root: str | Path | None = None) -> IssueInference:
     local_state = state or read_state(root)
+    loaded_active = load_active_issue(root=root)
+    if loaded_active.exists:
+        if loaded_active.problem:
+            return IssueInference(None, 0.0, loaded_active.problem)
+        active = loaded_active.active
+        problem = active_issue_context_problem(active, root=root) if active else "active Linear issue state could not be read"
+        if problem:
+            return IssueInference(None, 0.0, problem)
+        return IssueInference(
+            active["issue_key"],
+            1.0,
+            "active Linear issue state",
+            status=str(active.get("issue_status") or active.get("status") or "") or None,
+        )
+
+    explicit_key = first_issue_key(str(event.get("issue_key") or ""))
+    if explicit_key:
+        return with_cached_status(IssueInference(explicit_key, 1.0, "explicit event issue key"), local_state)
+
     branch = str(event.get("branch") or current_branch(root) or "")
     key = first_issue_key(branch)
     if key:
@@ -306,6 +572,327 @@ def infer_issue(event: JsonDict, state: JsonDict | None = None, *, root: str | P
 def first_issue_key(text: str) -> str | None:
     match = ISSUE_RE.search(text or "")
     return match.group(1).upper() if match else None
+
+
+def linear_issue_branch_name(issue: JsonDict) -> str | None:
+    for key in ("branchName", "gitBranchName", "gitBranch", "branch_name"):
+        value = issue.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    for key in ("git", "branch"):
+        value = issue.get(key)
+        if isinstance(value, dict):
+            nested_name = linear_issue_branch_name(value)
+            if nested_name:
+                return nested_name
+    return None
+
+
+def issue_identifier(issue: JsonDict) -> str:
+    value = issue.get("identifier") or issue.get("issue_key") or issue.get("key") or issue.get("id")
+    return str(value or "").strip().upper()
+
+
+def issue_title(issue: JsonDict) -> str:
+    return str(issue.get("title") or "").strip()
+
+
+def slugify_title(title: str, *, max_length: int = 64) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "-", title.lower()).strip("-")
+    slug = re.sub(r"-+", "-", slug)
+    return (slug[:max_length].rstrip("-") or "work")
+
+
+def fallback_branch_name(issue_key: str, title: str, *, prefix: str = "arya") -> str:
+    return f"{prefix}/{issue_key.upper()}-{slugify_title(title)}"
+
+
+def select_branch_name(issue: JsonDict, *, prefix: str = "arya") -> str:
+    return linear_issue_branch_name(issue) or fallback_branch_name(
+        issue_identifier(issue),
+        issue_title(issue),
+        prefix=prefix,
+    )
+
+
+def pr_title_for_issue(issue_key: str, title: str) -> str:
+    return f"{issue_key.upper()}: {title.strip() or 'Linear work'}"
+
+
+def pr_body_for_issue(issue_key: str, title: str, issue_url: str | None = None) -> str:
+    lines = [
+        f"Refs {issue_key.upper()}",
+        "",
+        f"Linear issue: {title.strip() or issue_key.upper()}",
+    ]
+    if issue_url:
+        lines.append(str(issue_url))
+    lines.extend(["", "This draft PR was created before implementation so Linear, branch, and PR stay linked."])
+    return "\n".join(lines)
+
+
+def linear_start_plan(
+    *,
+    issue_key: str,
+    issue_title: str,
+    issue_url: str | None,
+    branch: str | None,
+    team: str | None = None,
+    project: str | None = None,
+    root: str | Path | None = None,
+) -> JsonDict:
+    if not issue_url or not str(issue_url).strip():
+        raise ValueError("Linear kickoff requires issue_url before creating GitHub or Git state")
+    branch = branch or fallback_branch_name(issue_key, issue_title)
+    title = pr_title_for_issue(issue_key, issue_title)
+    body = pr_body_for_issue(issue_key, issue_title, str(issue_url).strip())
+    active_state = {
+        "issue_key": issue_key.upper(),
+        "issue_title": issue_title,
+        "issue_url": str(issue_url).strip(),
+        "branch": branch,
+        "repo": str(repo_root(root)),
+    }
+    if team:
+        active_state["team"] = team
+    if project:
+        active_state["project"] = project
+    return {
+        "active_state": active_state,
+        "commands": [
+            f"git switch {shlex.quote(branch)} || git switch -c {shlex.quote(branch)}",
+            shlex.join(["git", "commit", "--allow-empty", "-m", f"chore: start {issue_key.upper()}"]),
+            shlex.join(["git", "push", "-u", "origin", branch]),
+            shlex.join(["gh", "pr", "create", "--draft", "--title", title, "--body", body]),
+        ],
+        "pr_title": title,
+        "pr_body": body,
+    }
+
+
+def setup_plan(
+    *,
+    plugin_repo_root: str | Path,
+    target_repo_root: str | Path | None = None,
+    with_git_hook: bool = False,
+) -> JsonDict:
+    plugin_root = Path(plugin_repo_root).expanduser().resolve()
+    target_root = Path(target_repo_root or os.getcwd()).expanduser().resolve()
+    commands = [
+        shlex.join(["gh", "auth", "status"]),
+        shlex.join(["codex", "plugin", "marketplace", "add", str(plugin_root)]),
+        shlex.join(["codex", "plugin", "add", "linear-progress-sync@coreedge-local"]),
+        shlex.join(["codex", "mcp", "add", "linear", "--url", LINEAR_MCP_URL]),
+    ]
+    if with_git_hook:
+        hook_script = plugin_root / "plugins" / "linear-progress-sync" / "scripts" / "install_git_hook.py"
+        commands.append(shlex.join([sys.executable, str(hook_script), "--root", str(target_root)]))
+    return {
+        "commands": commands,
+        "plugin_repo_root": str(plugin_root),
+        "target_repo_root": str(target_root),
+        "per_repo_setup_required": False,
+        "optional_git_hook": with_git_hook,
+        "notes": [
+            "Default setup is user-level: plugin marketplace, plugin install, GitHub auth check, and Linear MCP registration.",
+            "GitHub auth is a manual prerequisite: run gh auth login when needed.",
+            "Linear auth is manual after setup registers the MCP server: run codex mcp login linear after setup when needed.",
+            "Per-repo Git hook setup is optional and only needed to sync commits made outside Codex.",
+            "Start a new Codex thread after installing or updating the plugin so hooks and skills reload.",
+        ],
+    }
+
+
+def run_linear_start(
+    *,
+    issue_key: str,
+    issue_title: str,
+    issue_url: str | None = None,
+    branch: str | None = None,
+    team: str | None = None,
+    project: str | None = None,
+    root: str | Path | None = None,
+    dry_run: bool = False,
+) -> JsonDict:
+    plan = linear_start_plan(
+        issue_key=issue_key,
+        issue_title=issue_title,
+        issue_url=issue_url,
+        branch=branch,
+        team=team,
+        project=project,
+        root=root,
+    )
+    if dry_run:
+        return {**plan, "dry_run": True}
+
+    require_clean_worktree(root=root)
+    target_branch = str(plan["active_state"]["branch"])
+    if current_branch(root) != target_branch:
+        switch_args = ["switch", target_branch] if local_branch_exists(target_branch, root=root) else ["switch", "-c", target_branch]
+        require_success(run_git(switch_args, root=root), f"switch to {target_branch}")
+
+    require_success(
+        run_git(["commit", "--allow-empty", "-m", f"chore: start {issue_key.upper()}"], root=root),
+        "create kickoff commit",
+    )
+    require_success(run_git(["push", "-u", "origin", target_branch], root=root), f"push {target_branch}")
+
+    pr_result = run_local_command(
+        ["gh", "pr", "create", "--draft", "--title", plan["pr_title"], "--body", plan["pr_body"]],
+        root=root,
+    )
+    require_success(pr_result, "create draft pull request")
+    pr_url = extract_pr_url(pr_result.stdout)
+    if not pr_url:
+        raise RuntimeError("Failed to create draft pull request: gh output did not include a pull request URL")
+    pr_number = extract_pr_number(pr_url)
+    if pr_number is None:
+        raise RuntimeError("Failed to create draft pull request: pull request URL did not include a PR number")
+    pending_active_state = dict(plan["active_state"])
+    pending_active_state["pr_url"] = pr_url
+    pending_active_state["pr_number"] = pr_number
+    return {
+        **plan,
+        "pending_active_state": pending_active_state,
+        "pr_url": pr_url,
+        "activation_command": linear_start_activation_command(pending_active_state, root=root),
+    }
+
+
+def activate_linear_start(
+    *,
+    issue_key: str,
+    issue_title: str,
+    issue_url: str,
+    branch: str,
+    pr_url: str,
+    pr_number: int | str,
+    team: str | None = None,
+    project: str | None = None,
+    root: str | Path | None = None,
+    linked_at: str | None = None,
+) -> JsonDict:
+    active_state: JsonDict = {
+        "issue_key": issue_key.upper(),
+        "issue_title": issue_title,
+        "issue_url": issue_url,
+        "branch": branch,
+        "repo": str(repo_root(root)),
+        "pr_url": pr_url,
+        "pr_number": int(pr_number),
+        "linear_linked_at": linked_at or now_iso(),
+    }
+    if team:
+        active_state["team"] = team
+    if project:
+        active_state["project"] = project
+    return write_active_issue(active_state, root=root)
+
+
+def linear_start_activation_command(active_state: JsonDict, *, root: str | Path | None = None) -> str:
+    script = Path(__file__).with_name("linear_start.py")
+    parts = [
+        sys.executable,
+        str(script),
+        "activate",
+        "--root",
+        str(repo_root(root)),
+        "--issue-key",
+        str(active_state.get("issue_key") or ""),
+        "--issue-title",
+        str(active_state.get("issue_title") or ""),
+        "--issue-url",
+        str(active_state.get("issue_url") or ""),
+        "--branch",
+        str(active_state.get("branch") or ""),
+        "--pr-url",
+        str(active_state.get("pr_url") or ""),
+        "--pr-number",
+        str(active_state.get("pr_number") or ""),
+    ]
+    for key, flag in (("team", "--team"), ("project", "--project")):
+        value = active_state.get(key)
+        if value:
+            parts.extend([flag, str(value)])
+    return " ".join(shlex.quote(part) for part in parts)
+
+
+def local_branch_exists(branch: str, *, root: str | Path | None = None) -> bool:
+    return run_git(["rev-parse", "--verify", f"refs/heads/{branch}"], root=root).returncode == 0
+
+
+def require_clean_worktree(*, root: str | Path | None = None) -> None:
+    dirty = worktree_status_entries(root=root)
+    if not dirty:
+        return
+    sample = ", ".join(dirty[:5])
+    suffix = f" (+{len(dirty) - 5} more)" if len(dirty) > 5 else ""
+    raise RuntimeError(
+        "Linear kickoff requires a clean worktree before creating the kickoff branch/commit; "
+        f"commit, stash, or reset these changes first: {sample}{suffix}"
+    )
+
+
+def worktree_status_entries(*, root: str | Path | None = None) -> list[str]:
+    result = run_git(["status", "--porcelain", "--untracked-files=all"], root=root)
+    require_success(result, "check worktree status")
+    return [line.strip() for line in result.stdout.splitlines() if line.strip() and status_entry_blocks_kickoff(line)]
+
+
+def status_entry_blocks_kickoff(entry: str) -> bool:
+    paths = status_entry_paths(entry)
+    return any(not plugin_owned_status_path(path) for path in paths)
+
+
+def plugin_owned_status_path(path: str) -> bool:
+    return normalize_repo_path(path).startswith(".codex/linear-sync/")
+
+
+def status_entry_paths(entry: str) -> list[str]:
+    payload = entry[3:] if len(entry) > 3 else entry
+    if " -> " in payload:
+        return [decode_status_path(part) for part in payload.split(" -> ") if part.strip()]
+    return [decode_status_path(payload)] if payload.strip() else []
+
+
+def decode_status_path(path: str) -> str:
+    value = path.strip()
+    try:
+        parts = shlex.split(value)
+    except ValueError:
+        return value.strip('"')
+    if len(parts) == 1:
+        return parts[0]
+    return value.strip('"')
+
+
+def run_local_command(args: list[str], *, root: str | Path | None = None) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        args,
+        cwd=repo_root(root),
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+
+
+def require_success(result: subprocess.CompletedProcess[str], action: str) -> None:
+    if result.returncode == 0:
+        return
+    output = "\n".join(part for part in (result.stdout.strip(), result.stderr.strip()) if part)
+    raise RuntimeError(f"Failed to {action}: {output or result.returncode}")
+
+
+def extract_pr_url(output: str) -> str | None:
+    match = re.search(r"https://github\.com/[^\s]+/pull/\d+", output or "")
+    return match.group(0) if match else None
+
+
+def extract_pr_number(url: str) -> int | None:
+    match = re.search(r"/pull/(\d+)(?:$|[^\d])", url or "")
+    return int(match.group(1)) if match else None
 
 
 def infer_from_stale_cache(event: JsonDict, state: JsonDict) -> IssueInference:
@@ -491,7 +1078,24 @@ def drain_once(
     failed = 0
     reviewed = 0
     skipped = 0
-    for path, event in load_events(root):
+    events = load_events(root)
+    active_problem = active_issue_fail_closed_problem(root=root)
+    if active_problem and events:
+        local_state.setdefault("failures", {})["active_state"] = {
+            "count": len(events),
+            "last_error": active_problem,
+            "last_failed_at": now_iso(),
+        }
+        save_state(local_state, root)
+        return {
+            "processed": 0,
+            "reviewed": 0,
+            "skipped": 0,
+            "failed": len(events),
+            "active_state_error": active_problem,
+        }
+
+    for path, event in events:
         event_id = str(event.get("id") or path.stem)
         if event_id in set(local_state.get("processed_event_ids") or []):
             safe_unlink(path)
@@ -621,7 +1225,34 @@ def foreground_sync_plan(
     eligible: list[JsonDict] = []
     held: list[JsonDict] = []
     skipped: list[JsonDict] = []
-    for path, event in load_events(root):
+    events = load_events(root)
+    active_problem = active_issue_fail_closed_problem(root=root)
+    if active_problem:
+        for path, event in events:
+            event_id = str(event.get("id") or path.stem)
+            held.append(
+                {
+                    "event_id": event_id,
+                    "event_type": event.get("type"),
+                    "event": event,
+                    "inference": IssueInference(None, 0.0, active_problem).__dict__,
+                    "reason": active_problem,
+                }
+            )
+            if len(held) >= limit:
+                break
+        return {
+            "repo": str(repo_root(root)),
+            "eligible": eligible,
+            "held": held,
+            "skipped": skipped,
+            "instructions": [
+                "Fix the active Linear issue state before writing Linear updates.",
+                "Do not acknowledge queued events until active state is valid and the Linear comment is confirmed visible.",
+            ],
+        }
+
+    for path, event in events:
         event_id = str(event.get("id") or path.stem)
         inference = infer_issue(event, local_state, root=root)
         item = {
@@ -858,6 +1489,47 @@ def read_stdin_json() -> JsonDict:
     return payload if isinstance(payload, dict) else {"payload": payload}
 
 
+def pre_tool_guard_decision(payload: JsonDict, *, root: str | Path | None = None) -> PreToolGuardDecision:
+    tool = tool_name(payload)
+    normalized_tool = tool.lower()
+    requires_active_state = normalized_tool in {"apply_patch", "edit", "write"}
+    if normalized_tool == "bash":
+        command = tool_command(payload)
+        if is_linear_start_command(command):
+            return PreToolGuardDecision(False)
+        if looks_like_branch_creation(command):
+            return PreToolGuardDecision(True, linear_branch_creation_blocked_message())
+        if bash_command_is_read_only(command):
+            return PreToolGuardDecision(False)
+        else:
+            requires_active_state = True
+
+    if requires_active_state:
+        problem = active_issue_write_problem(root=root)
+        if problem:
+            return PreToolGuardDecision(True, linear_kickoff_required_message(problem))
+        return PreToolGuardDecision(False)
+
+    return PreToolGuardDecision(False)
+
+
+def linear_branch_creation_blocked_message() -> str:
+    return (
+        "Create or reset implementation branches only through the Linear kickoff workflow. "
+        "Run the automatic Linear kickoff workflow first so Linear, the branch, and the draft PR stay linked."
+    )
+
+
+def linear_kickoff_required_message(reason: str | None = None) -> str:
+    prefix = f"{reason}. " if reason else ""
+    return (
+        f"{prefix}Linear kickoff is required before writing code or creating branches. "
+        "Run the automatic Linear kickoff workflow first: confirm or create the Linear issue, "
+        "create the Linear-named branch, push the empty kickoff commit, open the draft PR, "
+        "link Linear and GitHub, then retry this tool call."
+    )
+
+
 def handle_post_tool_use(payload: JsonDict, *, root: str | Path | None = None) -> JsonDict | None:
     tool = tool_name(payload)
     if tool.lower() == "bash":
@@ -939,6 +1611,446 @@ def looks_like_git_commit(command: str) -> bool:
     return bool(re.search(r"(^|[;&|]\s*)git\s+commit(\s|$)", command))
 
 
+def looks_like_branch_creation(command: str) -> bool:
+    if not command:
+        return False
+    return any(git_tokens_create_branch(tokens) for tokens in shell_command_tokens(command))
+
+
+def shell_command_tokens(command: str) -> list[list[str]]:
+    try:
+        lexer = shlex.shlex(
+            (command or "").replace("\n", " ; "),
+            posix=True,
+            punctuation_chars=SHELL_COMMAND_PUNCTUATION,
+        )
+        lexer.whitespace_split = True
+        lexer.commenters = ""
+        parsed = list(lexer)
+    except ValueError:
+        return []
+
+    segments: list[list[str]] = []
+    current: list[str] = []
+    for token in parsed:
+        if shell_token_is_separator(token):
+            if current:
+                segments.append(current)
+                current = []
+            continue
+        current.append(token)
+    if current:
+        segments.append(current)
+    return segments
+
+
+def shell_token_is_separator(token: str) -> bool:
+    return bool(token) and all(char in SHELL_COMMAND_PUNCTUATION for char in token)
+
+
+def git_tokens_create_branch(tokens: list[str]) -> bool:
+    executable_tokens = strip_env_prefix(tokens)
+    if not executable_tokens or read_only_shell_executable(Path(executable_tokens[0]).name):
+        return False
+    git_index = git_token_index(executable_tokens)
+    if git_index is None:
+        return False
+    args = skip_git_global_options(executable_tokens[git_index + 1 :])
+    if not args:
+        return False
+    command = args[0]
+    rest = args[1:]
+
+    if command in {"switch", "checkout"}:
+        return True
+    if command == "branch":
+        return git_branch_args_create_branch(rest)
+    if command == "update-ref":
+        return True
+    if command == "symbolic-ref":
+        return True
+    if command == "stash" and rest and rest[0] == "branch":
+        return True
+    if command == "worktree" and rest and rest[0] == "add":
+        return True
+
+    return False
+
+
+def git_token_index(tokens: list[str]) -> int | None:
+    for index, token in enumerate(tokens):
+        if Path(token).name == "git":
+            return index
+    return None
+
+
+def git_branch_args_create_branch(args: list[str]) -> bool:
+    if not args:
+        return False
+    if has_long_option(args, {"--copy", "--force-copy", "--track"}) or has_short_option(args, {"c", "C", "t"}):
+        return True
+    if has_long_option(args, {"--delete", "--move", "--list", "--all", "--remotes", "--show-current"}):
+        return False
+    if has_short_option(args, {"d", "D", "m", "M", "a", "r"}):
+        return False
+    operands = git_branch_operands(args)
+    if has_long_option(args, {"--force", "--create-reflog"}) or has_short_option(args, {"f"}):
+        return bool(operands)
+    return bool(operands)
+
+
+def git_branch_operands(args: list[str]) -> list[str]:
+    operands: list[str] = []
+    value_options = {
+        "--contains",
+        "--no-contains",
+        "--merged",
+        "--no-merged",
+        "--points-at",
+        "--format",
+        "--sort",
+        "--color",
+        "--column",
+        "--set-upstream-to",
+        "-u",
+    }
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        if arg == "--":
+            operands.extend(args[index + 1 :])
+            break
+        if arg in value_options:
+            index += 2
+            continue
+        if any(arg.startswith(f"{option}=") for option in value_options if option.startswith("--")):
+            index += 1
+            continue
+        if arg.startswith("-"):
+            index += 1
+            continue
+        operands.append(arg)
+        index += 1
+    return operands
+
+
+def skip_git_global_options(args: list[str]) -> list[str]:
+    index = 0
+    value_options = {"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--config-env"}
+    while index < len(args):
+        arg = args[index]
+        if arg == "--":
+            index += 1
+            break
+        if arg in value_options:
+            index += 2
+            continue
+        if any(arg.startswith(f"{option}=") for option in value_options if option.startswith("--")):
+            index += 1
+            continue
+        if arg.startswith("-"):
+            index += 1
+            continue
+        break
+    return args[index:]
+
+
+def has_long_option(args: list[str], options: set[str]) -> bool:
+    return any(arg == option or arg.startswith(f"{option}=") for arg in args for option in options)
+
+
+def has_short_option(args: list[str], letters: set[str]) -> bool:
+    for arg in args:
+        if arg == "--":
+            return False
+        if arg.startswith("--"):
+            continue
+        if arg.startswith("-") and any(letter in arg[1:] for letter in letters):
+            return True
+    return False
+
+
+def bash_command_is_read_only(command: str) -> bool:
+    if (
+        shell_command_has_write_redirection(command)
+        or shell_command_has_substitution(command)
+        or shell_command_has_grouping(command)
+    ):
+        return False
+    segments = shell_command_tokens(command)
+    return bool(segments) and all(command_tokens_are_read_only(tokens) for tokens in segments)
+
+
+def command_tokens_are_read_only(tokens: list[str]) -> bool:
+    if not tokens or command_tokens_have_write_redirection(tokens):
+        return False
+    tokens = strip_env_prefix(tokens)
+    if not tokens:
+        return False
+    executable = Path(tokens[0]).name
+    if executable == "git":
+        return git_tokens_are_read_only(tokens)
+    if executable in READ_ONLY_BASH_EXECUTABLES:
+        return True
+    if executable == "sed":
+        return not has_short_option(tokens[1:], {"i"}) and not has_long_option(tokens[1:], {"--in-place"})
+    if executable == "find":
+        unsafe = {"-delete", "-exec", "-execdir", "-ok", "-okdir"}
+        return not any(token in unsafe for token in tokens[1:])
+    if executable in {"test", "[", "true", "false", "echo"}:
+        return True
+    return False
+
+
+def read_only_shell_executable(executable: str) -> bool:
+    return executable in READ_ONLY_BASH_EXECUTABLES or executable in {"test", "[", "true", "false", "echo"}
+
+
+def command_tokens_have_write_redirection(tokens: list[str]) -> bool:
+    return any(re.match(r"^(?:\d*>>?|&>)(?:.+)?$", token) for token in tokens)
+
+
+def shell_command_has_write_redirection(command: str) -> bool:
+    in_single = False
+    in_double = False
+    escaped = False
+    for char in command or "":
+        if escaped:
+            escaped = False
+            continue
+        if char == "\\" and not in_single:
+            escaped = True
+            continue
+        if char == "'" and not in_double:
+            in_single = not in_single
+            continue
+        if char == '"' and not in_single:
+            in_double = not in_double
+            continue
+        if char == ">" and not in_single and not in_double:
+            return True
+    return False
+
+
+def shell_command_has_grouping(command: str) -> bool:
+    in_single = False
+    in_double = False
+    escaped = False
+    for char in command or "":
+        if escaped:
+            escaped = False
+            continue
+        if char == "\\" and not in_single:
+            escaped = True
+            continue
+        if char == "'" and not in_double:
+            in_single = not in_single
+            continue
+        if char == '"' and not in_single:
+            in_double = not in_double
+            continue
+        if char in {"(", ")", "{", "}"} and not in_single and not in_double:
+            return True
+    return False
+
+
+def shell_command_has_substitution(command: str) -> bool:
+    in_single = False
+    in_double = False
+    escaped = False
+    text = command or ""
+    index = 0
+    while index < len(text):
+        char = text[index]
+        if escaped:
+            escaped = False
+            index += 1
+            continue
+        if char == "\\" and not in_single:
+            escaped = True
+            index += 1
+            continue
+        if char == "'" and not in_double:
+            in_single = not in_single
+            index += 1
+            continue
+        if char == '"' and not in_single:
+            in_double = not in_double
+            index += 1
+            continue
+        if not in_single and (
+            text.startswith("$(", index)
+            or text.startswith("<(", index)
+            or text.startswith(">(", index)
+            or char == "`"
+        ):
+            return True
+        index += 1
+    return False
+
+
+def strip_env_prefix(tokens: list[str]) -> list[str]:
+    index = 0
+    if tokens and Path(tokens[0]).name == "env":
+        index = 1
+        env_value_options = {"-u", "--unset", "-C", "--chdir"}
+        while index < len(tokens):
+            token = tokens[index]
+            if token in {"-i", "--ignore-environment", "-0", "--null"}:
+                index += 1
+                continue
+            if token in {"-S", "--split-string"}:
+                if index + 1 >= len(tokens):
+                    return []
+                return strip_env_prefix([*safe_shlex_split(tokens[index + 1]), *tokens[index + 2 :]])
+            if token.startswith("--split-string="):
+                return strip_env_prefix([*safe_shlex_split(token.split("=", 1)[1]), *tokens[index + 1 :]])
+            if token in env_value_options:
+                index += 2
+                continue
+            if any(token.startswith(f"{option}=") for option in env_value_options if option.startswith("--")):
+                index += 1
+                continue
+            break
+    while index < len(tokens):
+        token = tokens[index]
+        if token == "--":
+            index += 1
+            break
+        if "=" in token and not token.startswith("-") and token.split("=", 1)[0]:
+            index += 1
+            continue
+        break
+    return tokens[index:]
+
+
+def safe_shlex_split(value: str) -> list[str]:
+    try:
+        return shlex.split(value)
+    except ValueError:
+        return []
+
+
+def git_tokens_are_read_only(tokens: list[str]) -> bool:
+    git_index = git_token_index(tokens)
+    if git_index is None:
+        return False
+    args = skip_git_global_options(tokens[git_index + 1 :])
+    if not args:
+        return False
+    command = args[0]
+    rest = args[1:]
+    always_read_only = {
+        "status",
+        "diff",
+        "log",
+        "show",
+        "rev-parse",
+        "ls-files",
+        "grep",
+        "describe",
+        "merge-base",
+    }
+    if command in always_read_only:
+        return True
+    if command == "remote":
+        return git_remote_args_are_read_only(rest)
+    if command == "config":
+        return git_config_args_are_read_only(rest)
+    if command == "branch":
+        return git_branch_args_are_read_only(rest)
+    return False
+
+
+def git_remote_args_are_read_only(args: list[str]) -> bool:
+    if not args:
+        return True
+    if args[0] in {"-v", "--verbose"}:
+        return True
+    return args[0] in {"get-url", "show", "prune", "update"} and not any(arg in {"--add", "--delete"} for arg in args[1:])
+
+
+def git_config_args_are_read_only(args: list[str]) -> bool:
+    if not args:
+        return False
+    read_flags = {"--get", "--get-all", "--get-regexp", "--list", "-l", "--show-origin", "--show-scope"}
+    if any(arg in read_flags or arg.startswith("--get-urlmatch") for arg in args):
+        return True
+    non_value_options = {"--global", "--system", "--local", "--worktree", "--file", "-f"}
+    filtered = [arg for arg in args if arg not in non_value_options]
+    return len(filtered) == 1 and not filtered[0].startswith("-")
+
+
+def git_branch_args_are_read_only(args: list[str]) -> bool:
+    if not args:
+        return True
+    if git_branch_args_create_branch(args):
+        return False
+    if has_long_option(args, {"--delete", "--move", "--copy", "--force-copy"}):
+        return False
+    if has_short_option(args, {"d", "D", "m", "M", "c", "C"}):
+        return False
+    allowed_options = {
+        "--list",
+        "--all",
+        "--remotes",
+        "--show-current",
+        "--contains",
+        "--no-contains",
+        "--merged",
+        "--no-merged",
+        "--points-at",
+        "--format",
+        "--sort",
+        "--color",
+        "--column",
+        "--verbose",
+    }
+    for arg in args:
+        if arg == "--":
+            return True
+        if arg.startswith("--") and not any(arg == option or arg.startswith(f"{option}=") for option in allowed_options):
+            return False
+        if arg.startswith("-") and not arg.startswith("--") and not set(arg[1:]) <= {"a", "r", "v"}:
+            return False
+    return True
+
+
+def is_linear_start_command(command: str) -> bool:
+    if shell_command_has_write_redirection(command):
+        return False
+    segments = shell_command_tokens(command or "")
+    return bool(segments) and all(command_tokens_are_linear_start(tokens) for tokens in segments)
+
+
+def command_tokens_are_linear_start(tokens: list[str]) -> bool:
+    tokens = strip_env_prefix(tokens)
+    if not tokens:
+        return False
+    executable = Path(tokens[0]).name
+    script_index = 0
+    if executable in {"python", "python3"}:
+        if len(tokens) < 2:
+            return False
+        script_index = 1
+    elif executable == "linear_start.py":
+        script_index = 0
+    elif tokens[0] == "/linear-start":
+        return True
+    else:
+        return False
+    script = Path(tokens[script_index]).name
+    if script != "linear_start.py":
+        return False
+    return len(tokens) > script_index + 1 and tokens[script_index + 1] in {
+        "kickoff",
+        "activate",
+        "repo-binding",
+        "configure-repo",
+    }
+
+
+
 def changed_paths_from_payload(payload: JsonDict) -> list[str]:
     paths: list[str] = []
     for key in ("file_path", "path", "filename"):
@@ -953,7 +2065,10 @@ def changed_paths_from_payload(payload: JsonDict) -> list[str]:
 
 
 def normalize_repo_path(path: str) -> str:
-    return path.replace("\\", "/").lstrip("./")
+    normalized = path.replace("\\", "/")
+    while normalized.startswith("./"):
+        normalized = normalized[2:]
+    return normalized
 
 
 def meaningful_file(path: str) -> bool:

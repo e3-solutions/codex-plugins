@@ -1,7 +1,7 @@
 {
   "name": "linear-progress-sync",
-  "version": "0.1.4",
-  "description": "Safely sync Codex and Git development progress into Linear comments.",
+  "version": "0.2.0",
+  "description": "Start Codex implementation work from a linked Linear issue, branch, and draft PR, then safely sync progress.",
   "author": {
     "name": "Core Edge Solution"
   },
@@ -15,8 +15,8 @@
   "skills": "./skills/",
   "interface": {
     "displayName": "Linear Progress Sync",
-    "shortDescription": "Sync real development progress to Linear safely.",
-    "longDescription": "Linear Progress Sync watches Codex and Git activity, queues progress events locally, and asks Codex to update inferred Linear issues with safe comments only.",
+    "shortDescription": "Start linked Linear work and sync progress safely.",
+    "longDescription": "Linear Progress Sync starts implementation work from a confirmed Linear issue, creates the linked branch and draft PR before code, then syncs Codex and Git activity to that active issue with safe comments only.",
     "developerName": "Core Edge Solution",
     "category": "Productivity",
     "capabilities": [
@@ -24,6 +24,7 @@
       "Write"
     ],
     "defaultPrompt": [
+      "Start implementation from a linked Linear issue",
       "Summarize queued Linear progress sync events",
       "Drain the Linear progress sync queue safely"
     ],
