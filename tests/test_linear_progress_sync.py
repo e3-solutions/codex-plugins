@@ -455,13 +455,16 @@ def test_linear_start_requires_parseable_pr_url_before_writing_active_state(tmp_
     assert linear_sync.read_active_issue(root=tmp_path) is None
 
 
-@pytest.mark.parametrize("change_kind", ("staged", "unstaged", "untracked"))
+@pytest.mark.parametrize("change_kind", ("staged", "staged_tmp", "unstaged", "untracked"))
 def test_linear_start_requires_clean_worktree_before_kickoff(tmp_path, monkeypatch, change_kind):
     monkeypatch.setenv("LINEAR_SYNC_STATE_DIR", str(tmp_path / "state"))
     repo = init_git_repo(tmp_path / "repo", branch="arya/cor-43-original")
     if change_kind == "staged":
         (repo / "staged.txt").write_text("staged content\n", encoding="utf-8")
         subprocess.run(["git", "add", "staged.txt"], cwd=repo, check=True)
+    elif change_kind == "staged_tmp":
+        (repo / "accidental.tmp").write_text("staged temp content\n", encoding="utf-8")
+        subprocess.run(["git", "add", "accidental.tmp"], cwd=repo, check=True)
     elif change_kind == "unstaged":
         (repo / "tracked.txt").write_text("before\n", encoding="utf-8")
         subprocess.run(["git", "add", "tracked.txt"], cwd=repo, check=True)
@@ -481,6 +484,17 @@ def test_linear_start_requires_clean_worktree_before_kickoff(tmp_path, monkeypat
 
     assert linear_sync.current_branch(repo) == "arya/cor-43-original"
     assert linear_sync.local_branch_exists("arya/cor-43-reject-dirty-kickoff", root=repo) is False
+
+
+def test_clean_worktree_reports_staged_ignored_suffix_files(tmp_path, monkeypatch):
+    monkeypatch.delenv("LINEAR_SYNC_STATE_DIR", raising=False)
+    repo = init_git_repo(tmp_path / "repo", branch="arya/cor-46-work")
+    (repo / "accidental.tmp").write_text("staged temp content\n", encoding="utf-8")
+    subprocess.run(["git", "add", "accidental.tmp"], cwd=repo, check=True)
+
+    entries = linear_sync.worktree_status_entries(root=repo)
+
+    assert any("accidental.tmp" in entry for entry in entries)
 
 
 def test_clean_worktree_ignores_plugin_owned_state_in_fresh_repo(tmp_path, monkeypatch):

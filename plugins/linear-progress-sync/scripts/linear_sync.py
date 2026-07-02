@@ -696,11 +696,16 @@ def require_clean_worktree(*, root: str | Path | None = None) -> None:
 def worktree_status_entries(*, root: str | Path | None = None) -> list[str]:
     result = run_git(["status", "--porcelain", "--untracked-files=all"], root=root)
     require_success(result, "check worktree status")
-    return [line.strip() for line in result.stdout.splitlines() if line.strip() and status_entry_is_meaningful(line)]
+    return [line.strip() for line in result.stdout.splitlines() if line.strip() and status_entry_blocks_kickoff(line)]
 
 
-def status_entry_is_meaningful(entry: str) -> bool:
-    return any(meaningful_file(path) for path in status_entry_paths(entry))
+def status_entry_blocks_kickoff(entry: str) -> bool:
+    paths = status_entry_paths(entry)
+    return any(not plugin_owned_status_path(path) for path in paths)
+
+
+def plugin_owned_status_path(path: str) -> bool:
+    return normalize_repo_path(path).startswith(".codex/linear-sync/")
 
 
 def status_entry_paths(entry: str) -> list[str]:
