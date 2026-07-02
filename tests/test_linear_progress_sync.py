@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import subprocess
 import sys
 from datetime import datetime, timezone
@@ -223,6 +224,30 @@ def test_active_state_branch_mismatch_blocks_writes_and_does_not_infer_active(tm
     assert "does not match current branch" in inference.reason
 
 
+def test_pre_tool_use_script_exits_2_when_blocking_write(tmp_path, monkeypatch):
+    monkeypatch.setenv("LINEAR_SYNC_CONFIG_DIR", str(tmp_path / "config"))
+    monkeypatch.setenv("LINEAR_SYNC_STATE_DIR", str(tmp_path / "state"))
+    repo = init_git_repo(tmp_path / "repo")
+    payload = {
+        "cwd": str(repo),
+        "hook_event_name": "PreToolUse",
+        "tool_name": "apply_patch",
+        "tool_input": {"command": "*** Begin Patch\n*** Update File: demo.txt\n@@\n-old\n+new\n*** End Patch\n"},
+    }
+
+    result = subprocess.run(
+        [sys.executable, str(ROOT / "plugins" / "linear-progress-sync" / "scripts" / "pre_tool_use.py")],
+        input=json.dumps(payload),
+        text=True,
+        capture_output=True,
+        cwd=repo,
+        check=False,
+    )
+
+    assert result.returncode == 2
+    assert "Before writing code or creating branches" in result.stderr
+
+
 def test_active_linear_issue_state_round_trips_and_malformed_fails_closed(tmp_path, monkeypatch):
     monkeypatch.setenv("LINEAR_SYNC_STATE_DIR", str(tmp_path))
     payload = {
@@ -347,9 +372,15 @@ def test_pre_tool_guard_blocks_writes_and_branch_creation_without_active_state(t
     assert write_decision.blocked is True
     assert branch_decision.blocked is True
     assert "Linear kickoff" in write_decision.message
+    assert "Do not ask the user for a Linear issue key" in write_decision.message
+    assert "Create a new Linear issue from the user's implementation request" in write_decision.message
+    assert "Do not test write access" in write_decision.message
+    assert "If a Linear issue was already created in this turn, reuse" in write_decision.message
+    assert "linear_start.py kickoff" in write_decision.message
+    assert "activation_command" in write_decision.message
 
 
-def test_pre_tool_guard_allows_unbound_repo_without_active_state(tmp_path, monkeypatch):
+def test_pre_tool_guard_blocks_unbound_repo_writes_until_linear_destination_is_saved(tmp_path, monkeypatch):
     state_dir = tmp_path / "state"
     config_dir = tmp_path / "config"
     monkeypatch.setenv("LINEAR_SYNC_STATE_DIR", str(state_dir))
@@ -362,8 +393,106 @@ def test_pre_tool_guard_allows_unbound_repo_without_active_state(tmp_path, monke
         root=repo,
     )
 
-    assert write_decision.blocked is False
-    assert branch_decision.blocked is False
+    assert write_decision.blocked is True
+    assert branch_decision.blocked is True
+    assert write_decision.message.startswith("LINEAR DESTINATION REQUIRED")
+    assert "No Linear team/project is saved for this repo" in write_decision.message
+    assert "LINEAR DESTINATION REQUIRED" in write_decision.message
+    assert "Do not answer with a code patch" in write_decision.message
+    assert "do not say you are blocked" in write_decision.message
+    assert "Your next action must be to list Linear teams/projects" in write_decision.message
+    assert "mcp__codex_apps__linear._list_teams" in write_decision.message
+    assert "mcp__linear.list_projects" in write_decision.message
+    assert "ask the user only which Linear team/project" in write_decision.message
+    assert "This is the one required first-run human question" in write_decision.message
+    assert "do not stop after listing projects" in write_decision.message
+    assert "mcp__linear.save_issue" in write_decision.message
+    assert "before creating the issue, branch, or PR" in write_decision.message
+    assert "Do not ask the user for a Linear issue key" in write_decision.message
+    assert "Create a new Linear issue from the user's implementation request" in write_decision.message
+    assert branch_decision.message.startswith("LINEAR DESTINATION REQUIRED")
+    assert "Create or reset implementation branches only after the saved Linear destination exists" in branch_decision.message
+    assert "Do not answer with a code patch" in branch_decision.message
+    assert "This is the one required first-run human question" in branch_decision.message
+    assert "do not stop after listing projects" in branch_decision.message
+    assert "linear_start.py kickoff" in branch_decision.message
+
+
+def test_pre_tool_guard_blocks_desktop_file_change_without_active_state(tmp_path, monkeypatch):
+    state_dir = tmp_path / "state"
+    config_dir = tmp_path / "config"
+    monkeypatch.setenv("LINEAR_SYNC_STATE_DIR", str(state_dir))
+    monkeypatch.setenv("LINEAR_SYNC_CONFIG_DIR", str(config_dir))
+    repo = init_git_repo(tmp_path / "repo", branch="arya/no-linear-binding")
+
+    decisions = [
+        linear_sync.pre_tool_guard_decision({"tool_name": name}, root=repo)
+        for name in ("fileChange", "FileChange", "file_change", "MultiEdit")
+    ]
+
+    assert all(decision.blocked for decision in decisions)
+    assert all("No Linear team/project is saved for this repo" in decision.message for decision in decisions)
+
+
+def test_pre_tool_guard_allows_unbound_repo_read_only_commands(tmp_path, monkeypatch):
+    state_dir = tmp_path / "state"
+    config_dir = tmp_path / "config"
+    monkeypatch.setenv("LINEAR_SYNC_STATE_DIR", str(state_dir))
+    monkeypatch.setenv("LINEAR_SYNC_CONFIG_DIR", str(config_dir))
+    repo = init_git_repo(tmp_path / "repo", branch="arya/no-linear-binding")
+
+    commands = [
+        "git status --short",
+        "stat README.md",
+        "date",
+        "pwd",
+    ]
+
+    for command in commands:
+        decision = linear_sync.pre_tool_guard_decision(
+            {"tool_name": "Bash", "command": command},
+            root=repo,
+        )
+        assert decision.blocked is False, command
+
+
+def test_pre_tool_guard_blocks_unknown_bash_without_active_state(tmp_path, monkeypatch):
+    monkeypatch.setenv("LINEAR_SYNC_STATE_DIR", str(tmp_path))
+    bind_linear_repo(tmp_path, tmp_path, monkeypatch)
+    commands = [
+        "perl -e 'print qq(hi)'",
+        "node -e 'console.log(\"hi\")'",
+        "python -m pytest -q",
+        "awk '{ print $1 }' app.py",
+    ]
+
+    for command in commands:
+        decision = linear_sync.pre_tool_guard_decision(
+            {"tool_name": "Bash", "command": command},
+            root=tmp_path,
+        )
+        assert decision.blocked is True, command
+        assert "pre-kickoff read-only allowlist" in decision.message
+
+
+def test_pre_tool_guard_blocks_unbound_repo_without_active_state(tmp_path, monkeypatch):
+    state_dir = tmp_path / "state"
+    config_dir = tmp_path / "config"
+    monkeypatch.setenv("LINEAR_SYNC_STATE_DIR", str(state_dir))
+    monkeypatch.setenv("LINEAR_SYNC_CONFIG_DIR", str(config_dir))
+    repo = init_git_repo(tmp_path / "repo", branch="arya/no-linear-binding")
+
+    write_decision = linear_sync.pre_tool_guard_decision({"tool_name": "apply_patch"}, root=repo)
+    branch_decision = linear_sync.pre_tool_guard_decision(
+        {"tool_name": "Bash", "command": "git switch -c arya/normal-work"},
+        root=repo,
+    )
+
+    assert write_decision.blocked is True
+    assert branch_decision.blocked is True
+    assert write_decision.message.startswith("LINEAR DESTINATION REQUIRED")
+    assert "No Linear team/project is saved for this repo" in write_decision.message
+    assert branch_decision.message.startswith("LINEAR DESTINATION REQUIRED")
 
 
 def test_pre_tool_guard_blocks_writes_with_incomplete_active_state(tmp_path, monkeypatch):
@@ -430,6 +559,7 @@ def test_pre_tool_guard_blocks_long_form_branch_creation_without_active_state(tm
         "git switch --create arya/new-work",
         "git status --short\ngit switch -c arya/new-work",
         "git status --short\ngit checkout -b arya/new-work",
+        "bash -lc 'git switch -c arya/new-work'",
         "git checkout --branch arya/new-work",
         "git checkout -B arya/new-work",
         "git switch --orphan arya/new-work",
@@ -460,6 +590,9 @@ def test_pre_tool_guard_blocks_unsafe_bash_writes_without_active_state(tmp_path,
     commands = [
         "touch app.py",
         "sed -i '' 's/a/b/' app.py",
+        "perl -0pi -e 's/a/b/' app.py",
+        "perl -pi -e 's/a/b/' app.py",
+        "ruby -pi -e 'gsub(/a/, \"b\")' app.py",
         "python3 -c 'open(\"app.py\", \"w\").write(\"x\")'",
         "cat > app.py",
         "echo hi > app.py",
@@ -953,9 +1086,14 @@ def test_setup_plan_is_global_by_default_and_does_not_install_repo_hook(tmp_path
     assert "gh auth status" in commands
     assert "codex plugin marketplace add" in commands
     assert "codex plugin add linear-progress-sync@coreedge-local" in commands
+    assert "install_codex_hooks.py" in commands
     assert "codex mcp add linear --url https://mcp.linear.app/mcp" in commands
     assert "codex mcp login linear" not in commands
     assert "codex mcp login linear after setup" in notes
+    assert "review hooks" in notes
+    assert "First use in a repo asks which Linear team/project" in notes
+    assert "read-only allowlist" in notes
+    assert "unknown scripts, tests, builds, writes, and branch creation" in notes
     assert "install_git_hook.py" not in commands
     assert plan["per_repo_setup_required"] is False
 
@@ -974,10 +1112,68 @@ def test_setup_plan_can_include_optional_repo_git_hook(tmp_path):
 
 def test_setup_script_exists_and_exposes_dry_run():
     script = ROOT / "plugins/linear-progress-sync/scripts/setup.py"
+    hook_script = ROOT / "plugins/linear-progress-sync/scripts/install_codex_hooks.py"
     assert script.exists()
+    assert hook_script.exists()
     text = script.read_text(encoding="utf-8")
     assert "--dry-run" in text
     assert "--with-git-hook" in text
+    assert "codex mcp login linear" in text
+    assert "Before Linear kickoff, Bash is read-only allowlisted" in text
+    assert "No per-repo setup is needed" in text
+
+
+def test_setup_summary_prints_team_next_steps(capsys):
+    linear_setup.print_summary(
+        {
+            "ok": True,
+            "results": [
+                {"command": "gh auth status", "ok": True, "message": ""},
+            ],
+        }
+    )
+    output = capsys.readouterr().out
+
+    assert "Run: codex mcp login linear" in output
+    assert "trust the Linear Progress Sync hooks once" in output
+    assert "which Linear team/project to use" in output
+    assert "Before Linear kickoff, Bash is read-only allowlisted" in output
+    assert "No per-repo setup is needed" in output
+
+
+def test_install_codex_hooks_merges_existing_user_hooks(tmp_path):
+    codex_home = tmp_path / "codex-home"
+    hooks_path = codex_home / "hooks.json"
+    hooks_path.parent.mkdir(parents=True)
+    hooks_path.write_text(
+        json.dumps(
+            {
+                "hooks": {
+                    "SessionStart": [
+                        {"hooks": [{"type": "command", "command": "/tmp/notify.sh"}]},
+                    ],
+                    "Stop": [
+                        {"hooks": [{"type": "command", "command": "/tmp/notify.sh"}]},
+                    ],
+                }
+            },
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    result = linear_sync.install_codex_hooks(plugin_repo_root=ROOT, codex_home_path=codex_home)
+    second = linear_sync.install_codex_hooks(plugin_repo_root=ROOT, codex_home_path=codex_home)
+    installed = json.loads(hooks_path.read_text(encoding="utf-8"))
+
+    assert result["changed"] is True
+    assert second["changed"] is False
+    assert installed["hooks"]["SessionStart"][0]["hooks"][0]["command"] == "/tmp/notify.sh"
+    assert any("linear-progress-sync" in json.dumps(entry) for entry in installed["hooks"]["PreToolUse"])
+    assert any("linear-progress-sync" in json.dumps(entry) for entry in installed["hooks"]["PostToolUse"])
+    assert json.dumps(installed).count("pre_tool_use.py") == 1
+    assert json.dumps(installed).count("post_tool_use.py") == 1
 
 
 def test_readmes_register_linear_mcp_before_linear_login():
@@ -987,6 +1183,11 @@ def test_readmes_register_linear_mcp_before_linear_login():
         assert text.index("python3 plugins/linear-progress-sync/scripts/setup.py") < text.index(
             "codex mcp login linear"
         )
+        assert "Run this once per teammate, not once per repo" in text
+        assert "trust the Linear Progress Sync hooks once" in text
+        assert "saves it in `~/.codex/linear-sync/repos.json`" in text
+        assert "Bash uses a read-only allowlist" in text
+        assert "Unknown scripts, tests, builds, file writes, and branch creation wait" in text
 
 
 def test_setup_run_step_does_not_treat_auth_failure_as_idempotent_success(monkeypatch):
@@ -1064,9 +1265,12 @@ def test_plugin_hooks_do_not_use_repo_relative_script_paths():
 
 
 def test_plugin_exposes_linear_start_command_and_pre_tool_guard_hook():
+    manifest = json.loads((ROOT / "plugins/linear-progress-sync/.codex-plugin/plugin.json").read_text(encoding="utf-8"))
     command = ROOT / "plugins/linear-progress-sync/commands/linear-start.md"
+    skill = ROOT / "plugins/linear-progress-sync/skills/linear-progress-sync/SKILL.md"
     assert command.exists()
     command_text = command.read_text(encoding="utf-8")
+    skill_text = skill.read_text(encoding="utf-8")
     sync_command_text = (ROOT / "plugins/linear-progress-sync/commands/sync-linear-progress.md").read_text(
         encoding="utf-8"
     )
@@ -1075,21 +1279,41 @@ def test_plugin_exposes_linear_start_command_and_pre_tool_guard_hook():
     assert "activation_command" in command_text
     assert "repo-binding" in command_text
     assert "configure-repo" in command_text
-    assert "mcp__linear." not in command_text
     assert "mcp__linear." not in sync_command_text
     assert "mcp__codex_apps__linear._list_teams" in command_text
     assert "mcp__codex_apps__linear._list_projects" in command_text
     assert "mcp__codex_apps__linear._save_issue" in command_text
+    assert "mcp__codex_apps__linear._get_issue" in command_text
     assert "mcp__codex_apps__linear._fetch" in command_text
     assert "mcp__codex_apps__linear._save_comment" in command_text
+    assert "create a new issue automatically from the user's implementation request" in command_text
+    assert "Do not ask the user for a Linear issue key" in command_text
+    assert "do not stop, do not test write access" in command_text
+    assert "activation_command" in command_text
+    assert "create a new issue automatically from the user's implementation request" in skill_text.lower()
+    assert "Do not ask the user for a Linear issue key" in skill_text
+    assert "do not stop, do not test write access" in skill_text
+    assert "mcp__linear.list_teams" in command_text
+    assert "mcp__linear.list_projects" in command_text
+    assert "mcp__linear.get_issue" in command_text
+    assert "mcp__linear.save_issue" in command_text
+    assert "mcp__linear.save_comment" in command_text
+    assert "short Linear aliases like `list_teams` or `list_projects`" in command_text
+    assert "do not stop after listing projects" in command_text
+    assert "do not answer with a code patch or say you are blocked" in command_text
+    assert "do not answer with a code patch or say you are blocked" in skill_text
+    assert "Do not create the Linear issue, branch, PR, or code changes until the chosen repo destination is saved" in skill_text
     assert "mcp__codex_apps__linear._list_comments" in sync_command_text
+    assert manifest["hooks"] == "./hooks/hooks.json"
     for rel in (
         "plugins/linear-progress-sync/hooks.json",
         "plugins/linear-progress-sync/hooks/hooks.json",
     ):
         text = (ROOT / rel).read_text(encoding="utf-8")
         assert '"PreToolUse"' in text
+        assert '"matcher"' not in text
         assert "pre_tool_use.py" in text
+        assert "post_tool_use.py" in text
 
 
 def test_dry_run_keeps_event_queued_and_unsynced(tmp_path, monkeypatch):

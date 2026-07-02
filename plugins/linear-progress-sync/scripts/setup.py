@@ -104,7 +104,20 @@ def print_summary(result: dict) -> None:
         if item.get("message"):
             print(item["message"])
     if result["ok"]:
-        print("Setup complete. Start a new Codex thread so plugin hooks and skills reload.")
+        print("Setup complete.")
+        print("")
+        print("Next steps:")
+        print("1. Run: codex mcp login linear")
+        print("2. If Codex asks to review hooks, trust the Linear Progress Sync hooks once.")
+        print("3. Start a new Codex thread so hooks and skills reload.")
+        print("4. On first use in a repo, Codex will ask which Linear team/project to use and save it.")
+        print("")
+        print("Notes:")
+        print("- GitHub auth is checked by setup; run gh auth login if that step failed.")
+        print("- Linear auth is manual; setup registers the MCP server but does not log you in.")
+        print("- Before Linear kickoff, Bash is read-only allowlisted.")
+        print("- Unknown scripts, tests, builds, writes, and branch creation wait for active Linear state.")
+        print("- No per-repo setup is needed unless you want the optional outside-Codex Git commit hook.")
 
 
 if __name__ == "__main__":

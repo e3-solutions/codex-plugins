@@ -37,6 +37,7 @@ DRY_RUN_ENV = "LINEAR_SYNC_DRY_RUN"
 CODEX_COMMAND_ENV = "LINEAR_SYNC_CODEX_COMMAND"
 THROTTLE_SECONDS = 30 * 60
 LINEAR_MCP_URL = "https://mcp.linear.app/mcp"
+LINEAR_HOOK_EVENTS = ("SessionStart", "PreToolUse", "PostToolUse", "Stop")
 IGNORED_FILE_PREFIXES = (
     ".codex/linear-sync/",
     ".git/",
@@ -45,20 +46,47 @@ IGNORED_FILE_NAMES = {
     ".DS_Store",
 }
 READ_ONLY_BASH_EXECUTABLES = {
-    "pwd",
-    "ls",
+    "basename",
     "cat",
-    "head",
-    "tail",
-    "wc",
-    "rg",
-    "grep",
+    "date",
+    "df",
+    "dirname",
+    "du",
     "egrep",
     "fgrep",
-    "nl",
     "file",
+    "grep",
+    "head",
+    "id",
+    "ls",
+    "nl",
+    "printenv",
+    "pwd",
+    "readlink",
+    "realpath",
+    "rg",
+    "stat",
+    "tail",
+    "uname",
+    "wc",
     "which",
+    "whoami",
 }
+WRITE_LIKE_BASH_EXECUTABLES = {
+    "chmod",
+    "chown",
+    "cp",
+    "install",
+    "ln",
+    "mkdir",
+    "mv",
+    "rm",
+    "rmdir",
+    "tee",
+    "touch",
+    "truncate",
+}
+SHELL_SCRIPT_EXECUTABLES = {"bash", "sh", "zsh"}
 SHELL_COMMAND_PUNCTUATION = ";&|<>"
 
 
@@ -373,6 +401,114 @@ def write_json_atomic(path: Path, payload: JsonDict) -> None:
     tmp.replace(path)
 
 
+def codex_home() -> Path:
+    override = os.environ.get("CODEX_HOME")
+    if override:
+        return Path(override).expanduser().resolve()
+    return Path.home() / ".codex"
+
+
+def codex_hooks_path(*, home: str | Path | None = None) -> Path:
+    base = Path(home).expanduser().resolve() if home else codex_home()
+    return base / "hooks.json"
+
+
+def read_json_object(path: Path) -> JsonDict:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"{path} is not valid JSON") from exc
+    except OSError as exc:
+        raise ValueError(f"{path} could not be read: {exc}") from exc
+    if not isinstance(data, dict):
+        raise ValueError(f"{path} must contain a JSON object")
+    return data
+
+
+def linear_plugin_root(plugin_repo_root: str | Path) -> Path:
+    root = Path(plugin_repo_root).expanduser().resolve()
+    if (root / ".codex-plugin" / "plugin.json").exists():
+        return root
+    return root / "plugins" / "linear-progress-sync"
+
+
+def linear_hooks_config_path(plugin_repo_root: str | Path) -> Path:
+    plugin_root = linear_plugin_root(plugin_repo_root)
+    for candidate in (plugin_root / "hooks" / "hooks.json", plugin_root / "hooks.json"):
+        if candidate.exists():
+            return candidate
+    raise FileNotFoundError(f"missing Linear hook config under {plugin_root}")
+
+
+def read_linear_hooks_config(plugin_repo_root: str | Path) -> JsonDict:
+    path = linear_hooks_config_path(plugin_repo_root)
+    config = read_json_object(path)
+    hooks = config.get("hooks")
+    if not isinstance(hooks, dict):
+        raise ValueError(f"{path} missing hooks object")
+    return config
+
+
+def hook_entry_mentions_linear_sync(entry: Any) -> bool:
+    try:
+        text = json.dumps(entry, sort_keys=True)
+    except TypeError:
+        text = str(entry)
+    return "linear-progress-sync" in text
+
+
+def merge_linear_hooks(existing: JsonDict, linear_config: JsonDict) -> JsonDict:
+    merged = json.loads(json.dumps(existing)) if existing else {}
+    merged_hooks = merged.setdefault("hooks", {})
+    if not isinstance(merged_hooks, dict):
+        raise ValueError("existing hooks.json field `hooks` must be an object")
+
+    linear_hooks = linear_config.get("hooks")
+    if not isinstance(linear_hooks, dict):
+        raise ValueError("Linear hook config missing hooks object")
+
+    for event in LINEAR_HOOK_EVENTS:
+        incoming = linear_hooks.get(event)
+        if incoming is None:
+            continue
+        if not isinstance(incoming, list):
+            raise ValueError(f"Linear hook event {event} must be a list")
+        current = merged_hooks.get(event, [])
+        if current is None:
+            current = []
+        if not isinstance(current, list):
+            raise ValueError(f"existing hooks event {event} must be a list")
+        kept = [entry for entry in current if not hook_entry_mentions_linear_sync(entry)]
+        merged_hooks[event] = kept + json.loads(json.dumps(incoming))
+
+    return merged
+
+
+def install_codex_hooks(
+    *,
+    plugin_repo_root: str | Path,
+    codex_home_path: str | Path | None = None,
+    dry_run: bool = False,
+) -> JsonDict:
+    hooks_path = codex_hooks_path(home=codex_home_path)
+    existing = read_json_object(hooks_path)
+    linear_config = read_linear_hooks_config(plugin_repo_root)
+    merged = merge_linear_hooks(existing, linear_config)
+    changed = merged != existing
+    if changed and not dry_run:
+        write_json_atomic(hooks_path, merged)
+    return {
+        "ok": True,
+        "changed": changed,
+        "dry_run": dry_run,
+        "path": str(hooks_path),
+        "source": str(linear_hooks_config_path(plugin_repo_root)),
+        "events": [event for event in LINEAR_HOOK_EVENTS if event in (linear_config.get("hooks") or {})],
+    }
+
+
 def append_jsonl(path: Path, payload: JsonDict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as handle:
@@ -682,6 +818,14 @@ def setup_plan(
         shlex.join(["gh", "auth", "status"]),
         shlex.join(["codex", "plugin", "marketplace", "add", str(plugin_root)]),
         shlex.join(["codex", "plugin", "add", "linear-progress-sync@coreedge-local"]),
+        shlex.join(
+            [
+                sys.executable,
+                str(plugin_root / "plugins" / "linear-progress-sync" / "scripts" / "install_codex_hooks.py"),
+                "--plugin-root",
+                str(plugin_root),
+            ]
+        ),
         shlex.join(["codex", "mcp", "add", "linear", "--url", LINEAR_MCP_URL]),
     ]
     if with_git_hook:
@@ -694,9 +838,12 @@ def setup_plan(
         "per_repo_setup_required": False,
         "optional_git_hook": with_git_hook,
         "notes": [
-            "Default setup is user-level: plugin marketplace, plugin install, GitHub auth check, and Linear MCP registration.",
+            "Default setup is user-level: plugin marketplace, plugin install, global Codex hooks, GitHub auth check, and Linear MCP registration.",
             "GitHub auth is a manual prerequisite: run gh auth login when needed.",
             "Linear auth is manual after setup registers the MCP server: run codex mcp login linear after setup when needed.",
+            "If Codex asks to review hooks, trust the Linear Progress Sync hooks once so automatic kickoff can run.",
+            "First use in a repo asks which Linear team/project to use and saves it in ~/.codex/linear-sync/repos.json.",
+            "Before kickoff, Bash is a read-only allowlist; unknown scripts, tests, builds, writes, and branch creation wait for active Linear state.",
             "Per-repo Git hook setup is optional and only needed to sync commits made outside Codex.",
             "Start a new Codex thread after installing or updating the plugin so hooks and skills reload.",
         ],
@@ -1492,27 +1639,47 @@ def read_stdin_json() -> JsonDict:
 def pre_tool_guard_decision(payload: JsonDict, *, root: str | Path | None = None) -> PreToolGuardDecision:
     tool = tool_name(payload)
     normalized_tool = tool.lower()
-    requires_active_state = normalized_tool in {"apply_patch", "edit", "write"}
+    requires_active_state = normalized_tool in {
+        "apply_patch",
+        "edit",
+        "multiedit",
+        "write",
+        "filechange",
+        "file_change",
+    }
     guard_enabled = linear_guard_enabled(root=root)
     if normalized_tool == "bash":
         command = tool_command(payload)
         if is_linear_start_command(command):
             return PreToolGuardDecision(False)
-        if not guard_enabled:
-            return PreToolGuardDecision(False)
         if looks_like_branch_creation(command):
-            return PreToolGuardDecision(True, linear_branch_creation_blocked_message())
+            return PreToolGuardDecision(
+                True,
+                linear_branch_creation_blocked_message(root=root, needs_binding=not guard_enabled),
+            )
         if bash_command_is_read_only(command):
             return PreToolGuardDecision(False)
-        else:
-            requires_active_state = True
+        if not guard_enabled:
+            return PreToolGuardDecision(True, linear_repo_binding_required_message(root=root))
+        problem = active_issue_write_problem(root=root)
+        if problem:
+            return PreToolGuardDecision(
+                True,
+                linear_kickoff_required_message(
+                    f"{problem}; Bash command is not on the pre-kickoff read-only allowlist",
+                    root=root,
+                ),
+            )
+        if not bash_command_is_write_like(command):
+            return PreToolGuardDecision(False)
+        requires_active_state = True
 
     if requires_active_state:
         if not guard_enabled:
-            return PreToolGuardDecision(False)
+            return PreToolGuardDecision(True, linear_repo_binding_required_message(root=root))
         problem = active_issue_write_problem(root=root)
         if problem:
-            return PreToolGuardDecision(True, linear_kickoff_required_message(problem))
+            return PreToolGuardDecision(True, linear_kickoff_required_message(problem, root=root))
         return PreToolGuardDecision(False)
 
     return PreToolGuardDecision(False)
@@ -1525,20 +1692,109 @@ def linear_guard_enabled(*, root: str | Path | None = None) -> bool:
     return bool(repo_binding_status(root=root).get("configured"))
 
 
-def linear_branch_creation_blocked_message() -> str:
+def linear_start_script_path() -> str:
+    return str(Path(__file__).with_name("linear_start.py"))
+
+
+def linear_guard_repo_arg(*, root: str | Path | None = None) -> str:
+    return str(repo_root(root))
+
+
+def continue_kickoff_instruction(
+    *,
+    root: str | Path | None = None,
+    needs_binding: bool = False,
+    include_hard_stop: bool = True,
+) -> str:
+    if needs_binding:
+        hard_stop = (
+            "LINEAR DESTINATION REQUIRED. Do not answer with a code patch, do not say you are blocked, "
+            "and do not stop. Your next action must be to list Linear teams/projects, then ask the human "
+            "which Linear team/project this repo should use. "
+            if include_hard_stop
+            else ""
+        )
+        return (
+            f"{hard_stop}"
+            "This is the one required first-run human "
+            "question; do not ask for a Linear issue key and do not ask for coding approval. After the "
+            "human chooses, save the answer before doing any issue, branch, PR, or code work. Use the "
+            "connected Linear app tools to list destinations: mcp__codex_apps__linear._list_teams and "
+            "mcp__codex_apps__linear._list_projects, or mcp__linear.list_teams and "
+            "mcp__linear.list_projects. If the session exposes short Linear aliases like list_teams or "
+            "list_projects, use those aliases. If save_issue is not visible yet, search/load Linear tools "
+            "and do not stop after listing projects. Save the chosen destination with "
+            f"`python3 {linear_start_script_path()} configure-repo --root "
+            f"{shlex.quote(linear_guard_repo_arg(root=root))} --team \"<Linear team>\" "
+            "--project \"<Linear project>\"`. Then create the Linear issue with "
+            "mcp__codex_apps__linear._save_issue or mcp__linear.save_issue, using the saved team/project. "
+            "After the issue exists, run "
+            f"`python3 {linear_start_script_path()} kickoff --root "
+            f"{shlex.quote(linear_guard_repo_arg(root=root))} --issue-key <ISSUE-KEY> "
+            "--issue-title \"<Linear issue title>\" --issue-url <Linear issue URL> "
+            "--branch <Linear gitBranchName>`; then attach/comment the draft PR in Linear with "
+            "mcp__codex_apps__linear._save_issue/mcp__codex_apps__linear._save_comment or "
+            "mcp__linear.save_issue/mcp__linear.save_comment, run the helper's `activation_command`, "
+            "and retry the blocked tool call."
+        )
+
     return (
-        "Create or reset implementation branches only through the Linear kickoff workflow. "
-        "Run the automatic Linear kickoff workflow first so Linear, the branch, and the draft PR stay linked."
+        "This is not a request for human approval. Codex must continue the kickoff workflow itself. "
+        "Do not test write access, do not inspect .codex as a substitute for kickoff, and do not stop after "
+        "creating the Linear issue. "
+        "If a Linear issue was already created in this turn, reuse that issue key, URL, title, and Linear "
+        "gitBranchName. Run "
+        f"`python3 {linear_start_script_path()} kickoff --root {shlex.quote(linear_guard_repo_arg(root=root))} "
+        "--issue-key <ISSUE-KEY> --issue-title \"<Linear issue title>\" --issue-url <Linear issue URL> "
+        "--branch <Linear gitBranchName>`; then attach/comment the draft PR in Linear, run the helper's "
+        "`activation_command`, and retry the blocked tool call."
     )
 
 
-def linear_kickoff_required_message(reason: str | None = None) -> str:
+def linear_branch_creation_blocked_message(
+    *,
+    root: str | Path | None = None,
+    needs_binding: bool = False,
+) -> str:
+    if needs_binding:
+        return (
+            f"{continue_kickoff_instruction(root=root, needs_binding=True)} "
+            "Create or reset implementation branches only after the saved Linear destination exists "
+            "and the Linear kickoff workflow creates the branch."
+        )
+    return (
+        "Create or reset implementation branches only through the Linear kickoff workflow. "
+        f"Run the automatic Linear kickoff workflow first so Linear, the branch, and the draft PR stay linked. "
+        f"{continue_kickoff_instruction(root=root, needs_binding=needs_binding)}"
+    )
+
+
+def linear_repo_binding_required_message(*, root: str | Path | None = None) -> str:
+    return (
+        "LINEAR DESTINATION REQUIRED. Do not answer with a code patch, do not say you are blocked, "
+        "and do not stop. Your next action must be to list Linear teams/projects, then ask the human "
+        "which Linear team/project this repo should use. No Linear team/project is saved for this repo. "
+        "Before writing code or creating branches, Codex must save that binding. "
+        "Do not tell the user to configure it manually. "
+        "Do not ask the user for a Linear issue key. "
+        "Create a new Linear issue from the user's implementation request unless the user explicitly "
+        "supplied an existing issue key. First call mcp__codex_apps__linear._list_teams and "
+        "mcp__codex_apps__linear._list_projects, or mcp__linear.list_teams and mcp__linear.list_projects "
+        "if the direct Linear namespace is exposed; ask the user only which Linear team/project this repo "
+        "should use; save it with linear_start.py configure-repo before creating the issue, branch, or PR. "
+        f"{continue_kickoff_instruction(root=root, needs_binding=True, include_hard_stop=False)}"
+    )
+
+
+def linear_kickoff_required_message(reason: str | None = None, *, root: str | Path | None = None) -> str:
     prefix = f"{reason}. " if reason else ""
     return (
         f"{prefix}Linear kickoff is required before writing code or creating branches. "
-        "Run the automatic Linear kickoff workflow first: confirm or create the Linear issue, "
-        "create the Linear-named branch, push the empty kickoff commit, open the draft PR, "
-        "link Linear and GitHub, then retry this tool call."
+        "Run the automatic Linear kickoff workflow first. Do not ask the user for a Linear issue key. "
+        "Create a new Linear issue from the user's implementation request unless the user explicitly "
+        "supplied an existing issue key; then create the Linear-named branch, push the empty kickoff "
+        "commit, open the draft PR, link Linear and GitHub, activate active.json, and retry this tool call. "
+        f"{continue_kickoff_instruction(root=root)}"
     )
 
 
@@ -1552,7 +1808,14 @@ def handle_post_tool_use(payload: JsonDict, *, root: str | Path | None = None) -
             queued = enqueue_event("post_commit", event, root=root)
             spawn_drain(root=root)
             return queued
-    if tool in {"apply_patch", "Edit", "Write"} or tool.lower() in {"apply_patch", "edit", "write"}:
+    if tool in {"apply_patch", "Edit", "MultiEdit", "Write", "fileChange", "FileChange"} or tool.lower() in {
+        "apply_patch",
+        "edit",
+        "multiedit",
+        "write",
+        "filechange",
+        "file_change",
+    }:
         paths = changed_paths_from_payload(payload)
         meaningful = [path for path in paths if meaningful_file(path)]
         if meaningful:
@@ -1626,7 +1889,18 @@ def looks_like_git_commit(command: str) -> bool:
 def looks_like_branch_creation(command: str) -> bool:
     if not command:
         return False
-    return any(git_tokens_create_branch(tokens) for tokens in shell_command_tokens(command))
+    return any(command_tokens_create_branch(tokens) for tokens in shell_command_tokens(command))
+
+
+def command_tokens_create_branch(tokens: list[str]) -> bool:
+    executable_tokens = strip_env_prefix(tokens)
+    if not executable_tokens:
+        return False
+    executable = Path(executable_tokens[0]).name
+    if executable in SHELL_SCRIPT_EXECUTABLES:
+        script = shell_c_script(executable_tokens)
+        return bool(script and looks_like_branch_creation(script))
+    return git_tokens_create_branch(executable_tokens)
 
 
 def shell_command_tokens(command: str) -> list[list[str]]:
@@ -1814,6 +2088,77 @@ def command_tokens_are_read_only(tokens: list[str]) -> bool:
     return False
 
 
+def bash_command_is_write_like(command: str) -> bool:
+    if (
+        shell_command_has_write_redirection(command)
+        or shell_command_has_substitution(command)
+        or shell_command_has_grouping(command)
+    ):
+        return True
+    return any(command_tokens_are_write_like(tokens) for tokens in shell_command_tokens(command))
+
+
+def command_tokens_are_write_like(tokens: list[str]) -> bool:
+    if not tokens or command_tokens_have_write_redirection(tokens):
+        return bool(tokens)
+    tokens = strip_env_prefix(tokens)
+    if not tokens:
+        return False
+    executable = Path(tokens[0]).name
+    if command_tokens_create_branch(tokens):
+        return True
+    if executable in SHELL_SCRIPT_EXECUTABLES:
+        script = shell_c_script(tokens)
+        return bool(script and bash_command_is_write_like(script))
+    if executable == "git":
+        return git_tokens_are_write_like(tokens)
+    if executable in WRITE_LIKE_BASH_EXECUTABLES:
+        return True
+    if executable == "sed":
+        return has_short_option(tokens[1:], {"i"}) or has_long_option(tokens[1:], {"--in-place"})
+    if executable in {"perl", "ruby"}:
+        return in_place_script_tokens_are_write_like(tokens)
+    if executable in {"python", "python3"}:
+        return python_tokens_are_write_like(tokens)
+    return False
+
+
+def shell_c_script(tokens: list[str]) -> str | None:
+    for index, token in enumerate(tokens[1:], start=1):
+        if token == "--":
+            continue
+        if token == "-c" or (token.startswith("-") and not token.startswith("--") and "c" in token[1:]):
+            return tokens[index + 1] if index + 1 < len(tokens) else None
+    return None
+
+
+def python_tokens_are_write_like(tokens: list[str]) -> bool:
+    code: str | None = None
+    for index, token in enumerate(tokens[1:], start=1):
+        if token == "-c":
+            code = tokens[index + 1] if index + 1 < len(tokens) else None
+            break
+    if not code:
+        return False
+    write_markers = (
+        ".write(",
+        ".writelines(",
+        "write_text(",
+        "write_bytes(",
+        "unlink(",
+        "remove(",
+        "rename(",
+        "replace(",
+    )
+    return any(marker in code for marker in write_markers) or bool(
+        re.search(r"\bopen\s*\([^)]*,\s*['\"][^'\"]*[wax+]", code)
+    )
+
+
+def in_place_script_tokens_are_write_like(tokens: list[str]) -> bool:
+    return has_short_option(tokens[1:], {"i"}) or has_long_option(tokens[1:], {"--in-place"})
+
+
 def read_only_shell_executable(executable: str) -> bool:
     return executable in READ_ONLY_BASH_EXECUTABLES or executable in {"test", "[", "true", "false", "echo"}
 
@@ -1972,6 +2317,49 @@ def git_tokens_are_read_only(tokens: list[str]) -> bool:
     if command == "branch":
         return git_branch_args_are_read_only(rest)
     return False
+
+
+def git_tokens_are_write_like(tokens: list[str]) -> bool:
+    git_index = git_token_index(tokens)
+    if git_index is None:
+        return False
+    args = skip_git_global_options(tokens[git_index + 1 :])
+    if not args:
+        return False
+    command = args[0]
+    rest = args[1:]
+    if command == "branch":
+        return not git_branch_args_are_read_only(rest)
+    if command == "config":
+        return not git_config_args_are_read_only(rest)
+    if command == "remote":
+        return not git_remote_args_are_read_only(rest)
+    return command in {
+        "add",
+        "am",
+        "apply",
+        "checkout",
+        "checkout-index",
+        "cherry-pick",
+        "clean",
+        "commit",
+        "merge",
+        "mv",
+        "pull",
+        "push",
+        "rebase",
+        "reset",
+        "restore",
+        "revert",
+        "rm",
+        "stash",
+        "switch",
+        "symbolic-ref",
+        "tag",
+        "update-index",
+        "update-ref",
+        "worktree",
+    }
 
 
 def git_remote_args_are_read_only(args: list[str]) -> bool:
