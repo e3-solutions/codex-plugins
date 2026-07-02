@@ -11,17 +11,22 @@ git clone https://github.com/e3-solutions/codex-plugins
 cd codex-plugins
 ```
 
-Authenticate GitHub CLI and Linear:
+Authenticate GitHub CLI:
 
 ```bash
 gh auth login
-codex mcp login linear
 ```
 
 Run setup:
 
 ```bash
 python3 plugins/linear-progress-sync/scripts/setup.py
+```
+
+Authenticate Linear after setup registers the MCP server:
+
+```bash
+codex mcp login linear
 ```
 
 Then restart Codex or start a new Codex thread.

@@ -616,7 +616,8 @@ def setup_plan(
         "optional_git_hook": with_git_hook,
         "notes": [
             "Default setup is user-level: plugin marketplace, plugin install, GitHub auth check, and Linear MCP registration.",
-            "GitHub and Linear auth are manual prerequisites: run gh auth login and codex mcp login linear when needed.",
+            "GitHub auth is a manual prerequisite: run gh auth login when needed.",
+            "Linear auth is manual after setup registers the MCP server: run codex mcp login linear after setup when needed.",
             "Per-repo Git hook setup is optional and only needed to sync commits made outside Codex.",
             "Start a new Codex thread after installing or updating the plugin so hooks and skills reload.",
         ],
@@ -646,6 +647,7 @@ def run_linear_start(
     if dry_run:
         return {**plan, "dry_run": True}
 
+    require_clean_worktree(root=root)
     target_branch = str(plan["active_state"]["branch"])
     if current_branch(root) != target_branch:
         switch_args = ["switch", target_branch] if local_branch_exists(target_branch, root=root) else ["switch", "-c", target_branch]
@@ -677,6 +679,24 @@ def run_linear_start(
 
 def local_branch_exists(branch: str, *, root: str | Path | None = None) -> bool:
     return run_git(["rev-parse", "--verify", f"refs/heads/{branch}"], root=root).returncode == 0
+
+
+def require_clean_worktree(*, root: str | Path | None = None) -> None:
+    dirty = worktree_status_entries(root=root)
+    if not dirty:
+        return
+    sample = ", ".join(dirty[:5])
+    suffix = f" (+{len(dirty) - 5} more)" if len(dirty) > 5 else ""
+    raise RuntimeError(
+        "Linear kickoff requires a clean worktree before creating the kickoff branch/commit; "
+        f"commit, stash, or reset these changes first: {sample}{suffix}"
+    )
+
+
+def worktree_status_entries(*, root: str | Path | None = None) -> list[str]:
+    result = run_git(["status", "--porcelain"], root=root)
+    require_success(result, "check worktree status")
+    return [line.strip() for line in result.stdout.splitlines() if line.strip()]
 
 
 def run_local_command(args: list[str], *, root: str | Path | None = None) -> subprocess.CompletedProcess[str]:

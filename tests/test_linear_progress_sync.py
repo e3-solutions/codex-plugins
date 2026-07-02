@@ -455,6 +455,34 @@ def test_linear_start_requires_parseable_pr_url_before_writing_active_state(tmp_
     assert linear_sync.read_active_issue(root=tmp_path) is None
 
 
+@pytest.mark.parametrize("change_kind", ("staged", "unstaged", "untracked"))
+def test_linear_start_requires_clean_worktree_before_kickoff(tmp_path, monkeypatch, change_kind):
+    monkeypatch.setenv("LINEAR_SYNC_STATE_DIR", str(tmp_path / "state"))
+    repo = init_git_repo(tmp_path / "repo", branch="arya/cor-43-original")
+    if change_kind == "staged":
+        (repo / "staged.txt").write_text("staged content\n", encoding="utf-8")
+        subprocess.run(["git", "add", "staged.txt"], cwd=repo, check=True)
+    elif change_kind == "unstaged":
+        (repo / "tracked.txt").write_text("before\n", encoding="utf-8")
+        subprocess.run(["git", "add", "tracked.txt"], cwd=repo, check=True)
+        subprocess.run(["git", "commit", "-m", "add tracked"], cwd=repo, check=True)
+        (repo / "tracked.txt").write_text("after\n", encoding="utf-8")
+    else:
+        (repo / "untracked.txt").write_text("untracked content\n", encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="clean worktree"):
+        linear_sync.run_linear_start(
+            issue_key="COR-43",
+            issue_title="Reject dirty kickoff",
+            issue_url="https://linear.app/coreedge/issue/COR-43/reject-dirty-kickoff",
+            branch="arya/cor-43-reject-dirty-kickoff",
+            root=repo,
+        )
+
+    assert linear_sync.current_branch(repo) == "arya/cor-43-original"
+    assert linear_sync.local_branch_exists("arya/cor-43-reject-dirty-kickoff", root=repo) is False
+
+
 def test_repo_identity_normalizes_github_origin(tmp_path):
     repo = init_git_repo(tmp_path / "repo")
     add_origin(repo, "git@github.com:e3-solutions/codex-plugins.git")
@@ -486,12 +514,14 @@ def test_repo_linear_binding_round_trips_by_repo_identity(tmp_path, monkeypatch)
 def test_setup_plan_is_global_by_default_and_does_not_install_repo_hook(tmp_path):
     plan = linear_sync.setup_plan(plugin_repo_root=ROOT, target_repo_root=tmp_path)
     commands = "\n".join(plan["commands"])
+    notes = "\n".join(plan["notes"])
 
     assert "gh auth status" in commands
     assert "codex plugin marketplace add" in commands
     assert "codex plugin add linear-progress-sync@coreedge-local" in commands
     assert "codex mcp add linear --url https://mcp.linear.app/mcp" in commands
     assert "codex mcp login linear" not in commands
+    assert "codex mcp login linear after setup" in notes
     assert "install_git_hook.py" not in commands
     assert plan["per_repo_setup_required"] is False
 
@@ -516,11 +546,13 @@ def test_setup_script_exists_and_exposes_dry_run():
     assert "--with-git-hook" in text
 
 
-def test_readmes_put_auth_before_setup_command():
+def test_readmes_register_linear_mcp_before_linear_login():
     for rel in ("README.md", "plugins/linear-progress-sync/README.md"):
         text = (ROOT / rel).read_text(encoding="utf-8")
         assert text.index("gh auth login") < text.index("python3 plugins/linear-progress-sync/scripts/setup.py")
-        assert text.index("codex mcp login linear") < text.index("python3 plugins/linear-progress-sync/scripts/setup.py")
+        assert text.index("python3 plugins/linear-progress-sync/scripts/setup.py") < text.index(
+            "codex mcp login linear"
+        )
 
 
 def test_setup_run_step_does_not_treat_auth_failure_as_idempotent_success(monkeypatch):
