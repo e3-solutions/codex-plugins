@@ -52,7 +52,11 @@ Start a coding task in Codex. The plugin makes Codex run Linear kickoff before e
 
 The first time a repo needs a new Linear issue, Codex asks which Linear team/project that repo should use and saves it in `~/.codex/linear-sync/repos.json`. Future tasks in that repo reuse the saved team/project automatically.
 
-Codex commits are then synced back to the active Linear issue automatically.
+Standard Codex commits are then synced back to the active Linear issue automatically.
+
+## V1 Scope
+
+The automatic commit sync covers the normal `git commit ...` flow Codex uses. The optional repo hook covers commits made outside Codex. Hardening unusual wrapped Git invocations such as `/usr/bin/git commit` or `git -C <repo> commit` is a follow-up.
 
 ## Optional
 
