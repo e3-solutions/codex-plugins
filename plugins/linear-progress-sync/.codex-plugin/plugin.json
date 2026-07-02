@@ -13,6 +13,7 @@
     "workflow"
   ],
   "skills": "./skills/",
+  "hooks": "./hooks/hooks.json",
   "interface": {
     "displayName": "Linear Progress Sync",
     "shortDescription": "Start linked Linear work and sync progress safely.",

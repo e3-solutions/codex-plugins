@@ -4,32 +4,19 @@ Local Codex plugin for Linear-first development. Codex starts work from a Linear
 
 ## Setup
 
-For a new teammate:
+Run this once per teammate, not once per repo:
 
 ```bash
 git clone https://github.com/e3-solutions/codex-plugins
 cd codex-plugins
-```
-
-Authenticate GitHub CLI:
-
-```bash
 gh auth login
-```
-
-Run setup:
-
-```bash
 python3 plugins/linear-progress-sync/scripts/setup.py
-```
-
-Authenticate Linear after setup registers the MCP server:
-
-```bash
 codex mcp login linear
 ```
 
-Then restart Codex or start a new Codex thread.
+Then restart Codex or start a new Codex thread. If Codex asks to review hooks, trust the Linear Progress Sync hooks once.
+
+`setup.py` checks GitHub CLI auth, installs the plugin, installs global Codex hooks into `~/.codex/hooks.json`, and registers Linear MCP. It does not log you in to Linear, so `codex mcp login linear` is still required.
 
 Preview setup without changing Codex config:
 
@@ -37,32 +24,19 @@ Preview setup without changing Codex config:
 python3 plugins/linear-progress-sync/scripts/setup.py --dry-run
 ```
 
-## What Setup Does
-
-- checks GitHub CLI auth with `gh auth status`
-- adds this repo as a Codex plugin marketplace
-- installs `linear-progress-sync@coreedge-local`
-- configures Linear MCP with `codex mcp add linear --url https://mcp.linear.app/mcp`
-
-This is user-level setup. You do not need to install anything separately in every repo for normal Codex work.
-
 ## Normal Use
 
-Start a coding task in a repo that uses Linear sync. The plugin makes Codex run Linear kickoff before edits: Linear issue, branch, empty kickoff commit, draft PR, and local active state.
+Start a coding task normally. Before the first edit or branch creation, Codex must create or confirm the Linear issue, create the Linear-named branch, push an empty kickoff commit, open a draft PR, link Linear and GitHub, and write local active state.
 
 The first time a repo needs a new Linear issue, Codex asks which Linear team/project that repo should use and saves it in `~/.codex/linear-sync/repos.json`. Future tasks in that repo reuse the saved team/project automatically.
 
-Repos without saved Linear team/project binding are left alone by the write guard, so installing this plugin does not block unrelated Codex threads.
+Before kickoff, Bash uses a read-only allowlist. Simple inspection commands like `pwd`, `ls`, `cat`, `rg`, `grep`, `stat`, and read-only `git` commands work. Unknown scripts, tests, builds, file writes, and branch creation wait until active Linear state exists.
 
-Standard Codex commits are then synced back to the active Linear issue automatically.
-
-## V1 Scope
-
-The automatic commit sync covers the normal `git commit ...` flow Codex uses. The optional repo hook covers commits made outside Codex. Hardening unusual wrapped Git invocations such as `/usr/bin/git commit` or `git -C <repo> commit` is a follow-up.
+After kickoff, Codex writes and standard Codex commits are synced back to the active Linear issue automatically.
 
 ## Optional
 
-Only if you also want commits made outside Codex to sync to Linear:
+Only install the repo Git hook if you also want commits made outside Codex to sync to Linear:
 
 ```bash
 python3 plugins/linear-progress-sync/scripts/setup.py --with-git-hook --root /path/to/repo

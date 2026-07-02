@@ -12,16 +12,6 @@
     ],
     "PreToolUse": [
       {
-        "matcher": "Bash",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "sh -c 'script=$(ls -td \"$HOME\"/.codex/plugins/cache/*/linear-progress-sync/*/scripts/pre_tool_use.py 2>/dev/null | head -n 1); [ -n \"$script\" ] && exec python3 \"$script\" || exit 0'"
-          }
-        ]
-      },
-      {
-        "matcher": "apply_patch|Edit|Write",
         "hooks": [
           {
             "type": "command",
@@ -32,16 +22,6 @@
     ],
     "PostToolUse": [
       {
-        "matcher": "Bash",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "sh -c 'script=$(ls -td \"$HOME\"/.codex/plugins/cache/*/linear-progress-sync/*/scripts/post_tool_use.py 2>/dev/null | head -n 1); [ -n \"$script\" ] && exec python3 \"$script\" || exit 0'"
-          }
-        ]
-      },
-      {
-        "matcher": "apply_patch|Edit|Write",
         "hooks": [
           {
             "type": "command",

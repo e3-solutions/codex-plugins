@@ -10,7 +10,7 @@ def main() -> None:
     decision = pre_tool_guard_decision(read_stdin_json())
     if decision.blocked:
         print(decision.message, file=sys.stderr)
-        raise SystemExit(1)
+        raise SystemExit(2)
 
 
 if __name__ == "__main__":
