@@ -58,6 +58,15 @@ def active_payload(
     }
 
 
+def bind_linear_repo(root: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict:
+    monkeypatch.setenv("LINEAR_SYNC_CONFIG_DIR", str(tmp_path / "config"))
+    return linear_sync.save_repo_linear_binding(
+        team="Engineering",
+        project="Codex Plugins",
+        root=root,
+    )
+
+
 def test_terminal_statuses_are_never_changed(tmp_path, monkeypatch):
     monkeypatch.setenv("LINEAR_SYNC_STATE_DIR", str(tmp_path))
     state = linear_sync.default_state()
@@ -327,6 +336,7 @@ def test_pr_title_and_body_link_linear_without_closing():
 
 def test_pre_tool_guard_blocks_writes_and_branch_creation_without_active_state(tmp_path, monkeypatch):
     monkeypatch.setenv("LINEAR_SYNC_STATE_DIR", str(tmp_path))
+    bind_linear_repo(tmp_path, tmp_path, monkeypatch)
 
     write_decision = linear_sync.pre_tool_guard_decision({"tool_name": "apply_patch"}, root=tmp_path)
     branch_decision = linear_sync.pre_tool_guard_decision(
@@ -337,6 +347,23 @@ def test_pre_tool_guard_blocks_writes_and_branch_creation_without_active_state(t
     assert write_decision.blocked is True
     assert branch_decision.blocked is True
     assert "Linear kickoff" in write_decision.message
+
+
+def test_pre_tool_guard_allows_unbound_repo_without_active_state(tmp_path, monkeypatch):
+    state_dir = tmp_path / "state"
+    config_dir = tmp_path / "config"
+    monkeypatch.setenv("LINEAR_SYNC_STATE_DIR", str(state_dir))
+    monkeypatch.setenv("LINEAR_SYNC_CONFIG_DIR", str(config_dir))
+    repo = init_git_repo(tmp_path / "repo", branch="arya/no-linear-binding")
+
+    write_decision = linear_sync.pre_tool_guard_decision({"tool_name": "apply_patch"}, root=repo)
+    branch_decision = linear_sync.pre_tool_guard_decision(
+        {"tool_name": "Bash", "command": "git switch -c arya/normal-work"},
+        root=repo,
+    )
+
+    assert write_decision.blocked is False
+    assert branch_decision.blocked is False
 
 
 def test_pre_tool_guard_blocks_writes_with_incomplete_active_state(tmp_path, monkeypatch):
@@ -397,6 +424,7 @@ def test_pre_tool_guard_blocks_when_current_branch_cannot_be_verified(tmp_path, 
 
 def test_pre_tool_guard_blocks_long_form_branch_creation_without_active_state(tmp_path, monkeypatch):
     monkeypatch.setenv("LINEAR_SYNC_STATE_DIR", str(tmp_path))
+    bind_linear_repo(tmp_path, tmp_path, monkeypatch)
 
     commands = [
         "git switch --create arya/new-work",
@@ -428,6 +456,7 @@ def test_pre_tool_guard_blocks_long_form_branch_creation_without_active_state(tm
 
 def test_pre_tool_guard_blocks_unsafe_bash_writes_without_active_state(tmp_path, monkeypatch):
     monkeypatch.setenv("LINEAR_SYNC_STATE_DIR", str(tmp_path))
+    bind_linear_repo(tmp_path, tmp_path, monkeypatch)
     commands = [
         "touch app.py",
         "sed -i '' 's/a/b/' app.py",
@@ -453,6 +482,7 @@ def test_pre_tool_guard_blocks_unsafe_bash_writes_without_active_state(tmp_path,
 
 def test_pre_tool_guard_blocks_shell_substitutions_without_active_state(tmp_path, monkeypatch):
     monkeypatch.setenv("LINEAR_SYNC_STATE_DIR", str(tmp_path))
+    bind_linear_repo(tmp_path, tmp_path, monkeypatch)
     commands = [
         "git status $(touch app.py)",
         "git status `touch app.py`",
@@ -581,6 +611,7 @@ def test_pre_tool_guard_blocks_switch_and_checkout_with_active_state(tmp_path, m
 
 def test_pre_tool_guard_blocks_background_write_segments_without_active_state(tmp_path, monkeypatch):
     monkeypatch.setenv("LINEAR_SYNC_STATE_DIR", str(tmp_path))
+    bind_linear_repo(tmp_path, tmp_path, monkeypatch)
     commands = [
         "git status & touch app.py",
         "rg foo README.md & touch app.py",
@@ -646,6 +677,7 @@ def test_pre_tool_guard_blocks_branch_creation_even_with_active_state(tmp_path, 
 
 def test_pre_tool_guard_blocks_chained_branch_creation_after_kickoff_helper(tmp_path, monkeypatch):
     monkeypatch.setenv("LINEAR_SYNC_STATE_DIR", str(tmp_path))
+    bind_linear_repo(tmp_path, tmp_path, monkeypatch)
     commands = [
         "python3 plugins/linear-progress-sync/scripts/linear_start.py repo-binding --root . && git switch -c arya/bypass",
         "echo linear_start.py; git switch -c arya/bypass",
