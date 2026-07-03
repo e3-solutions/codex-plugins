@@ -20,7 +20,7 @@ Process queued Linear progress sync events in the foreground with visible Linear
    - If the issue is terminal (`Done`, `Completed`, `Closed`, `Canceled`, or equivalent), do not modify Linear. Run the event's `skip_command` with a terminal-state reason.
    - Use `mcp__codex_apps__linear._list_comments` and check whether the exact commit SHA, short SHA, or event ID is already present.
    - If a matching comment already exists, run the event's `ack_command` and do not add a duplicate comment.
-   - Otherwise call `mcp__codex_apps__linear._save_comment` with the provided `comment_body`.
+   - Otherwise call `mcp__codex_apps__linear._save_comment` with the provided `comment_body`, including its `Codex bot: <stored Linear user name> at <ISO-8601 UTC timestamp>` footer.
    - Read comments back with `mcp__codex_apps__linear._list_comments`.
    - Run the event's `ack_command` only after the new comment is visible.
 

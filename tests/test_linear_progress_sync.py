@@ -59,13 +59,40 @@ def active_payload(
     }
 
 
+def save_linear_user(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, name: str = "Codex Test User") -> dict:
+    monkeypatch.setenv("LINEAR_SYNC_CONFIG_DIR", str(tmp_path / "config"))
+    return linear_sync.save_linear_user_profile(linear_name=name)
+
+
 def bind_linear_repo(root: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict:
     monkeypatch.setenv("LINEAR_SYNC_CONFIG_DIR", str(tmp_path / "config"))
+    linear_sync.save_linear_user_profile(linear_name="Codex Test User")
     return linear_sync.save_repo_linear_binding(
         team="Engineering",
         project="Codex Plugins",
         root=root,
     )
+
+
+def test_global_linear_user_profile_round_trips(tmp_path, monkeypatch):
+    monkeypatch.setenv("LINEAR_SYNC_CONFIG_DIR", str(tmp_path / "config"))
+
+    missing = linear_sync.linear_user_profile_status()
+    saved = linear_sync.save_linear_user_profile(linear_name=" Arya G ")
+    loaded = linear_sync.linear_user_profile_status()
+
+    assert missing["configured"] is False
+    assert saved["profile"]["linear_name"] == "Arya G"
+    assert loaded["configured"] is True
+    assert loaded["profile"]["linear_name"] == "Arya G"
+    assert loaded["config_path"].endswith("user.json")
+
+
+def test_global_linear_user_profile_rejects_blank_name(tmp_path, monkeypatch):
+    monkeypatch.setenv("LINEAR_SYNC_CONFIG_DIR", str(tmp_path / "config"))
+
+    with pytest.raises(ValueError, match="Linear user profile requires linear_name"):
+        linear_sync.save_linear_user_profile(linear_name=" ")
 
 
 def test_terminal_statuses_are_never_changed(tmp_path, monkeypatch):
@@ -203,6 +230,7 @@ def test_active_state_wins_over_explicit_event_issue_key(tmp_path, monkeypatch):
 def test_active_state_branch_mismatch_blocks_writes_and_does_not_infer_active(tmp_path, monkeypatch):
     state_dir = tmp_path / "state"
     monkeypatch.setenv("LINEAR_SYNC_STATE_DIR", str(state_dir))
+    save_linear_user(tmp_path, monkeypatch)
     repo = init_git_repo(tmp_path / "repo", branch="arya/cor-99-new-work")
     linear_sync.write_active_issue(
         active_payload(repo, issue_key="COR-33", issue_title="Old work", branch="arya/cor-33-old-work"),
@@ -245,11 +273,14 @@ def test_pre_tool_use_script_exits_2_when_blocking_write(tmp_path, monkeypatch):
     )
 
     assert result.returncode == 2
-    assert "Before writing code or creating branches" in result.stderr
+    assert "LINEAR USER REQUIRED" in result.stderr
+    assert "configure-user" in result.stderr
 
 
 def test_active_linear_issue_state_round_trips_and_malformed_fails_closed(tmp_path, monkeypatch):
     monkeypatch.setenv("LINEAR_SYNC_STATE_DIR", str(tmp_path))
+    monkeypatch.setenv("LINEAR_SYNC_CONFIG_DIR", str(tmp_path / "config"))
+    linear_sync.save_linear_user_profile(linear_name="Arya G")
     payload = {
         "issue_key": "COR-34",
         "issue_url": "https://linear.app/coreedge/issue/COR-34/test",
@@ -270,15 +301,20 @@ def test_active_linear_issue_state_round_trips_and_malformed_fails_closed(tmp_pa
 def test_legacy_active_state_without_link_timestamp_still_reads_when_pr_evidence_exists(tmp_path, monkeypatch):
     state_dir = tmp_path / "state"
     monkeypatch.setenv("LINEAR_SYNC_STATE_DIR", str(state_dir))
+    monkeypatch.setenv("LINEAR_SYNC_CONFIG_DIR", str(tmp_path / "config"))
     repo = init_git_repo(tmp_path / "repo", branch="arya/cor-52-legacy")
     legacy = active_payload(repo, issue_key="COR-52", issue_title="Legacy active state", pr_number=52)
     legacy.pop("linear_linked_at")
     linear_sync.write_json_atomic(linear_sync.active_issue_path(root=repo), legacy)
 
     active = linear_sync.read_current_active_issue(root=repo)
+    missing_user = linear_sync.pre_tool_guard_decision({"tool_name": "apply_patch"}, root=repo)
+    linear_sync.save_linear_user_profile(linear_name="Arya G")
     decision = linear_sync.pre_tool_guard_decision({"tool_name": "apply_patch"}, root=repo)
 
     assert active["issue_key"] == "COR-52"
+    assert missing_user.blocked is True
+    assert "LINEAR USER REQUIRED" in missing_user.message
     assert decision.blocked is False
 
 
@@ -362,6 +398,7 @@ def test_pr_title_and_body_link_linear_without_closing():
 def test_pre_tool_guard_blocks_writes_and_branch_creation_without_active_state(tmp_path, monkeypatch):
     monkeypatch.setenv("LINEAR_SYNC_STATE_DIR", str(tmp_path))
     bind_linear_repo(tmp_path, tmp_path, monkeypatch)
+    linear_sync.save_linear_user_profile(linear_name="Arya G")
 
     write_decision = linear_sync.pre_tool_guard_decision({"tool_name": "apply_patch"}, root=tmp_path)
     branch_decision = linear_sync.pre_tool_guard_decision(
@@ -380,12 +417,206 @@ def test_pre_tool_guard_blocks_writes_and_branch_creation_without_active_state(t
     assert "activation_command" in write_decision.message
 
 
+def test_pre_tool_guard_blocks_until_global_linear_user_profile_is_saved(tmp_path, monkeypatch):
+    state_dir = tmp_path / "state"
+    config_dir = tmp_path / "config"
+    monkeypatch.setenv("LINEAR_SYNC_STATE_DIR", str(state_dir))
+    monkeypatch.setenv("LINEAR_SYNC_CONFIG_DIR", str(config_dir))
+    repo = init_git_repo(tmp_path / "repo", branch="arya/profile-required")
+    linear_sync.save_repo_linear_binding(team="Engineering", project="Codex Plugins", root=repo)
+
+    missing_user = linear_sync.pre_tool_guard_decision({"tool_name": "apply_patch"}, root=repo)
+    linear_sync.save_linear_user_profile(linear_name="Arya G")
+    ready_for_kickoff = linear_sync.pre_tool_guard_decision({"tool_name": "apply_patch"}, root=repo)
+
+    assert missing_user.blocked is True
+    assert missing_user.message.startswith("LINEAR USER REQUIRED")
+    assert "ask the human what their name on Linear is" in missing_user.message
+    assert "linear_start.py user-profile" in missing_user.message
+    assert "linear_start.py configure-user" in missing_user.message
+    assert "assign new Linear issues to that stored user" in missing_user.message
+    assert ready_for_kickoff.blocked is True
+    assert "Linear kickoff has not created active issue state" in ready_for_kickoff.message
+
+
+@pytest.mark.parametrize(
+    "tool",
+    [
+        "mcp__codex_apps__linear._save_issue",
+        "mcp__codex_apps__linear._save_comment",
+        "mcp__linear.save_issue",
+        "mcp__linear.save_comment",
+        "save_issue",
+        "save_comment",
+    ],
+)
+def test_pre_tool_guard_blocks_linear_writes_until_global_user_profile_is_saved(tmp_path, monkeypatch, tool):
+    state_dir = tmp_path / "state"
+    config_dir = tmp_path / "config"
+    monkeypatch.setenv("LINEAR_SYNC_STATE_DIR", str(state_dir))
+    monkeypatch.setenv("LINEAR_SYNC_CONFIG_DIR", str(config_dir))
+    repo = init_git_repo(tmp_path / "repo", branch="arya/profile-required")
+    linear_sync.save_repo_linear_binding(team="Engineering", project="Codex Plugins", root=repo)
+
+    missing_user = linear_sync.pre_tool_guard_decision({"tool_name": tool}, root=repo)
+    linear_sync.save_linear_user_profile(linear_name="Arya G")
+    ready_payload = {"tool_name": tool}
+    if tool.endswith("save_comment") or tool.endswith("_save_comment"):
+        ready_payload["tool_input"] = {"body": "Kickoff started\n\nCodex bot: Arya G at 2026-07-03T18:42:10+00:00"}
+    if tool.endswith("save_issue") or tool.endswith("_save_issue"):
+        ready_payload["tool_input"] = {"id": "COR-123", "title": "Attach PR metadata"}
+    ready = linear_sync.pre_tool_guard_decision(ready_payload, root=repo)
+
+    assert missing_user.blocked is True
+    assert missing_user.message.startswith("LINEAR USER REQUIRED")
+    assert ready.blocked is False
+
+
+@pytest.mark.parametrize(
+    ("tool", "field"),
+    [
+        ("mcp__codex_apps__linear._save_comment", "body"),
+        ("mcp__linear.save_comment", "comment"),
+        ("save_comment", "content"),
+        ("mcp__codex_apps__linear._save_issue", "description"),
+        ("mcp__linear.save_issue", "body"),
+        ("save_issue", "markdown"),
+    ],
+)
+def test_pre_tool_guard_blocks_linear_content_without_attribution_footer(tmp_path, monkeypatch, tool, field):
+    monkeypatch.setenv("LINEAR_SYNC_STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setenv("LINEAR_SYNC_CONFIG_DIR", str(tmp_path / "config"))
+    repo = init_git_repo(tmp_path / "repo", branch="arya/footer-required")
+    linear_sync.save_linear_user_profile(linear_name="Arya G")
+    tool_input = {field: "Kickoff started"}
+    if tool.endswith("save_issue") or tool.endswith("_save_issue"):
+        tool_input["id"] = "COR-123"
+
+    decision = linear_sync.pre_tool_guard_decision(
+        {"tool_name": tool, "tool_input": tool_input},
+        root=repo,
+    )
+
+    assert decision.blocked is True
+    assert decision.message.startswith("LINEAR ATTRIBUTION REQUIRED")
+    assert "Codex bot: Arya G at <ISO-8601 UTC timestamp>" in decision.message
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {
+            "tool_name": "mcp__codex_apps__linear._save_comment",
+            "tool_input": {"body": "Kickoff started\n\nCodex bot: Arya G at 2026-07-03T18:42:10+00:00"},
+        },
+        {
+            "tool_name": "mcp__linear.save_issue",
+            "arguments": {
+                "id": "COR-123",
+                "description": "Issue created\n\nCodex bot: Arya G at 2026-07-03T18:42:10+00:00",
+            },
+        },
+        {
+            "tool_name": "save_issue",
+            "tool_input": {"id": "COR-123", "title": "Attach PR metadata"},
+        },
+    ],
+)
+def test_pre_tool_guard_allows_linear_writes_with_attribution_footer(tmp_path, monkeypatch, payload):
+    monkeypatch.setenv("LINEAR_SYNC_STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setenv("LINEAR_SYNC_CONFIG_DIR", str(tmp_path / "config"))
+    repo = init_git_repo(tmp_path / "repo", branch="arya/footer-present")
+    linear_sync.save_linear_user_profile(linear_name="Arya G")
+
+    decision = linear_sync.pre_tool_guard_decision(payload, root=repo)
+
+    assert decision.blocked is False
+
+
+@pytest.mark.parametrize(
+    ("payload", "expected"),
+    [
+        (
+            {
+                "tool_name": "mcp__linear.save_issue",
+                "tool_input": {"title": "Implement tracking", "team": "Engineering"},
+            },
+            "include an attributed description",
+        ),
+        (
+            {
+                "id": "tool-call-1",
+                "tool_name": "mcp__linear.save_issue",
+                "tool_input": {"title": "Implement tracking", "team": "Engineering"},
+            },
+            "include an attributed description",
+        ),
+        (
+            {
+                "tool_name": "mcp__linear.save_issue",
+                "tool_input": {
+                    "title": "Implement tracking",
+                    "team": "Engineering",
+                    "description": "Issue created\n\nCodex bot: Arya G at 2026-07-03T18:42:10+00:00",
+                },
+            },
+            "assign the new Linear issue to Arya G",
+        ),
+        (
+            {
+                "tool_name": "mcp__linear.save_issue",
+                "tool_input": {
+                    "title": "Implement tracking",
+                    "team": "Engineering",
+                    "assignee": "Arya G",
+                },
+            },
+            "include an attributed description",
+        ),
+    ],
+)
+def test_pre_tool_guard_blocks_issue_creation_without_assignee_and_attribution(tmp_path, monkeypatch, payload, expected):
+    monkeypatch.setenv("LINEAR_SYNC_STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setenv("LINEAR_SYNC_CONFIG_DIR", str(tmp_path / "config"))
+    repo = init_git_repo(tmp_path / "repo", branch="arya/issue-create-required")
+    linear_sync.save_linear_user_profile(linear_name="Arya G")
+
+    decision = linear_sync.pre_tool_guard_decision(payload, root=repo)
+
+    assert decision.blocked is True
+    assert decision.message.startswith("LINEAR ISSUE CREATE REQUIRED")
+    assert expected in decision.message
+
+
+def test_pre_tool_guard_allows_issue_creation_with_assignee_and_attribution(tmp_path, monkeypatch):
+    monkeypatch.setenv("LINEAR_SYNC_STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setenv("LINEAR_SYNC_CONFIG_DIR", str(tmp_path / "config"))
+    repo = init_git_repo(tmp_path / "repo", branch="arya/issue-create-ready")
+    linear_sync.save_linear_user_profile(linear_name="Arya G")
+
+    decision = linear_sync.pre_tool_guard_decision(
+        {
+            "tool_name": "mcp__linear.save_issue",
+            "tool_input": {
+                "title": "Implement tracking",
+                "team": "Engineering",
+                "assignee": "Arya G",
+                "description": "Issue created\n\nCodex bot: Arya G at 2026-07-03T18:42:10+00:00",
+            },
+        },
+        root=repo,
+    )
+
+    assert decision.blocked is False
+
+
 def test_pre_tool_guard_blocks_unbound_repo_writes_until_linear_destination_is_saved(tmp_path, monkeypatch):
     state_dir = tmp_path / "state"
     config_dir = tmp_path / "config"
     monkeypatch.setenv("LINEAR_SYNC_STATE_DIR", str(state_dir))
     monkeypatch.setenv("LINEAR_SYNC_CONFIG_DIR", str(config_dir))
     repo = init_git_repo(tmp_path / "repo", branch="arya/no-linear-binding")
+    linear_sync.save_linear_user_profile(linear_name="Arya G")
 
     write_decision = linear_sync.pre_tool_guard_decision({"tool_name": "apply_patch"}, root=repo)
     branch_decision = linear_sync.pre_tool_guard_decision(
@@ -424,6 +655,7 @@ def test_pre_tool_guard_blocks_desktop_file_change_without_active_state(tmp_path
     monkeypatch.setenv("LINEAR_SYNC_STATE_DIR", str(state_dir))
     monkeypatch.setenv("LINEAR_SYNC_CONFIG_DIR", str(config_dir))
     repo = init_git_repo(tmp_path / "repo", branch="arya/no-linear-binding")
+    linear_sync.save_linear_user_profile(linear_name="Arya G")
 
     decisions = [
         linear_sync.pre_tool_guard_decision({"tool_name": name}, root=repo)
@@ -481,6 +713,7 @@ def test_pre_tool_guard_blocks_unbound_repo_without_active_state(tmp_path, monke
     monkeypatch.setenv("LINEAR_SYNC_STATE_DIR", str(state_dir))
     monkeypatch.setenv("LINEAR_SYNC_CONFIG_DIR", str(config_dir))
     repo = init_git_repo(tmp_path / "repo", branch="arya/no-linear-binding")
+    linear_sync.save_linear_user_profile(linear_name="Arya G")
 
     write_decision = linear_sync.pre_tool_guard_decision({"tool_name": "apply_patch"}, root=repo)
     branch_decision = linear_sync.pre_tool_guard_decision(
@@ -497,6 +730,7 @@ def test_pre_tool_guard_blocks_unbound_repo_without_active_state(tmp_path, monke
 
 def test_pre_tool_guard_blocks_writes_with_incomplete_active_state(tmp_path, monkeypatch):
     monkeypatch.setenv("LINEAR_SYNC_STATE_DIR", str(tmp_path))
+    save_linear_user(tmp_path, monkeypatch)
     linear_sync.write_json_atomic(
         tmp_path / "active.json",
         {"issue_key": "COR-40"},
@@ -511,6 +745,7 @@ def test_pre_tool_guard_blocks_writes_with_incomplete_active_state(tmp_path, mon
 def test_pre_tool_guard_blocks_active_state_without_pr_evidence(tmp_path, monkeypatch):
     state_dir = tmp_path / "state"
     monkeypatch.setenv("LINEAR_SYNC_STATE_DIR", str(state_dir))
+    save_linear_user(tmp_path, monkeypatch)
     repo = init_git_repo(tmp_path / "repo", branch="arya/cor-40-work")
     incomplete = active_payload(repo, issue_key="COR-40", issue_title="Missing PR evidence", pr_number=40)
     incomplete.pop("pr_url")
@@ -529,6 +764,7 @@ def test_pre_tool_guard_blocks_active_state_without_pr_evidence(tmp_path, monkey
 def test_pre_tool_guard_blocks_when_current_branch_cannot_be_verified(tmp_path, monkeypatch):
     state_dir = tmp_path / "state"
     monkeypatch.setenv("LINEAR_SYNC_STATE_DIR", str(state_dir))
+    save_linear_user(tmp_path, monkeypatch)
     repo = init_git_repo(tmp_path / "repo", branch="arya/cor-41-work")
     subprocess.run(["git", "switch", "--detach"], cwd=repo, check=True)
     linear_sync.write_active_issue(
@@ -634,6 +870,7 @@ def test_pre_tool_guard_blocks_shell_substitutions_without_active_state(tmp_path
 def test_pre_tool_guard_allows_general_bash_with_active_state(tmp_path, monkeypatch):
     state_dir = tmp_path / "state"
     monkeypatch.setenv("LINEAR_SYNC_STATE_DIR", str(state_dir))
+    save_linear_user(tmp_path, monkeypatch)
     repo = init_git_repo(tmp_path / "repo", branch="arya/cor-49-active")
     linear_sync.write_active_issue(
         active_payload(repo, issue_key="COR-49", issue_title="Active Bash work", pr_number=49),
@@ -657,6 +894,7 @@ def test_pre_tool_guard_allows_general_bash_with_active_state(tmp_path, monkeypa
 def test_pre_tool_guard_blocks_update_ref_branch_creation_with_active_state(tmp_path, monkeypatch):
     state_dir = tmp_path / "state"
     monkeypatch.setenv("LINEAR_SYNC_STATE_DIR", str(state_dir))
+    save_linear_user(tmp_path, monkeypatch)
     repo = init_git_repo(tmp_path / "repo", branch="arya/cor-56-active")
     linear_sync.write_active_issue(
         active_payload(repo, issue_key="COR-56", issue_title="Active update-ref guard", pr_number=56),
@@ -681,6 +919,7 @@ def test_pre_tool_guard_blocks_update_ref_branch_creation_with_active_state(tmp_
 def test_pre_tool_guard_blocks_ref_writing_git_commands_with_active_state(tmp_path, monkeypatch):
     state_dir = tmp_path / "state"
     monkeypatch.setenv("LINEAR_SYNC_STATE_DIR", str(state_dir))
+    save_linear_user(tmp_path, monkeypatch)
     repo = init_git_repo(tmp_path / "repo", branch="arya/cor-62-active")
     linear_sync.write_active_issue(
         active_payload(repo, issue_key="COR-62", issue_title="Active ref guard", pr_number=62),
@@ -705,6 +944,7 @@ def test_pre_tool_guard_blocks_ref_writing_git_commands_with_active_state(tmp_pa
 def test_pre_tool_guard_blocks_env_split_string_branch_creation_with_active_state(tmp_path, monkeypatch):
     state_dir = tmp_path / "state"
     monkeypatch.setenv("LINEAR_SYNC_STATE_DIR", str(state_dir))
+    save_linear_user(tmp_path, monkeypatch)
     repo = init_git_repo(tmp_path / "repo", branch="arya/cor-64-active")
     linear_sync.write_active_issue(
         active_payload(repo, issue_key="COR-64", issue_title="Active env split guard", pr_number=64),
@@ -723,6 +963,7 @@ def test_pre_tool_guard_blocks_env_split_string_branch_creation_with_active_stat
 def test_pre_tool_guard_blocks_switch_and_checkout_with_active_state(tmp_path, monkeypatch):
     state_dir = tmp_path / "state"
     monkeypatch.setenv("LINEAR_SYNC_STATE_DIR", str(state_dir))
+    save_linear_user(tmp_path, monkeypatch)
     repo = init_git_repo(tmp_path / "repo", branch="arya/cor-58-active")
     linear_sync.write_active_issue(
         active_payload(repo, issue_key="COR-58", issue_title="Active switch guard", pr_number=58),
@@ -796,6 +1037,7 @@ def test_pre_tool_guard_allows_quoted_redirection_text_as_read_only(tmp_path, mo
 def test_pre_tool_guard_blocks_branch_creation_even_with_active_state(tmp_path, monkeypatch):
     state_dir = tmp_path / "state"
     monkeypatch.setenv("LINEAR_SYNC_STATE_DIR", str(state_dir))
+    save_linear_user(tmp_path, monkeypatch)
     repo = init_git_repo(tmp_path / "repo", branch="arya/cor-47-active")
     linear_sync.write_active_issue(active_payload(repo, issue_key="COR-47", issue_title="Active", pr_number=47), root=repo)
 
@@ -825,20 +1067,39 @@ def test_pre_tool_guard_blocks_chained_branch_creation_after_kickoff_helper(tmp_
         assert decision.blocked is True, command
 
 
-def test_pre_tool_guard_allows_read_only_and_kickoff_commands_without_active_state(tmp_path, monkeypatch):
+def test_pre_tool_guard_blocks_kickoff_until_global_linear_user_profile_is_saved(tmp_path, monkeypatch):
     monkeypatch.setenv("LINEAR_SYNC_STATE_DIR", str(tmp_path))
+    monkeypatch.setenv("LINEAR_SYNC_CONFIG_DIR", str(tmp_path / "config"))
 
     read_decision = linear_sync.pre_tool_guard_decision(
         {"tool_name": "Bash", "command": "git status --short"},
         root=tmp_path,
     )
-    kickoff_decision = linear_sync.pre_tool_guard_decision(
+    missing_user_decision = linear_sync.pre_tool_guard_decision(
+        {"tool_name": "Bash", "command": "python3 plugins/linear-progress-sync/scripts/linear_start.py kickoff"},
+        root=tmp_path,
+    )
+    profile_decision = linear_sync.pre_tool_guard_decision(
+        {
+            "tool_name": "Bash",
+            "command": (
+                "python3 plugins/linear-progress-sync/scripts/linear_start.py "
+                "configure-user --linear-name 'Arya G'"
+            ),
+        },
+        root=tmp_path,
+    )
+    linear_sync.save_linear_user_profile(linear_name="Arya G")
+    ready_decision = linear_sync.pre_tool_guard_decision(
         {"tool_name": "Bash", "command": "python3 plugins/linear-progress-sync/scripts/linear_start.py kickoff"},
         root=tmp_path,
     )
 
     assert read_decision.blocked is False
-    assert kickoff_decision.blocked is False
+    assert missing_user_decision.blocked is True
+    assert "LINEAR USER REQUIRED" in missing_user_decision.message
+    assert profile_decision.blocked is False
+    assert ready_decision.blocked is False
 
 
 def test_enqueue_event_carries_active_issue_key(tmp_path, monkeypatch):
@@ -877,6 +1138,8 @@ def test_linear_start_dry_run_plan_contains_git_and_gh_commands(tmp_path):
 
 
 def test_linear_start_requires_issue_url_before_side_effects(tmp_path, monkeypatch):
+    monkeypatch.setenv("LINEAR_SYNC_CONFIG_DIR", str(tmp_path / "config"))
+    linear_sync.save_linear_user_profile(linear_name="Arya G")
     calls = []
     monkeypatch.setattr(
         linear_sync,
@@ -896,9 +1159,51 @@ def test_linear_start_requires_issue_url_before_side_effects(tmp_path, monkeypat
     assert calls == []
 
 
+def test_linear_start_requires_user_profile_before_side_effects(tmp_path, monkeypatch):
+    monkeypatch.setenv("LINEAR_SYNC_CONFIG_DIR", str(tmp_path / "config"))
+    repo = init_git_repo(tmp_path / "repo", branch="arya/cor-41-original")
+    calls = []
+    monkeypatch.setattr(
+        linear_sync,
+        "run_git",
+        lambda args, root=None: calls.append(args) or subprocess.CompletedProcess(args, 0, "", ""),
+    )
+    monkeypatch.setattr(
+        linear_sync,
+        "run_local_command",
+        lambda args, root=None: calls.append(args) or subprocess.CompletedProcess(args, 0, "", ""),
+    )
+
+    with pytest.raises(ValueError, match="Linear user profile"):
+        linear_sync.run_linear_start(
+            issue_key="COR-41",
+            issue_title="Require user profile",
+            issue_url="https://linear.app/coreedge/issue/COR-41/require-user-profile",
+            branch="arya/cor-41-require-user-profile",
+            root=repo,
+        )
+
+    assert calls == []
+    current = subprocess.run(
+        ["git", "branch", "--show-current"],
+        cwd=repo,
+        check=True,
+        text=True,
+        stdout=subprocess.PIPE,
+    ).stdout.strip()
+    branch_created = subprocess.run(
+        ["git", "show-ref", "--verify", "--quiet", "refs/heads/arya/cor-41-require-user-profile"],
+        cwd=repo,
+    )
+    assert current == "arya/cor-41-original"
+    assert branch_created.returncode != 0
+
+
 def test_linear_start_returns_pending_state_without_writing_active_state(tmp_path, monkeypatch):
     state_dir = tmp_path / "state"
     monkeypatch.setenv("LINEAR_SYNC_STATE_DIR", str(state_dir))
+    monkeypatch.setenv("LINEAR_SYNC_CONFIG_DIR", str(tmp_path / "config"))
+    linear_sync.save_linear_user_profile(linear_name="Arya G")
     repo = init_git_repo(tmp_path / "repo", branch="arya/cor-42-work")
     calls = []
 
@@ -934,6 +1239,8 @@ def test_linear_start_returns_pending_state_without_writing_active_state(tmp_pat
 def test_activate_linear_start_writes_linked_active_state(tmp_path, monkeypatch):
     state_dir = tmp_path / "state"
     monkeypatch.setenv("LINEAR_SYNC_STATE_DIR", str(state_dir))
+    monkeypatch.setenv("LINEAR_SYNC_CONFIG_DIR", str(tmp_path / "config"))
+    linear_sync.save_linear_user_profile(linear_name="Arya G")
     repo = init_git_repo(tmp_path / "repo", branch="arya/cor-43-activate")
 
     active = linear_sync.activate_linear_start(
@@ -955,6 +1262,8 @@ def test_activate_linear_start_writes_linked_active_state(tmp_path, monkeypatch)
 
 def test_linear_start_requires_parseable_pr_url_before_writing_active_state(tmp_path, monkeypatch):
     monkeypatch.setenv("LINEAR_SYNC_STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setenv("LINEAR_SYNC_CONFIG_DIR", str(tmp_path / "config"))
+    linear_sync.save_linear_user_profile(linear_name="Arya G")
     monkeypatch.setattr(linear_sync, "current_branch", lambda root=None: "arya/cor-42-work")
     monkeypatch.setattr(
         linear_sync,
@@ -982,6 +1291,8 @@ def test_linear_start_requires_parseable_pr_url_before_writing_active_state(tmp_
 @pytest.mark.parametrize("change_kind", ("staged", "staged_tmp", "unstaged", "untracked"))
 def test_linear_start_requires_clean_worktree_before_kickoff(tmp_path, monkeypatch, change_kind):
     monkeypatch.setenv("LINEAR_SYNC_STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setenv("LINEAR_SYNC_CONFIG_DIR", str(tmp_path / "config"))
+    linear_sync.save_linear_user_profile(linear_name="Arya G")
     repo = init_git_repo(tmp_path / "repo", branch="arya/cor-43-original")
     if change_kind == "staged":
         (repo / "staged.txt").write_text("staged content\n", encoding="utf-8")
@@ -1235,6 +1546,7 @@ def test_post_commit_hook_returns_quickly():
 
 def test_worker_failure_does_not_lose_queued_event(tmp_path, monkeypatch):
     monkeypatch.setenv("LINEAR_SYNC_STATE_DIR", str(tmp_path))
+    save_linear_user(tmp_path, monkeypatch)
     linear_sync.enqueue_event(
         "post_commit",
         {
@@ -1276,6 +1588,8 @@ def test_plugin_exposes_linear_start_command_and_pre_tool_guard_hook():
     )
     assert "linear_start.py" in command_text
     assert "linear_start.py activate" in command_text
+    assert "linear_start.py user-profile" in command_text
+    assert "linear_start.py configure-user" in command_text
     assert "activation_command" in command_text
     assert "repo-binding" in command_text
     assert "configure-repo" in command_text
@@ -1298,10 +1612,14 @@ def test_plugin_exposes_linear_start_command_and_pre_tool_guard_hook():
     assert "mcp__linear.get_issue" in command_text
     assert "mcp__linear.save_issue" in command_text
     assert "mcp__linear.save_comment" in command_text
+    assert "assignee: <stored Linear user name>" in command_text
+    assert "Codex bot: <stored Linear user name> at <ISO-8601 UTC timestamp>" in command_text
     assert "short Linear aliases like `list_teams` or `list_projects`" in command_text
     assert "do not stop after listing projects" in command_text
     assert "do not answer with a code patch or say you are blocked" in command_text
     assert "do not answer with a code patch or say you are blocked" in skill_text
+    assert "ask them what their name on Linear is" in skill_text
+    assert "configure-user" in skill_text
     assert "Do not create the Linear issue, branch, PR, or code changes until the chosen repo destination is saved" in skill_text
     assert "mcp__codex_apps__linear._list_comments" in sync_command_text
     assert manifest["hooks"] == "./hooks/hooks.json"
@@ -1318,6 +1636,7 @@ def test_plugin_exposes_linear_start_command_and_pre_tool_guard_hook():
 
 def test_dry_run_keeps_event_queued_and_unsynced(tmp_path, monkeypatch):
     monkeypatch.setenv("LINEAR_SYNC_STATE_DIR", str(tmp_path))
+    save_linear_user(tmp_path, monkeypatch)
     linear_sync.enqueue_event(
         "post_commit",
         {
@@ -1336,7 +1655,8 @@ def test_dry_run_keeps_event_queued_and_unsynced(tmp_path, monkeypatch):
     assert list((tmp_path / "events").glob("*.json"))
 
 
-def test_codex_prompt_requires_success_sentinel():
+def test_codex_prompt_requires_success_sentinel(tmp_path, monkeypatch):
+    save_linear_user(tmp_path, monkeypatch)
     event = {"type": "post_commit", "commit_sha": "abc", "commit_subject": "COR-9 work"}
     inference = linear_sync.IssueInference("COR-9", 0.95, "branch")
     prompt = linear_sync.build_codex_prompt(event, inference)
@@ -1344,8 +1664,50 @@ def test_codex_prompt_requires_success_sentinel():
     assert "do not print LINEAR_SYNC_OK" in prompt
 
 
+def test_codex_prompt_includes_linear_user_footer(tmp_path, monkeypatch):
+    monkeypatch.setenv("LINEAR_SYNC_CONFIG_DIR", str(tmp_path / "config"))
+    linear_sync.save_linear_user_profile(linear_name="Arya G")
+    event = {"type": "post_commit", "commit_sha": "abc", "commit_subject": "COR-9 work"}
+    inference = linear_sync.IssueInference("COR-9", 0.95, "branch")
+
+    prompt = linear_sync.build_codex_prompt(
+        event,
+        inference,
+        now=datetime(2026, 7, 3, 18, 42, 10, tzinfo=timezone.utc),
+    )
+
+    assert "Codex bot: Arya G at 2026-07-03T18:42:10+00:00" in prompt
+
+
+def test_codex_prompt_uses_one_timestamp_when_now_is_implicit(tmp_path, monkeypatch):
+    monkeypatch.setenv("LINEAR_SYNC_CONFIG_DIR", str(tmp_path / "config"))
+    linear_sync.save_linear_user_profile(linear_name="Arya G")
+
+    class FakeDateTime(datetime):
+        calls = 0
+
+        @classmethod
+        def now(cls, tz=None):
+            cls.calls += 1
+            second = 10 if cls.calls == 1 else 11
+            value = datetime(2026, 7, 3, 18, 42, second, tzinfo=timezone.utc)
+            return value if tz is None else value.astimezone(tz)
+
+    monkeypatch.setattr(linear_sync, "datetime", FakeDateTime)
+
+    prompt = linear_sync.build_codex_prompt(
+        {"type": "post_commit", "commit_sha": "abc", "commit_subject": "COR-9 work"},
+        linear_sync.IssueInference("COR-9", 0.95, "branch"),
+    )
+
+    assert "Codex bot: Arya G at 2026-07-03T18:42:10+00:00" in prompt
+    assert "Codex bot: Arya G at 2026-07-03T18:42:11+00:00" not in prompt
+
+
 def test_foreground_prepare_returns_eligible_event_without_mutation(tmp_path, monkeypatch):
     monkeypatch.setenv("LINEAR_SYNC_STATE_DIR", str(tmp_path))
+    monkeypatch.setenv("LINEAR_SYNC_CONFIG_DIR", str(tmp_path / "config"))
+    linear_sync.save_linear_user_profile(linear_name="Arya G")
     linear_sync.enqueue_event(
         "post_commit",
         {
@@ -1362,6 +1724,7 @@ def test_foreground_prepare_returns_eligible_event_without_mutation(tmp_path, mo
     state = linear_sync.read_state(tmp_path)
     assert plan["eligible"][0]["issue_key"] == "COR-10"
     assert "Codex progress update" in plan["eligible"][0]["comment_body"]
+    assert "Codex bot: Arya G at " in plan["eligible"][0]["comment_body"]
     assert "foreground_sync.py ack" in plan["eligible"][0]["ack_command"]
     assert "evt-fg" not in state["processed_event_ids"]
     assert list((tmp_path / "events").glob("*.json"))
@@ -1402,7 +1765,9 @@ def test_foreground_skip_logs_noop_and_removes_event(tmp_path, monkeypatch):
     assert not list((tmp_path / "events").glob("*.json"))
 
 
-def test_commit_comment_uses_path_based_summary_and_grouped_areas():
+def test_commit_comment_uses_path_based_summary_and_grouped_areas(tmp_path, monkeypatch):
+    monkeypatch.setenv("LINEAR_SYNC_CONFIG_DIR", str(tmp_path / "config"))
+    linear_sync.save_linear_user_profile(linear_name="Arya G")
     event = {
         "type": "post_commit",
         "short_sha": "b7753aa",
@@ -1416,12 +1781,26 @@ def test_commit_comment_uses_path_based_summary_and_grouped_areas():
             "test/aggregate.test.mjs",
         ],
     }
-    comment = linear_sync.build_linear_comment(event)
+    comment = linear_sync.build_linear_comment(
+        event,
+        now=datetime(2026, 7, 3, 18, 42, 10, tzinfo=timezone.utc),
+    )
     assert "Added or updated the React dashboard UI" in comment
     assert "Added or updated core usage aggregation" in comment
     assert "Database/Supabase schema" in comment
     assert "React dashboard UI: src/react/UsageDashboard.js" in comment
     assert "Tests: test/aggregate.test.mjs" in comment
+    assert comment.endswith("Codex bot: Arya G at 2026-07-03T18:42:10+00:00")
+
+
+def test_linear_comment_requires_user_profile(tmp_path, monkeypatch):
+    monkeypatch.setenv("LINEAR_SYNC_CONFIG_DIR", str(tmp_path / "config"))
+
+    with pytest.raises(ValueError, match="Linear user profile"):
+        linear_sync.build_linear_comment(
+            {"type": "post_commit", "short_sha": "b7753aa", "commit_subject": "Work"},
+            now=datetime(2026, 7, 3, 18, 42, 10, tzinfo=timezone.utc),
+        )
 
 
 def test_changed_file_summary_falls_back_to_subject_when_empty():

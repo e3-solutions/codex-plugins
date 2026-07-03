@@ -194,6 +194,66 @@ def repo_bindings_path() -> Path:
     return global_config_dir() / "repos.json"
 
 
+def linear_user_profile_path() -> Path:
+    return global_config_dir() / "user.json"
+
+
+def read_linear_user_profile() -> JsonDict:
+    path = linear_user_profile_path()
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, OSError, json.JSONDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def linear_user_profile_status() -> JsonDict:
+    data = read_linear_user_profile()
+    linear_name = data.get("linear_name")
+    configured = isinstance(linear_name, str) and bool(linear_name.strip())
+    profile = {"linear_name": linear_name.strip()} if configured else None
+    return {
+        "configured": configured,
+        "profile": profile,
+        "config_path": str(linear_user_profile_path()),
+    }
+
+
+def save_linear_user_profile(*, linear_name: str) -> JsonDict:
+    name = str(linear_name or "").strip()
+    if not name:
+        raise ValueError("Linear user profile requires linear_name")
+    profile = {"linear_name": name}
+    write_json_atomic(linear_user_profile_path(), profile)
+    return {
+        "configured": True,
+        "profile": profile,
+        "config_path": str(linear_user_profile_path()),
+    }
+
+
+def linear_user_name(*, default: str = "unknown Linear user") -> str:
+    status = linear_user_profile_status()
+    profile = status.get("profile") if status.get("configured") else None
+    if isinstance(profile, dict):
+        name = profile.get("linear_name")
+        if isinstance(name, str) and name.strip():
+            return name.strip()
+    return default
+
+
+def linear_user_profile_configured() -> bool:
+    return bool(linear_user_profile_status().get("configured"))
+
+
+def require_linear_user_profile() -> JsonDict:
+    status = linear_user_profile_status()
+    if not status.get("configured"):
+        raise ValueError("Linear user profile is required before Linear kickoff or attribution")
+    profile = status.get("profile")
+    return profile if isinstance(profile, dict) else {}
+
+
 def read_repo_bindings() -> JsonDict:
     path = repo_bindings_path()
     try:
@@ -519,6 +579,22 @@ def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def utc_timestamp(now: datetime | None = None) -> str:
+    current = now or datetime.now(timezone.utc)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=timezone.utc)
+    return current.astimezone(timezone.utc).isoformat(timespec="seconds")
+
+
+def codex_attribution_footer(*, now: datetime | None = None) -> str:
+    profile = require_linear_user_profile()
+    return f"Codex bot: {profile['linear_name']} at {utc_timestamp(now)}"
+
+
+def with_codex_attribution(body: str, *, now: datetime | None = None) -> str:
+    return "\n".join([body.rstrip(), "", codex_attribution_footer(now=now)])
+
+
 def enqueue_event(event_type: str, payload: JsonDict | None = None, *, root: str | Path | None = None) -> JsonDict:
     base = ensure_state(root)
     event = dict(payload or {})
@@ -789,6 +865,9 @@ def linear_start_plan(
         "branch": branch,
         "repo": str(repo_root(root)),
     }
+    user_name = linear_user_name(default="")
+    if user_name:
+        active_state["linear_user_name"] = user_name
     if team:
         active_state["team"] = team
     if project:
@@ -842,6 +921,7 @@ def setup_plan(
             "GitHub auth is a manual prerequisite: run gh auth login when needed.",
             "Linear auth is manual after setup registers the MCP server: run codex mcp login linear after setup when needed.",
             "If Codex asks to review hooks, trust the Linear Progress Sync hooks once so automatic kickoff can run.",
+            "First use asks for the user's Linear name and saves it in ~/.codex/linear-sync/user.json for all repos.",
             "First use in a repo asks which Linear team/project to use and saves it in ~/.codex/linear-sync/repos.json.",
             "Before kickoff, Bash is a read-only allowlist; unknown scripts, tests, builds, writes, and branch creation wait for active Linear state.",
             "Per-repo Git hook setup is optional and only needed to sync commits made outside Codex.",
@@ -861,6 +941,7 @@ def run_linear_start(
     root: str | Path | None = None,
     dry_run: bool = False,
 ) -> JsonDict:
+    require_linear_user_profile()
     plan = linear_start_plan(
         issue_key=issue_key,
         issue_title=issue_title,
@@ -930,6 +1011,9 @@ def activate_linear_start(
         "pr_number": int(pr_number),
         "linear_linked_at": linked_at or now_iso(),
     }
+    user_name = linear_user_name(default="")
+    if user_name:
+        active_state["linear_user_name"] = user_name
     if team:
         active_state["team"] = team
     if project:
@@ -1321,20 +1405,23 @@ def safe_unlink(path: Path) -> None:
 
 
 
-def build_linear_comment(event: JsonDict) -> str:
+def build_linear_comment(event: JsonDict, *, now: datetime | None = None) -> str:
     if event.get("type") == "session_progress":
         summary = str(event.get("summary") or "Codex made meaningful local progress.")
         current_state = str(event.get("diff_stat") or "Local files changed; inspect repo diff for details.")
-        return "\n".join(
-            [
-                "Codex session progress update",
-                "",
-                "Summary:",
-                f"- {summary}",
-                "",
-                "Current state:",
-                f"- {current_state}",
-            ]
+        return with_codex_attribution(
+            "\n".join(
+                [
+                    "Codex session progress update",
+                    "",
+                    "Summary:",
+                    f"- {summary}",
+                    "",
+                    "Current state:",
+                    f"- {current_state}",
+                ]
+            ),
+            now=now,
         )
 
     short_sha = str(event.get("short_sha") or str(event.get("commit_sha") or "")[:7] or "unknown")
@@ -1344,21 +1431,24 @@ def build_linear_comment(event: JsonDict) -> str:
     if not bullets:
         bullets = summarize_changed_files(changed, subject=subject)
     changed_lines = changed_area_lines(changed)
-    return "\n".join(
-        [
-            "Codex progress update",
-            "",
-            f"Commit: `{short_sha}` — {subject}",
-            "",
-            "Summary:",
-            *[f"- {bullet}" for bullet in bullets[:4]],
-            "",
-            "Changed areas:",
-            *[f"- {line}" for line in changed_lines],
-            "",
-            "Status:",
-            "- Work appears to be in progress.",
-        ]
+    return with_codex_attribution(
+        "\n".join(
+            [
+                "Codex progress update",
+                "",
+                f"Commit: `{short_sha}` — {subject}",
+                "",
+                "Summary:",
+                *[f"- {bullet}" for bullet in bullets[:4]],
+                "",
+                "Changed areas:",
+                *[f"- {line}" for line in changed_lines],
+                "",
+                "Status:",
+                "- Work appears to be in progress.",
+            ]
+        ),
+        now=now,
     )
 
 
@@ -1547,8 +1637,9 @@ def skip_foreground_event(
     save_state(local_state, root)
     return {"ok": True, "event_id": event_id, "issue_key": issue_key, "action": "skipped", "reason": reason}
 
-def build_codex_prompt(event: JsonDict, inference: IssueInference) -> str:
+def build_codex_prompt(event: JsonDict, inference: IssueInference, *, now: datetime | None = None) -> str:
     event_json = json.dumps(event, indent=2, sort_keys=True)
+    comment_now = now or datetime.now(timezone.utc)
     if event.get("type") == "session_progress":
         comment_template = """Codex session progress update
 
@@ -1570,6 +1661,8 @@ Changed areas:
 
 Status:
 - Work appears to be in progress."""
+    comment_template = with_codex_attribution(comment_template, now=comment_now)
+    footer = codex_attribution_footer(now=comment_now)
 
     return f"""You are Linear Progress Sync running inside Codex.
 
@@ -1581,6 +1674,7 @@ Hard safety rules:
 - Optionally move issue {inference.issue_key} to In Progress only if the current Linear state is non-terminal.
 - If issue {inference.issue_key} is already terminal, do not modify Linear.
 - Do not create duplicate comments if this exact commit/update already appears on the issue.
+- End the Linear comment exactly with: {footer}
 - After the Linear comment is actually created, print exactly: LINEAR_SYNC_OK {inference.issue_key}
 - If you cannot access Linear tools or cannot confirm the comment was created, do not print LINEAR_SYNC_OK.
 
@@ -1639,6 +1733,7 @@ def read_stdin_json() -> JsonDict:
 def pre_tool_guard_decision(payload: JsonDict, *, root: str | Path | None = None) -> PreToolGuardDecision:
     tool = tool_name(payload)
     normalized_tool = tool.lower()
+    is_linear_write = linear_tool_is_write(normalized_tool)
     requires_active_state = normalized_tool in {
         "apply_patch",
         "edit",
@@ -1647,18 +1742,25 @@ def pre_tool_guard_decision(payload: JsonDict, *, root: str | Path | None = None
         "filechange",
         "file_change",
     }
+    user_profile_required = not linear_user_profile_configured()
     guard_enabled = linear_guard_enabled(root=root)
     if normalized_tool == "bash":
         command = tool_command(payload)
         if is_linear_start_command(command):
+            if user_profile_required and not linear_start_allowed_without_user_profile(command):
+                return PreToolGuardDecision(True, linear_user_profile_required_message(root=root))
             return PreToolGuardDecision(False)
         if looks_like_branch_creation(command):
+            if user_profile_required:
+                return PreToolGuardDecision(True, linear_user_profile_required_message(root=root))
             return PreToolGuardDecision(
                 True,
                 linear_branch_creation_blocked_message(root=root, needs_binding=not guard_enabled),
             )
         if bash_command_is_read_only(command):
             return PreToolGuardDecision(False)
+        if user_profile_required:
+            return PreToolGuardDecision(True, linear_user_profile_required_message(root=root))
         if not guard_enabled:
             return PreToolGuardDecision(True, linear_repo_binding_required_message(root=root))
         problem = active_issue_write_problem(root=root)
@@ -1675,12 +1777,21 @@ def pre_tool_guard_decision(payload: JsonDict, *, root: str | Path | None = None
         requires_active_state = True
 
     if requires_active_state:
+        if user_profile_required:
+            return PreToolGuardDecision(True, linear_user_profile_required_message(root=root))
         if not guard_enabled:
             return PreToolGuardDecision(True, linear_repo_binding_required_message(root=root))
         problem = active_issue_write_problem(root=root)
         if problem:
             return PreToolGuardDecision(True, linear_kickoff_required_message(problem, root=root))
         return PreToolGuardDecision(False)
+
+    if is_linear_write:
+        if user_profile_required:
+            return PreToolGuardDecision(True, linear_user_profile_required_message(root=root))
+        attribution_problem = linear_write_attribution_problem(payload, normalized_tool)
+        if attribution_problem:
+            return PreToolGuardDecision(True, attribution_problem)
 
     return PreToolGuardDecision(False)
 
@@ -1696,8 +1807,150 @@ def linear_start_script_path() -> str:
     return str(Path(__file__).with_name("linear_start.py"))
 
 
+def linear_tool_is_write(normalized_tool: str) -> bool:
+    return normalized_tool in {
+        "mcp__codex_apps__linear._save_issue",
+        "mcp__codex_apps__linear._save_comment",
+        "mcp__linear.save_issue",
+        "mcp__linear.save_comment",
+        "save_issue",
+        "save_comment",
+    }
+
+
+def linear_write_kind(normalized_tool: str) -> str | None:
+    if normalized_tool in {"mcp__codex_apps__linear._save_comment", "mcp__linear.save_comment", "save_comment"}:
+        return "comment"
+    if normalized_tool in {"mcp__codex_apps__linear._save_issue", "mcp__linear.save_issue", "save_issue"}:
+        return "issue"
+    return None
+
+
+def linear_write_text_keys(kind: str) -> set[str]:
+    common = {"body", "content", "markdown", "text"}
+    if kind == "comment":
+        return common | {"comment", "comment_body", "message"}
+    if kind == "issue":
+        return common | {"description"}
+    return set()
+
+
+def linear_write_text_values(value: Any, keys: set[str]) -> list[str]:
+    values: list[str] = []
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if key in keys and isinstance(item, str) and item.strip():
+                values.append(item)
+            values.extend(linear_write_text_values(item, keys))
+    elif isinstance(value, list):
+        for item in value:
+            values.extend(linear_write_text_values(item, keys))
+    return values
+
+
+def linear_write_payload_objects(payload: JsonDict) -> list[JsonDict]:
+    objects: list[JsonDict] = []
+    for key in ("tool_input", "toolInput", "input", "arguments"):
+        value = payload.get(key)
+        if isinstance(value, dict):
+            objects.append(value)
+    return objects or [payload]
+
+
+def linear_write_field(payload: JsonDict, field: str) -> Any:
+    for obj in linear_write_payload_objects(payload):
+        if field in obj:
+            return obj.get(field)
+    return None
+
+
+def linear_write_has_nonempty_field(payload: JsonDict, field: str) -> bool:
+    value = linear_write_field(payload, field)
+    return value is not None and str(value).strip() != ""
+
+
+def linear_text_has_codex_footer(text: str, *, linear_name: str) -> bool:
+    pattern = (
+        r"(?:^|\n)Codex bot: "
+        + re.escape(linear_name)
+        + r" at \d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\+00:00\s*$"
+    )
+    return re.search(pattern, text) is not None
+
+
+def linear_write_attribution_problem(payload: JsonDict, normalized_tool: str) -> str | None:
+    kind = linear_write_kind(normalized_tool)
+    if not kind:
+        return None
+    status = linear_user_profile_status()
+    profile = status.get("profile") if status.get("configured") else None
+    linear_name = str(profile.get("linear_name") or "").strip() if isinstance(profile, dict) else ""
+    if not linear_name:
+        return None
+    texts: list[str] = []
+    for obj in linear_write_payload_objects(payload):
+        texts.extend(linear_write_text_values(obj, linear_write_text_keys(kind)))
+    if kind == "issue" and not linear_write_has_nonempty_field(payload, "id"):
+        assignee = linear_write_field(payload, "assignee")
+        assignee_ok = isinstance(assignee, str) and assignee.strip() == linear_name
+        attribution_ok = bool(texts) and all(linear_text_has_codex_footer(text, linear_name=linear_name) for text in texts)
+        if not assignee_ok or not attribution_ok:
+            return linear_issue_create_required_message(
+                linear_name=linear_name,
+                needs_assignee=not assignee_ok,
+                needs_attribution=not attribution_ok,
+            )
+    if kind == "comment" and not texts:
+        return linear_attribution_required_message(linear_name=linear_name)
+    if any(not linear_text_has_codex_footer(text, linear_name=linear_name) for text in texts):
+        return linear_attribution_required_message(linear_name=linear_name)
+    return None
+
+
+def linear_attribution_required_message(*, linear_name: str) -> str:
+    return (
+        "LINEAR ATTRIBUTION REQUIRED. Do not create or update Linear issue bodies or comments until the "
+        "outgoing content ends with "
+        f"`Codex bot: {linear_name} at <ISO-8601 UTC timestamp>`. Add the footer and retry the blocked "
+        "Linear write."
+    )
+
+
+def linear_issue_create_required_message(
+    *,
+    linear_name: str,
+    needs_assignee: bool,
+    needs_attribution: bool,
+) -> str:
+    requirements: list[str] = []
+    if needs_assignee:
+        requirements.append(f"assign the new Linear issue to {linear_name}")
+    if needs_attribution:
+        requirements.append("include an attributed description ending with the Codex bot footer")
+    joined = " and ".join(requirements)
+    return (
+        "LINEAR ISSUE CREATE REQUIRED. Do not create the Linear issue until the payload does this: "
+        f"{joined}. Use `assignee: {linear_name}` and end the description with "
+        f"`Codex bot: {linear_name} at <ISO-8601 UTC timestamp>`."
+    )
+
+
 def linear_guard_repo_arg(*, root: str | Path | None = None) -> str:
     return str(repo_root(root))
+
+
+def linear_user_profile_required_message(*, root: str | Path | None = None) -> str:
+    repo_arg = shlex.quote(linear_guard_repo_arg(root=root))
+    return (
+        "LINEAR USER REQUIRED. Do not write code, create branches, create Linear issues, or continue kickoff "
+        "until the global Linear user profile is saved. Your next action must be to ask the human what their "
+        "name on Linear is, then save it globally with "
+        f"`python3 {linear_start_script_path()} configure-user --linear-name \"<Linear user name>\"`. "
+        f"You can inspect the current value with `python3 {linear_start_script_path()} user-profile --root "
+        f"{repo_arg}`. After this is saved, assign new Linear issues to that stored user, append "
+        "`Codex bot: <stored Linear user name> at <ISO-8601 UTC timestamp>` to every Linear issue/comment "
+        "body Codex creates, and retry the blocked tool call."
+    )
 
 
 def continue_kickoff_instruction(
@@ -1727,7 +1980,9 @@ def continue_kickoff_instruction(
             f"`python3 {linear_start_script_path()} configure-repo --root "
             f"{shlex.quote(linear_guard_repo_arg(root=root))} --team \"<Linear team>\" "
             "--project \"<Linear project>\"`. Then create the Linear issue with "
-            "mcp__codex_apps__linear._save_issue or mcp__linear.save_issue, using the saved team/project. "
+            "mcp__codex_apps__linear._save_issue or mcp__linear.save_issue, using the saved team/project "
+            "and assigning it to the saved Linear user name. End any Linear issue body or comment Codex "
+            "creates with `Codex bot: <stored Linear user name> at <ISO-8601 UTC timestamp>`. "
             "After the issue exists, run "
             f"`python3 {linear_start_script_path()} kickoff --root "
             f"{shlex.quote(linear_guard_repo_arg(root=root))} --issue-key <ISSUE-KEY> "
@@ -1743,7 +1998,9 @@ def continue_kickoff_instruction(
         "Do not test write access, do not inspect .codex as a substitute for kickoff, and do not stop after "
         "creating the Linear issue. "
         "If a Linear issue was already created in this turn, reuse that issue key, URL, title, and Linear "
-        "gitBranchName. Run "
+        "gitBranchName. Otherwise create it in the saved team/project and assign it to the saved Linear "
+        "user name. End any Linear issue body or comment Codex creates with `Codex bot: <stored Linear "
+        "user name> at <ISO-8601 UTC timestamp>`. Run "
         f"`python3 {linear_start_script_path()} kickoff --root {shlex.quote(linear_guard_repo_arg(root=root))} "
         "--issue-key <ISSUE-KEY> --issue-title \"<Linear issue title>\" --issue-url <Linear issue URL> "
         "--branch <Linear gitBranchName>`; then attach/comment the draft PR in Linear, run the helper's "
@@ -2417,37 +2674,60 @@ def git_branch_args_are_read_only(args: list[str]) -> bool:
 
 
 def is_linear_start_command(command: str) -> bool:
+    return linear_start_command_subcommands(command) is not None
+
+
+def linear_start_allowed_without_user_profile(command: str) -> bool:
+    subcommands = linear_start_command_subcommands(command)
+    return bool(subcommands) and all(subcommand in {"user-profile", "configure-user"} for subcommand in subcommands)
+
+
+def linear_start_command_subcommands(command: str) -> list[str] | None:
     if shell_command_has_write_redirection(command):
-        return False
+        return None
     segments = shell_command_tokens(command or "")
-    return bool(segments) and all(command_tokens_are_linear_start(tokens) for tokens in segments)
+    if not segments:
+        return None
+    subcommands = [linear_start_subcommand_from_tokens(tokens) for tokens in segments]
+    if any(subcommand is None for subcommand in subcommands):
+        return None
+    return [str(subcommand) for subcommand in subcommands]
 
 
 def command_tokens_are_linear_start(tokens: list[str]) -> bool:
+    return linear_start_subcommand_from_tokens(tokens) is not None
+
+
+def linear_start_subcommand_from_tokens(tokens: list[str]) -> str | None:
     tokens = strip_env_prefix(tokens)
     if not tokens:
-        return False
+        return None
     executable = Path(tokens[0]).name
     script_index = 0
     if executable in {"python", "python3"}:
         if len(tokens) < 2:
-            return False
+            return None
         script_index = 1
     elif executable == "linear_start.py":
         script_index = 0
     elif tokens[0] == "/linear-start":
-        return True
+        return "/linear-start"
     else:
-        return False
+        return None
     script = Path(tokens[script_index]).name
     if script != "linear_start.py":
-        return False
-    return len(tokens) > script_index + 1 and tokens[script_index + 1] in {
+        return None
+    if len(tokens) <= script_index + 1:
+        return None
+    subcommand = tokens[script_index + 1]
+    return subcommand if subcommand in {
         "kickoff",
         "activate",
         "repo-binding",
         "configure-repo",
-    }
+        "user-profile",
+        "configure-user",
+    } else None
 
 
 
