@@ -246,6 +246,14 @@ def linear_user_profile_configured() -> bool:
     return bool(linear_user_profile_status().get("configured"))
 
 
+def require_linear_user_profile() -> JsonDict:
+    status = linear_user_profile_status()
+    if not status.get("configured"):
+        raise ValueError("Linear user profile is required before Linear kickoff or attribution")
+    profile = status.get("profile")
+    return profile if isinstance(profile, dict) else {}
+
+
 def read_repo_bindings() -> JsonDict:
     path = repo_bindings_path()
     try:
@@ -579,7 +587,8 @@ def utc_timestamp(now: datetime | None = None) -> str:
 
 
 def codex_attribution_footer(*, now: datetime | None = None) -> str:
-    return f"Codex bot: {linear_user_name()} at {utc_timestamp(now)}"
+    profile = require_linear_user_profile()
+    return f"Codex bot: {profile['linear_name']} at {utc_timestamp(now)}"
 
 
 def with_codex_attribution(body: str, *, now: datetime | None = None) -> str:
@@ -932,6 +941,7 @@ def run_linear_start(
     root: str | Path | None = None,
     dry_run: bool = False,
 ) -> JsonDict:
+    require_linear_user_profile()
     plan = linear_start_plan(
         issue_key=issue_key,
         issue_title=issue_title,
@@ -1731,7 +1741,7 @@ def pre_tool_guard_decision(payload: JsonDict, *, root: str | Path | None = None
         "filechange",
         "file_change",
     }
-    user_profile_required = not linear_user_profile_configured() and not load_active_issue(root=root).exists
+    user_profile_required = not linear_user_profile_configured()
     guard_enabled = linear_guard_enabled(root=root)
     if normalized_tool == "bash":
         command = tool_command(payload)
