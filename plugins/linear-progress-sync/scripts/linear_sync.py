@@ -1848,6 +1848,27 @@ def linear_write_text_values(value: Any, keys: set[str]) -> list[str]:
     return values
 
 
+def linear_write_payload_objects(payload: JsonDict) -> list[JsonDict]:
+    objects: list[JsonDict] = []
+    for key in ("tool_input", "toolInput", "input", "arguments"):
+        value = payload.get(key)
+        if isinstance(value, dict):
+            objects.append(value)
+    return objects or [payload]
+
+
+def linear_write_field(payload: JsonDict, field: str) -> Any:
+    for obj in linear_write_payload_objects(payload):
+        if field in obj:
+            return obj.get(field)
+    return None
+
+
+def linear_write_has_nonempty_field(payload: JsonDict, field: str) -> bool:
+    value = linear_write_field(payload, field)
+    return value is not None and str(value).strip() != ""
+
+
 def linear_text_has_codex_footer(text: str, *, linear_name: str) -> bool:
     pattern = (
         r"(?:^|\n)Codex bot: "
@@ -1866,7 +1887,19 @@ def linear_write_attribution_problem(payload: JsonDict, normalized_tool: str) ->
     linear_name = str(profile.get("linear_name") or "").strip() if isinstance(profile, dict) else ""
     if not linear_name:
         return None
-    texts = linear_write_text_values(payload, linear_write_text_keys(kind))
+    texts: list[str] = []
+    for obj in linear_write_payload_objects(payload):
+        texts.extend(linear_write_text_values(obj, linear_write_text_keys(kind)))
+    if kind == "issue" and not linear_write_has_nonempty_field(payload, "id"):
+        assignee = linear_write_field(payload, "assignee")
+        assignee_ok = isinstance(assignee, str) and assignee.strip() == linear_name
+        attribution_ok = bool(texts) and all(linear_text_has_codex_footer(text, linear_name=linear_name) for text in texts)
+        if not assignee_ok or not attribution_ok:
+            return linear_issue_create_required_message(
+                linear_name=linear_name,
+                needs_assignee=not assignee_ok,
+                needs_attribution=not attribution_ok,
+            )
     if kind == "comment" and not texts:
         return linear_attribution_required_message(linear_name=linear_name)
     if any(not linear_text_has_codex_footer(text, linear_name=linear_name) for text in texts):
@@ -1880,6 +1913,25 @@ def linear_attribution_required_message(*, linear_name: str) -> str:
         "outgoing content ends with "
         f"`Codex bot: {linear_name} at <ISO-8601 UTC timestamp>`. Add the footer and retry the blocked "
         "Linear write."
+    )
+
+
+def linear_issue_create_required_message(
+    *,
+    linear_name: str,
+    needs_assignee: bool,
+    needs_attribution: bool,
+) -> str:
+    requirements: list[str] = []
+    if needs_assignee:
+        requirements.append(f"assign the new Linear issue to {linear_name}")
+    if needs_attribution:
+        requirements.append("include an attributed description ending with the Codex bot footer")
+    joined = " and ".join(requirements)
+    return (
+        "LINEAR ISSUE CREATE REQUIRED. Do not create the Linear issue until the payload does this: "
+        f"{joined}. Use `assignee: {linear_name}` and end the description with "
+        f"`Codex bot: {linear_name} at <ISO-8601 UTC timestamp>`."
     )
 
 

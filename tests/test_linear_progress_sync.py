@@ -463,6 +463,8 @@ def test_pre_tool_guard_blocks_linear_writes_until_global_user_profile_is_saved(
     ready_payload = {"tool_name": tool}
     if tool.endswith("save_comment") or tool.endswith("_save_comment"):
         ready_payload["tool_input"] = {"body": "Kickoff started\n\nCodex bot: Arya G at 2026-07-03T18:42:10+00:00"}
+    if tool.endswith("save_issue") or tool.endswith("_save_issue"):
+        ready_payload["tool_input"] = {"id": "COR-123", "title": "Attach PR metadata"}
     ready = linear_sync.pre_tool_guard_decision(ready_payload, root=repo)
 
     assert missing_user.blocked is True
@@ -486,9 +488,12 @@ def test_pre_tool_guard_blocks_linear_content_without_attribution_footer(tmp_pat
     monkeypatch.setenv("LINEAR_SYNC_CONFIG_DIR", str(tmp_path / "config"))
     repo = init_git_repo(tmp_path / "repo", branch="arya/footer-required")
     linear_sync.save_linear_user_profile(linear_name="Arya G")
+    tool_input = {field: "Kickoff started"}
+    if tool.endswith("save_issue") or tool.endswith("_save_issue"):
+        tool_input["id"] = "COR-123"
 
     decision = linear_sync.pre_tool_guard_decision(
-        {"tool_name": tool, "tool_input": {field: "Kickoff started"}},
+        {"tool_name": tool, "tool_input": tool_input},
         root=repo,
     )
 
@@ -506,11 +511,14 @@ def test_pre_tool_guard_blocks_linear_content_without_attribution_footer(tmp_pat
         },
         {
             "tool_name": "mcp__linear.save_issue",
-            "arguments": {"description": "Issue created\n\nCodex bot: Arya G at 2026-07-03T18:42:10+00:00"},
+            "arguments": {
+                "id": "COR-123",
+                "description": "Issue created\n\nCodex bot: Arya G at 2026-07-03T18:42:10+00:00",
+            },
         },
         {
             "tool_name": "save_issue",
-            "tool_input": {"title": "Attach PR metadata"},
+            "tool_input": {"id": "COR-123", "title": "Attach PR metadata"},
         },
     ],
 )
@@ -521,6 +529,83 @@ def test_pre_tool_guard_allows_linear_writes_with_attribution_footer(tmp_path, m
     linear_sync.save_linear_user_profile(linear_name="Arya G")
 
     decision = linear_sync.pre_tool_guard_decision(payload, root=repo)
+
+    assert decision.blocked is False
+
+
+@pytest.mark.parametrize(
+    ("payload", "expected"),
+    [
+        (
+            {
+                "tool_name": "mcp__linear.save_issue",
+                "tool_input": {"title": "Implement tracking", "team": "Engineering"},
+            },
+            "include an attributed description",
+        ),
+        (
+            {
+                "id": "tool-call-1",
+                "tool_name": "mcp__linear.save_issue",
+                "tool_input": {"title": "Implement tracking", "team": "Engineering"},
+            },
+            "include an attributed description",
+        ),
+        (
+            {
+                "tool_name": "mcp__linear.save_issue",
+                "tool_input": {
+                    "title": "Implement tracking",
+                    "team": "Engineering",
+                    "description": "Issue created\n\nCodex bot: Arya G at 2026-07-03T18:42:10+00:00",
+                },
+            },
+            "assign the new Linear issue to Arya G",
+        ),
+        (
+            {
+                "tool_name": "mcp__linear.save_issue",
+                "tool_input": {
+                    "title": "Implement tracking",
+                    "team": "Engineering",
+                    "assignee": "Arya G",
+                },
+            },
+            "include an attributed description",
+        ),
+    ],
+)
+def test_pre_tool_guard_blocks_issue_creation_without_assignee_and_attribution(tmp_path, monkeypatch, payload, expected):
+    monkeypatch.setenv("LINEAR_SYNC_STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setenv("LINEAR_SYNC_CONFIG_DIR", str(tmp_path / "config"))
+    repo = init_git_repo(tmp_path / "repo", branch="arya/issue-create-required")
+    linear_sync.save_linear_user_profile(linear_name="Arya G")
+
+    decision = linear_sync.pre_tool_guard_decision(payload, root=repo)
+
+    assert decision.blocked is True
+    assert decision.message.startswith("LINEAR ISSUE CREATE REQUIRED")
+    assert expected in decision.message
+
+
+def test_pre_tool_guard_allows_issue_creation_with_assignee_and_attribution(tmp_path, monkeypatch):
+    monkeypatch.setenv("LINEAR_SYNC_STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setenv("LINEAR_SYNC_CONFIG_DIR", str(tmp_path / "config"))
+    repo = init_git_repo(tmp_path / "repo", branch="arya/issue-create-ready")
+    linear_sync.save_linear_user_profile(linear_name="Arya G")
+
+    decision = linear_sync.pre_tool_guard_decision(
+        {
+            "tool_name": "mcp__linear.save_issue",
+            "tool_input": {
+                "title": "Implement tracking",
+                "team": "Engineering",
+                "assignee": "Arya G",
+                "description": "Issue created\n\nCodex bot: Arya G at 2026-07-03T18:42:10+00:00",
+            },
+        },
+        root=repo,
+    )
 
     assert decision.blocked is False
 
