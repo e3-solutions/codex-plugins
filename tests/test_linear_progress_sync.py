@@ -723,6 +723,89 @@ def test_pre_tool_guard_allows_opted_out_repo_without_user_or_active_state(tmp_p
     assert branch_decision.blocked is False
 
 
+def test_pre_tool_guard_allows_disable_linear_sync_before_user_profile(tmp_path, monkeypatch):
+    state_dir = tmp_path / "state"
+    config_dir = tmp_path / "config"
+    monkeypatch.setenv("LINEAR_SYNC_STATE_DIR", str(state_dir))
+    monkeypatch.setenv("LINEAR_SYNC_CONFIG_DIR", str(config_dir))
+    repo = init_git_repo(tmp_path / "repo", branch="arya/no-linear-sync")
+    command = (
+        f"{sys.executable} {ROOT / 'plugins' / 'linear-progress-sync' / 'scripts' / 'linear_start.py'} "
+        f"configure-repo --root {repo} --disable-linear-sync --reason 'No Linear tracking'"
+    )
+
+    disable_decision = linear_sync.pre_tool_guard_decision({"tool_name": "Bash", "command": command}, root=repo)
+    normal_config_decision = linear_sync.pre_tool_guard_decision(
+        {
+            "tool_name": "Bash",
+            "command": (
+                f"{sys.executable} {ROOT / 'plugins' / 'linear-progress-sync' / 'scripts' / 'linear_start.py'} "
+                f"configure-repo --root {repo} --team Engineering --project 'Codex Plugins'"
+            ),
+        },
+        root=repo,
+    )
+
+    assert disable_decision.blocked is False
+    assert normal_config_decision.blocked is True
+    assert normal_config_decision.message.startswith("LINEAR USER REQUIRED")
+
+
+def test_opted_out_repo_does_not_drain_or_prepare_linear_sync(tmp_path, monkeypatch):
+    state_dir = tmp_path / "state"
+    config_dir = tmp_path / "config"
+    monkeypatch.setenv("LINEAR_SYNC_STATE_DIR", str(state_dir))
+    monkeypatch.setenv("LINEAR_SYNC_CONFIG_DIR", str(config_dir))
+    repo = init_git_repo(tmp_path / "repo", branch="arya/cor-123-opt-out")
+    linear_sync.save_linear_user_profile(linear_name="Arya G")
+    linear_sync.save_repo_linear_opt_out(reason="No Linear tracking", root=repo)
+    queued = linear_sync.handle_post_tool_use({"tool_name": "apply_patch", "file_path": "app.py"}, root=repo)
+    assert queued is None
+    assert list((state_dir / "events").glob("*.json")) == []
+    (repo / "app.py").write_text("print('hi')\n", encoding="utf-8")
+    stop_result = subprocess.run(
+        [sys.executable, str(ROOT / "plugins" / "linear-progress-sync" / "scripts" / "stop_progress.py")],
+        input="{}\n",
+        cwd=repo,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    assert stop_result.returncode == 0
+    assert stop_result.stdout == ""
+    assert list((state_dir / "events").glob("*.json")) == []
+    linear_sync.enqueue_event(
+        "post_commit",
+        {
+            "id": "evt-opt-out",
+            "type": "post_commit",
+            "branch": "arya/cor-123-opt-out",
+            "commit_sha": "abc123",
+            "commit_subject": "COR-123 work that should not sync",
+        },
+        root=repo,
+    )
+    calls = []
+
+    plan = linear_sync.foreground_sync_plan(root=repo)
+    result = linear_sync.drain_once(
+        root=repo,
+        executor=lambda prompt, event, inference: calls.append((prompt, event, inference))
+        or linear_sync.WorkerResult(True, "should not run"),
+    )
+    remaining_events = list((state_dir / "events").glob("*.json"))
+
+    assert plan["eligible"] == []
+    assert plan["held"] == []
+    assert plan["skipped"][0]["reason"] == "Linear sync disabled for this repo"
+    assert result["processed"] == 0
+    assert result["skipped"] == 1
+    assert result["failed"] == 0
+    assert calls == []
+    assert remaining_events == []
+
+
 def test_pre_tool_guard_blocks_desktop_file_change_without_active_state(tmp_path, monkeypatch):
     state_dir = tmp_path / "state"
     config_dir = tmp_path / "config"

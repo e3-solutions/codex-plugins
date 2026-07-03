@@ -1342,6 +1342,21 @@ def drain_once(
     reviewed = 0
     skipped = 0
     events = load_events(root)
+    if linear_guard_disabled(root=root):
+        for path, event in events:
+            event_id = str(event.get("id") or path.stem)
+            if event_id not in set(local_state.get("processed_event_ids") or []):
+                log_noop(local_state, event, "Linear sync disabled for this repo")
+                mark_processed(local_state, event_id)
+                skipped += 1
+            safe_unlink(path)
+        save_state(local_state, root)
+        return {
+            "processed": 0,
+            "reviewed": 0,
+            "skipped": skipped,
+            "failed": 0,
+        }
     active_problem = active_issue_fail_closed_problem(root=root)
     if active_problem and events:
         local_state.setdefault("failures", {})["active_state"] = {
@@ -1495,6 +1510,27 @@ def foreground_sync_plan(
     held: list[JsonDict] = []
     skipped: list[JsonDict] = []
     events = load_events(root)
+    if linear_guard_disabled(root=root):
+        for path, event in events[:limit]:
+            event_id = str(event.get("id") or path.stem)
+            skipped.append(
+                {
+                    "event_id": event_id,
+                    "event_type": event.get("type"),
+                    "event": event,
+                    "inference": IssueInference(None, 0.0, "Linear sync disabled for this repo").__dict__,
+                    "reason": "Linear sync disabled for this repo",
+                }
+            )
+        return {
+            "repo": str(repo_root(root)),
+            "eligible": eligible,
+            "held": held,
+            "skipped": skipped,
+            "instructions": [
+                "Linear sync is disabled for this repo; do not write Linear progress updates.",
+            ],
+        }
     active_problem = active_issue_fail_closed_problem(root=root)
     if active_problem:
         for path, event in events:
@@ -2101,6 +2137,8 @@ def linear_kickoff_required_message(reason: str | None = None, *, root: str | Pa
 
 
 def handle_post_tool_use(payload: JsonDict, *, root: str | Path | None = None) -> JsonDict | None:
+    if linear_guard_disabled(root=root):
+        return None
     tool = tool_name(payload)
     if tool.lower() == "bash":
         command = tool_command(payload)
@@ -2723,11 +2761,20 @@ def is_linear_start_command(command: str) -> bool:
 
 
 def linear_start_allowed_without_user_profile(command: str) -> bool:
-    subcommands = linear_start_command_subcommands(command)
-    return bool(subcommands) and all(subcommand in {"user-profile", "configure-user"} for subcommand in subcommands)
+    segments = linear_start_command_segments(command)
+    if segments is None:
+        return False
+    return all(linear_start_segment_allowed_without_user_profile(tokens) for tokens in segments)
 
 
 def linear_start_command_subcommands(command: str) -> list[str] | None:
+    segments = linear_start_command_segments(command)
+    if segments is None:
+        return None
+    return [str(linear_start_subcommand_from_tokens(tokens)) for tokens in segments]
+
+
+def linear_start_command_segments(command: str) -> list[list[str]] | None:
     if shell_command_has_write_redirection(command):
         return None
     segments = shell_command_tokens(command or "")
@@ -2736,7 +2783,16 @@ def linear_start_command_subcommands(command: str) -> list[str] | None:
     subcommands = [linear_start_subcommand_from_tokens(tokens) for tokens in segments]
     if any(subcommand is None for subcommand in subcommands):
         return None
-    return [str(subcommand) for subcommand in subcommands]
+    return segments
+
+
+def linear_start_segment_allowed_without_user_profile(tokens: list[str]) -> bool:
+    subcommand = linear_start_subcommand_from_tokens(tokens)
+    if subcommand in {"user-profile", "configure-user"}:
+        return True
+    if subcommand == "configure-repo":
+        return "--disable-linear-sync" in tokens
+    return False
 
 
 def command_tokens_are_linear_start(tokens: list[str]) -> bool:
