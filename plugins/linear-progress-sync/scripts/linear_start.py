@@ -4,7 +4,15 @@ from __future__ import annotations
 import argparse
 import json
 
-from linear_sync import activate_linear_start, cli_root_arg, repo_binding_status, run_linear_start, save_repo_linear_binding
+from linear_sync import (
+    activate_linear_start,
+    cli_root_arg,
+    linear_user_profile_status,
+    repo_binding_status,
+    run_linear_start,
+    save_linear_user_profile,
+    save_repo_linear_binding,
+)
 
 
 def main() -> None:
@@ -40,6 +48,12 @@ def main() -> None:
     configure.add_argument("--team", required=True)
     configure.add_argument("--project", required=True)
 
+    user_profile = sub.add_parser("user-profile", help="Print saved global Linear user profile.")
+    cli_root_arg(user_profile)
+
+    configure_user = sub.add_parser("configure-user", help="Save the global Linear user profile.")
+    configure_user.add_argument("--linear-name", required=True)
+
     args = parser.parse_args()
     if args.command == "kickoff":
         result = run_linear_start(
@@ -70,6 +84,11 @@ def main() -> None:
         print(json.dumps(repo_binding_status(root=args.root), indent=2, sort_keys=True))
     elif args.command == "configure-repo":
         result = save_repo_linear_binding(team=args.team, project=args.project, root=args.root)
+        print(json.dumps(result, indent=2, sort_keys=True))
+    elif args.command == "user-profile":
+        print(json.dumps(linear_user_profile_status(), indent=2, sort_keys=True))
+    elif args.command == "configure-user":
+        result = save_linear_user_profile(linear_name=args.linear_name)
         print(json.dumps(result, indent=2, sort_keys=True))
 
 

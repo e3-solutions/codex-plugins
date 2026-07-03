@@ -21,21 +21,24 @@ Pre-kickoff Bash uses a read-only allowlist, not a write-command blacklist. Allo
 
 If active state is missing, run the Linear kickoff workflow before editing:
 
-1. Run `scripts/linear_start.py repo-binding --root <root>`.
-2. If this repo has no saved team/project, call `mcp__codex_apps__linear._list_teams` and `mcp__codex_apps__linear._list_projects`, ask the user once which Linear team/project the repo should use, then save it with `scripts/linear_start.py configure-repo`.
+1. Run `scripts/linear_start.py user-profile --root <root>`.
+2. If there is no saved user profile, ask them what their name on Linear is, then save it once with `scripts/linear_start.py configure-user --linear-name "<Linear user name>"`. This is global for every repo.
+3. Run `scripts/linear_start.py repo-binding --root <root>`.
+4. If this repo has no saved team/project, call `mcp__codex_apps__linear._list_teams` and `mcp__codex_apps__linear._list_projects`, ask the user once which Linear team/project the repo should use, then save it with `scripts/linear_start.py configure-repo`.
    - If the direct Linear MCP namespace is exposed instead, use `mcp__linear.list_teams` and `mcp__linear.list_projects`.
    - If the session exposes short Linear aliases like `list_teams` or `list_projects`, use those aliases. If create/update tools are not visible after listing, search/load Linear tools; do not stop after listing projects. Issue creation/linking tools are `mcp__codex_apps__linear._save_issue`/`mcp__codex_apps__linear._save_comment` or `mcp__linear.save_issue`/`mcp__linear.save_comment`.
    - Do not create the Linear issue, branch, PR, or code changes until the chosen repo destination is saved.
    - If the write guard blocks because no repo destination is saved, do not answer with a code patch or say you are blocked. Continue by listing Linear destinations and asking the user which team/project this repo should use.
-3. Unless the user explicitly supplied an existing Linear issue key, create a new issue automatically from the user's implementation request in the saved team/project. Do not ask the user for a Linear issue key.
-4. Use `mcp__codex_apps__linear._save_issue` to create the issue in the saved team/project, or `mcp__codex_apps__linear._get_issue`/`mcp__codex_apps__linear._fetch` to read an explicitly supplied existing issue.
+5. Unless the user explicitly supplied an existing Linear issue key, create a new issue automatically from the user's implementation request in the saved team/project and assign it to the saved Linear user name. Do not ask the user for a Linear issue key.
+6. Use `mcp__codex_apps__linear._save_issue` to create the issue in the saved team/project, or `mcp__codex_apps__linear._get_issue`/`mcp__codex_apps__linear._fetch` to read an explicitly supplied existing issue.
    - Direct Linear MCP equivalents are `mcp__linear.save_issue` and `mcp__linear.get_issue`.
-5. Read the issue back with `mcp__codex_apps__linear._get_issue`/`mcp__codex_apps__linear._fetch` or `mcp__linear.get_issue` and use Linear's generated git branch name when present.
-6. Run `/linear-start` or `scripts/linear_start.py kickoff` to create/switch the branch, push an empty kickoff commit, and create a draft PR. Treat the returned `pending_active_state` as inactive until Linear linking is confirmed.
+7. Read the issue back with `mcp__codex_apps__linear._get_issue`/`mcp__codex_apps__linear._fetch` or `mcp__linear.get_issue` and use Linear's generated git branch name when present.
+8. Run `/linear-start` or `scripts/linear_start.py kickoff` to create/switch the branch, push an empty kickoff commit, and create a draft PR. Treat the returned `pending_active_state` as inactive until Linear linking is confirmed.
    - If a write is blocked after the Linear issue was created, do not stop, do not test write access, and do not ask the user to activate state. Reuse the issue key, URL, title, and Linear `gitBranchName`; run the kickoff helper; link Linear and GitHub; then run the helper's `activation_command`.
-7. Add the PR link/comment back to Linear with `mcp__codex_apps__linear._save_issue` and `mcp__codex_apps__linear._save_comment`.
+9. Add the PR link/comment back to Linear with `mcp__codex_apps__linear._save_issue` and `mcp__codex_apps__linear._save_comment`.
    - Direct Linear MCP equivalents are `mcp__linear.save_issue` and `mcp__linear.save_comment`.
-8. Read Linear back or otherwise confirm the PR link/comment is visible, then run `scripts/linear_start.py activate` with the helper's `activation_command` to write `.codex/linear-sync/active.json`.
+   - End every Linear issue body and comment Codex creates with `Codex bot: <stored Linear user name> at <ISO-8601 UTC timestamp>`.
+10. Read Linear back or otherwise confirm the PR link/comment is visible, then run `scripts/linear_start.py activate` with the helper's `activation_command` to write `.codex/linear-sync/active.json`.
 
 The human should not need to remember `/linear-start`; use it as the explicit/manual entrypoint when active state is missing.
 
@@ -77,6 +80,8 @@ Inspect or save the Linear team/project binding for a repo:
 
 ```bash
 python3 plugins/linear-progress-sync/scripts/linear_start.py repo-binding --root /path/to/repo
+python3 plugins/linear-progress-sync/scripts/linear_start.py user-profile --root /path/to/repo
+python3 plugins/linear-progress-sync/scripts/linear_start.py configure-user --linear-name "Your Linear Name"
 python3 plugins/linear-progress-sync/scripts/linear_start.py configure-repo --root /path/to/repo --team "Engineering" --project "Codex Plugins"
 ```
 
