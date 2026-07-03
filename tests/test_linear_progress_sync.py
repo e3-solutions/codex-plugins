@@ -460,11 +460,69 @@ def test_pre_tool_guard_blocks_linear_writes_until_global_user_profile_is_saved(
 
     missing_user = linear_sync.pre_tool_guard_decision({"tool_name": tool}, root=repo)
     linear_sync.save_linear_user_profile(linear_name="Arya G")
-    ready = linear_sync.pre_tool_guard_decision({"tool_name": tool}, root=repo)
+    ready_payload = {"tool_name": tool}
+    if tool.endswith("save_comment") or tool.endswith("_save_comment"):
+        ready_payload["tool_input"] = {"body": "Kickoff started\n\nCodex bot: Arya G at 2026-07-03T18:42:10+00:00"}
+    ready = linear_sync.pre_tool_guard_decision(ready_payload, root=repo)
 
     assert missing_user.blocked is True
     assert missing_user.message.startswith("LINEAR USER REQUIRED")
     assert ready.blocked is False
+
+
+@pytest.mark.parametrize(
+    ("tool", "field"),
+    [
+        ("mcp__codex_apps__linear._save_comment", "body"),
+        ("mcp__linear.save_comment", "comment"),
+        ("save_comment", "content"),
+        ("mcp__codex_apps__linear._save_issue", "description"),
+        ("mcp__linear.save_issue", "body"),
+        ("save_issue", "markdown"),
+    ],
+)
+def test_pre_tool_guard_blocks_linear_content_without_attribution_footer(tmp_path, monkeypatch, tool, field):
+    monkeypatch.setenv("LINEAR_SYNC_STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setenv("LINEAR_SYNC_CONFIG_DIR", str(tmp_path / "config"))
+    repo = init_git_repo(tmp_path / "repo", branch="arya/footer-required")
+    linear_sync.save_linear_user_profile(linear_name="Arya G")
+
+    decision = linear_sync.pre_tool_guard_decision(
+        {"tool_name": tool, "tool_input": {field: "Kickoff started"}},
+        root=repo,
+    )
+
+    assert decision.blocked is True
+    assert decision.message.startswith("LINEAR ATTRIBUTION REQUIRED")
+    assert "Codex bot: Arya G at <ISO-8601 UTC timestamp>" in decision.message
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {
+            "tool_name": "mcp__codex_apps__linear._save_comment",
+            "tool_input": {"body": "Kickoff started\n\nCodex bot: Arya G at 2026-07-03T18:42:10+00:00"},
+        },
+        {
+            "tool_name": "mcp__linear.save_issue",
+            "arguments": {"description": "Issue created\n\nCodex bot: Arya G at 2026-07-03T18:42:10+00:00"},
+        },
+        {
+            "tool_name": "save_issue",
+            "tool_input": {"title": "Attach PR metadata"},
+        },
+    ],
+)
+def test_pre_tool_guard_allows_linear_writes_with_attribution_footer(tmp_path, monkeypatch, payload):
+    monkeypatch.setenv("LINEAR_SYNC_STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setenv("LINEAR_SYNC_CONFIG_DIR", str(tmp_path / "config"))
+    repo = init_git_repo(tmp_path / "repo", branch="arya/footer-present")
+    linear_sync.save_linear_user_profile(linear_name="Arya G")
+
+    decision = linear_sync.pre_tool_guard_decision(payload, root=repo)
+
+    assert decision.blocked is False
 
 
 def test_pre_tool_guard_blocks_unbound_repo_writes_until_linear_destination_is_saved(tmp_path, monkeypatch):

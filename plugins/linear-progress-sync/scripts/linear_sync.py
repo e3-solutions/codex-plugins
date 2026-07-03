@@ -1786,8 +1786,12 @@ def pre_tool_guard_decision(payload: JsonDict, *, root: str | Path | None = None
             return PreToolGuardDecision(True, linear_kickoff_required_message(problem, root=root))
         return PreToolGuardDecision(False)
 
-    if is_linear_write and user_profile_required:
-        return PreToolGuardDecision(True, linear_user_profile_required_message(root=root))
+    if is_linear_write:
+        if user_profile_required:
+            return PreToolGuardDecision(True, linear_user_profile_required_message(root=root))
+        attribution_problem = linear_write_attribution_problem(payload, normalized_tool)
+        if attribution_problem:
+            return PreToolGuardDecision(True, attribution_problem)
 
     return PreToolGuardDecision(False)
 
@@ -1812,6 +1816,71 @@ def linear_tool_is_write(normalized_tool: str) -> bool:
         "save_issue",
         "save_comment",
     }
+
+
+def linear_write_kind(normalized_tool: str) -> str | None:
+    if normalized_tool in {"mcp__codex_apps__linear._save_comment", "mcp__linear.save_comment", "save_comment"}:
+        return "comment"
+    if normalized_tool in {"mcp__codex_apps__linear._save_issue", "mcp__linear.save_issue", "save_issue"}:
+        return "issue"
+    return None
+
+
+def linear_write_text_keys(kind: str) -> set[str]:
+    common = {"body", "content", "markdown", "text"}
+    if kind == "comment":
+        return common | {"comment", "comment_body", "message"}
+    if kind == "issue":
+        return common | {"description"}
+    return set()
+
+
+def linear_write_text_values(value: Any, keys: set[str]) -> list[str]:
+    values: list[str] = []
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if key in keys and isinstance(item, str) and item.strip():
+                values.append(item)
+            values.extend(linear_write_text_values(item, keys))
+    elif isinstance(value, list):
+        for item in value:
+            values.extend(linear_write_text_values(item, keys))
+    return values
+
+
+def linear_text_has_codex_footer(text: str, *, linear_name: str) -> bool:
+    pattern = (
+        r"(?:^|\n)Codex bot: "
+        + re.escape(linear_name)
+        + r" at \d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\+00:00\s*$"
+    )
+    return re.search(pattern, text) is not None
+
+
+def linear_write_attribution_problem(payload: JsonDict, normalized_tool: str) -> str | None:
+    kind = linear_write_kind(normalized_tool)
+    if not kind:
+        return None
+    status = linear_user_profile_status()
+    profile = status.get("profile") if status.get("configured") else None
+    linear_name = str(profile.get("linear_name") or "").strip() if isinstance(profile, dict) else ""
+    if not linear_name:
+        return None
+    texts = linear_write_text_values(payload, linear_write_text_keys(kind))
+    if kind == "comment" and not texts:
+        return linear_attribution_required_message(linear_name=linear_name)
+    if any(not linear_text_has_codex_footer(text, linear_name=linear_name) for text in texts):
+        return linear_attribution_required_message(linear_name=linear_name)
+    return None
+
+
+def linear_attribution_required_message(*, linear_name: str) -> str:
+    return (
+        "LINEAR ATTRIBUTION REQUIRED. Do not create or update Linear issue bodies or comments until the "
+        "outgoing content ends with "
+        f"`Codex bot: {linear_name} at <ISO-8601 UTC timestamp>`. Add the footer and retry the blocked "
+        "Linear write."
+    )
 
 
 def linear_guard_repo_arg(*, root: str | Path | None = None) -> str:
