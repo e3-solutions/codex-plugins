@@ -431,7 +431,10 @@ def test_pre_tool_guard_blocks_until_global_linear_user_profile_is_saved(tmp_pat
 
     assert missing_user.blocked is True
     assert missing_user.message.startswith("LINEAR USER REQUIRED")
-    assert "ask the human what their name on Linear is" in missing_user.message
+    assert "list Linear users" in missing_user.message
+    assert "mcp__codex_apps__linear._list_users" in missing_user.message
+    assert "mcp__linear.list_users" in missing_user.message
+    assert "ask the human to choose their Linear user from that list" in missing_user.message
     assert "linear_start.py user-profile" in missing_user.message
     assert "linear_start.py configure-user" in missing_user.message
     assert "assign new Linear issues to that stored user" in missing_user.message
@@ -634,6 +637,8 @@ def test_pre_tool_guard_blocks_unbound_repo_writes_until_linear_destination_is_s
     assert "Your next action must be to list Linear teams/projects" in write_decision.message
     assert "mcp__codex_apps__linear._list_teams" in write_decision.message
     assert "mcp__linear.list_projects" in write_decision.message
+    assert "present the Linear project list" in write_decision.message
+    assert "ask the human to choose the Linear project from that list" in write_decision.message
     assert "ask the user only which Linear team/project" in write_decision.message
     assert "This is the one required first-run human question" in write_decision.message
     assert "do not stop after listing projects" in write_decision.message
@@ -647,6 +652,29 @@ def test_pre_tool_guard_blocks_unbound_repo_writes_until_linear_destination_is_s
     assert "This is the one required first-run human question" in branch_decision.message
     assert "do not stop after listing projects" in branch_decision.message
     assert "linear_start.py kickoff" in branch_decision.message
+
+
+def test_pre_tool_guard_allows_opted_out_repo_without_user_or_active_state(tmp_path, monkeypatch):
+    state_dir = tmp_path / "state"
+    config_dir = tmp_path / "config"
+    monkeypatch.setenv("LINEAR_SYNC_STATE_DIR", str(state_dir))
+    monkeypatch.setenv("LINEAR_SYNC_CONFIG_DIR", str(config_dir))
+    repo = init_git_repo(tmp_path / "repo", branch="arya/no-linear-sync")
+    disabled = linear_sync.save_repo_linear_opt_out(reason="No Linear tracking for this project", root=repo)
+
+    write_decision = linear_sync.pre_tool_guard_decision({"tool_name": "apply_patch"}, root=repo)
+    branch_decision = linear_sync.pre_tool_guard_decision(
+        {"tool_name": "Bash", "command": "git switch -c arya/normal-work"},
+        root=repo,
+    )
+    status = linear_sync.repo_binding_status(root=repo)
+
+    assert disabled["binding"]["disabled"] is True
+    assert status["disabled"] is True
+    assert status["configured"] is False
+    assert status["binding"]["reason"] == "No Linear tracking for this project"
+    assert write_decision.blocked is False
+    assert branch_decision.blocked is False
 
 
 def test_pre_tool_guard_blocks_desktop_file_change_without_active_state(tmp_path, monkeypatch):
@@ -1389,6 +1417,34 @@ def test_repo_linear_binding_round_trips_by_repo_identity(tmp_path, monkeypatch)
     assert "e3-solutions/codex-plugins" in (config_dir / "repos.json").read_text(encoding="utf-8")
 
 
+def test_linear_start_configure_repo_can_disable_linear_sync(tmp_path, monkeypatch):
+    config_dir = tmp_path / "config"
+    monkeypatch.setenv("LINEAR_SYNC_CONFIG_DIR", str(config_dir))
+    repo = init_git_repo(tmp_path / "repo")
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(ROOT / "plugins" / "linear-progress-sync" / "scripts" / "linear_start.py"),
+            "configure-repo",
+            "--root",
+            str(repo),
+            "--disable-linear-sync",
+            "--reason",
+            "No Linear tracking",
+        ],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    status = linear_sync.repo_binding_status(root=repo)
+
+    assert result.returncode == 0
+    assert status["disabled"] is True
+    assert status["binding"] == {"disabled": True, "reason": "No Linear tracking"}
+
+
 def test_setup_plan_is_global_by_default_and_does_not_install_repo_hook(tmp_path):
     plan = linear_sync.setup_plan(plugin_repo_root=ROOT, target_repo_root=tmp_path)
     commands = "\n".join(plan["commands"])
@@ -1402,7 +1458,9 @@ def test_setup_plan_is_global_by_default_and_does_not_install_repo_hook(tmp_path
     assert "codex mcp login linear" not in commands
     assert "codex mcp login linear after setup" in notes
     assert "review hooks" in notes
-    assert "First use in a repo asks which Linear team/project" in notes
+    assert "First use lists Linear users" in notes
+    assert "First use in a repo lists Linear teams/projects" in notes
+    assert "--disable-linear-sync" in notes
     assert "read-only allowlist" in notes
     assert "unknown scripts, tests, builds, writes, and branch creation" in notes
     assert "install_git_hook.py" not in commands
@@ -1447,7 +1505,8 @@ def test_setup_summary_prints_team_next_steps(capsys):
 
     assert "Run: codex mcp login linear" in output
     assert "trust the Linear Progress Sync hooks once" in output
-    assert "which Linear team/project to use" in output
+    assert "list Linear users/projects" in output
+    assert "--disable-linear-sync" in output
     assert "Before Linear kickoff, Bash is read-only allowlisted" in output
     assert "No per-repo setup is needed" in output
 
@@ -1590,9 +1649,12 @@ def test_plugin_exposes_linear_start_command_and_pre_tool_guard_hook():
     assert "linear_start.py activate" in command_text
     assert "linear_start.py user-profile" in command_text
     assert "linear_start.py configure-user" in command_text
+    assert "mcp__codex_apps__linear._list_users" in command_text
+    assert "mcp__linear.list_users" in command_text
     assert "activation_command" in command_text
     assert "repo-binding" in command_text
     assert "configure-repo" in command_text
+    assert "--disable-linear-sync" in command_text
     assert "mcp__linear." not in sync_command_text
     assert "mcp__codex_apps__linear._list_teams" in command_text
     assert "mcp__codex_apps__linear._list_projects" in command_text
@@ -1618,7 +1680,9 @@ def test_plugin_exposes_linear_start_command_and_pre_tool_guard_hook():
     assert "do not stop after listing projects" in command_text
     assert "do not answer with a code patch or say you are blocked" in command_text
     assert "do not answer with a code patch or say you are blocked" in skill_text
-    assert "ask them what their name on Linear is" in skill_text
+    assert "choose their Linear user from that list" in skill_text
+    assert "choose the project from that list" in skill_text
+    assert "--disable-linear-sync" in skill_text
     assert "configure-user" in skill_text
     assert "Do not create the Linear issue, branch, PR, or code changes until the chosen repo destination is saved" in skill_text
     assert "mcp__codex_apps__linear._list_comments" in sync_command_text

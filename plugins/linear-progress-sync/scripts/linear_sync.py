@@ -296,17 +296,27 @@ def repo_binding_status(*, root: str | Path | None = None) -> JsonDict:
     config = read_repo_bindings()
     repos = config.get("repos") if isinstance(config.get("repos"), dict) else {}
     binding = repos.get(repo) if isinstance(repos, dict) else None
+    disabled = isinstance(binding, dict) and binding.get("disabled") is True
     configured = (
         isinstance(binding, dict)
+        and not disabled
         and isinstance(binding.get("team"), str)
         and bool(binding.get("team", "").strip())
         and isinstance(binding.get("project"), str)
         and bool(binding.get("project", "").strip())
     )
+    if disabled:
+        returned_binding = {
+            "disabled": True,
+            "reason": str(binding.get("reason") or "").strip(),
+        }
+    else:
+        returned_binding = {"team": binding["team"], "project": binding["project"]} if configured else None
     return {
         "repo": repo,
         "configured": configured,
-        "binding": {"team": binding["team"], "project": binding["project"]} if configured else None,
+        "disabled": disabled,
+        "binding": returned_binding,
         "config_path": str(repo_bindings_path()),
     }
 
@@ -323,6 +333,26 @@ def save_repo_linear_binding(
     config = read_repo_bindings()
     repos = config.setdefault("repos", {})
     repos[repo] = {"team": team.strip(), "project": project.strip()}
+    save_repo_bindings(config)
+    return {
+        "repo": repo,
+        "binding": repos[repo],
+        "config_path": str(repo_bindings_path()),
+    }
+
+
+def save_repo_linear_opt_out(
+    *,
+    reason: str | None = None,
+    root: str | Path | None = None,
+) -> JsonDict:
+    repo = repo_identity(root)
+    config = read_repo_bindings()
+    repos = config.setdefault("repos", {})
+    binding: JsonDict = {"disabled": True}
+    if reason and str(reason).strip():
+        binding["reason"] = str(reason).strip()
+    repos[repo] = binding
     save_repo_bindings(config)
     return {
         "repo": repo,
@@ -921,8 +951,9 @@ def setup_plan(
             "GitHub auth is a manual prerequisite: run gh auth login when needed.",
             "Linear auth is manual after setup registers the MCP server: run codex mcp login linear after setup when needed.",
             "If Codex asks to review hooks, trust the Linear Progress Sync hooks once so automatic kickoff can run.",
-            "First use asks for the user's Linear name and saves it in ~/.codex/linear-sync/user.json for all repos.",
-            "First use in a repo asks which Linear team/project to use and saves it in ~/.codex/linear-sync/repos.json.",
+            "First use lists Linear users, asks which user to save, and stores it in ~/.codex/linear-sync/user.json for all repos.",
+            "First use in a repo lists Linear teams/projects, asks which project to save, and stores it in ~/.codex/linear-sync/repos.json.",
+            "Repos that should not use Linear sync can be opted out with linear_start.py configure-repo --disable-linear-sync.",
             "Before kickoff, Bash is a read-only allowlist; unknown scripts, tests, builds, writes, and branch creation wait for active Linear state.",
             "Per-repo Git hook setup is optional and only needed to sync commits made outside Codex.",
             "Start a new Codex thread after installing or updating the plugin so hooks and skills reload.",
@@ -1744,6 +1775,9 @@ def pre_tool_guard_decision(payload: JsonDict, *, root: str | Path | None = None
     }
     user_profile_required = not linear_user_profile_configured()
     guard_enabled = linear_guard_enabled(root=root)
+    guard_disabled = linear_guard_disabled(root=root)
+    if guard_disabled and not is_linear_write:
+        return PreToolGuardDecision(False)
     if normalized_tool == "bash":
         command = tool_command(payload)
         if is_linear_start_command(command):
@@ -1797,10 +1831,16 @@ def pre_tool_guard_decision(payload: JsonDict, *, root: str | Path | None = None
 
 
 def linear_guard_enabled(*, root: str | Path | None = None) -> bool:
+    if linear_guard_disabled(root=root):
+        return False
     loaded = load_active_issue(root=root)
     if loaded.exists:
         return True
     return bool(repo_binding_status(root=root).get("configured"))
+
+
+def linear_guard_disabled(*, root: str | Path | None = None) -> bool:
+    return bool(repo_binding_status(root=root).get("disabled"))
 
 
 def linear_start_script_path() -> str:
@@ -1943,8 +1983,9 @@ def linear_user_profile_required_message(*, root: str | Path | None = None) -> s
     repo_arg = shlex.quote(linear_guard_repo_arg(root=root))
     return (
         "LINEAR USER REQUIRED. Do not write code, create branches, create Linear issues, or continue kickoff "
-        "until the global Linear user profile is saved. Your next action must be to ask the human what their "
-        "name on Linear is, then save it globally with "
+        "until the global Linear user profile is saved. Your next action must be to list Linear users with "
+        "mcp__codex_apps__linear._list_users or mcp__linear.list_users, present the active human users, "
+        "ask the human to choose their Linear user from that list, then save the selected Linear `name` globally with "
         f"`python3 {linear_start_script_path()} configure-user --linear-name \"<Linear user name>\"`. "
         f"You can inspect the current value with `python3 {linear_start_script_path()} user-profile --root "
         f"{repo_arg}`. After this is saved, assign new Linear issues to that stored user, append "
@@ -1962,8 +2003,8 @@ def continue_kickoff_instruction(
     if needs_binding:
         hard_stop = (
             "LINEAR DESTINATION REQUIRED. Do not answer with a code patch, do not say you are blocked, "
-            "and do not stop. Your next action must be to list Linear teams/projects, then ask the human "
-            "which Linear team/project this repo should use. "
+            "and do not stop. Your next action must be to list Linear teams/projects, present the Linear "
+            "project list, then ask the human to choose the Linear project from that list. "
             if include_hard_stop
             else ""
         )
@@ -1976,7 +2017,9 @@ def continue_kickoff_instruction(
             "mcp__codex_apps__linear._list_projects, or mcp__linear.list_teams and "
             "mcp__linear.list_projects. If the session exposes short Linear aliases like list_teams or "
             "list_projects, use those aliases. If save_issue is not visible yet, search/load Linear tools "
-            "and do not stop after listing projects. Save the chosen destination with "
+            "and do not stop after listing projects. Present the Linear project list and ask the human to "
+            "choose the Linear project from that list; do not ask them to type an unconstrained project name. "
+            "Save the chosen destination with "
             f"`python3 {linear_start_script_path()} configure-repo --root "
             f"{shlex.quote(linear_guard_repo_arg(root=root))} --team \"<Linear team>\" "
             "--project \"<Linear project>\"`. Then create the Linear issue with "
@@ -2037,8 +2080,9 @@ def linear_repo_binding_required_message(*, root: str | Path | None = None) -> s
         "Create a new Linear issue from the user's implementation request unless the user explicitly "
         "supplied an existing issue key. First call mcp__codex_apps__linear._list_teams and "
         "mcp__codex_apps__linear._list_projects, or mcp__linear.list_teams and mcp__linear.list_projects "
-        "if the direct Linear namespace is exposed; ask the user only which Linear team/project this repo "
-        "should use; save it with linear_start.py configure-repo before creating the issue, branch, or PR. "
+        "if the direct Linear namespace is exposed; present the Linear project list and ask the user only "
+        "which Linear team/project this repo should use; save it with linear_start.py configure-repo before "
+        "creating the issue, branch, or PR. "
         f"{continue_kickoff_instruction(root=root, needs_binding=True, include_hard_stop=False)}"
     )
 

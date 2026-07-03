@@ -11,13 +11,15 @@ Start Linear-linked implementation work before any code edits.
 - `root`: target repository root. If omitted, use the current working repository.
 - `dry-run`: print the local GitHub kickoff plan without changing GitHub or active state.
 - `configure`: update the saved Linear team/project binding for this repo.
+- `disable-linear-sync`: opt this repo out of Linear kickoff enforcement.
 
 ## Workflow
 
 1. Resolve the global Linear user profile.
    - Run `python3 <plugin-root>/scripts/linear_start.py user-profile --root <root>`.
-   - If no profile exists, ask the user once what their name on Linear is.
-   - Save the answer with:
+   - If no profile exists, call `mcp__codex_apps__linear._list_users` and present the active human users. If the direct Linear MCP namespace is exposed instead, use `mcp__linear.list_users`.
+   - Ask the user once to choose their Linear user from that list.
+   - Save the selected Linear `name` with:
 
      ```bash
      python3 <plugin-root>/scripts/linear_start.py configure-user \
@@ -29,9 +31,18 @@ Start Linear-linked implementation work before any code edits.
 
 2. Resolve this repo's Linear destination.
    - Run `python3 <plugin-root>/scripts/linear_start.py repo-binding --root <root>`.
-   - If no binding exists, call `mcp__codex_apps__linear._list_teams` and `mcp__codex_apps__linear._list_projects`, then ask the user once which team/project this repo should use.
+   - If no binding exists, call `mcp__codex_apps__linear._list_teams` and `mcp__codex_apps__linear._list_projects`, present the Linear project list, then ask the user once to choose the project from that list.
    - If the direct Linear MCP namespace is exposed instead, use `mcp__linear.list_teams` and `mcp__linear.list_projects`.
    - If the session exposes short Linear aliases like `list_teams` or `list_projects`, use those aliases. If create/update tools are not visible after listing, search/load Linear tools; do not stop after listing projects.
+   - If the user says this repo should not use Linear sync, save the opt-out with:
+
+     ```bash
+     python3 <plugin-root>/scripts/linear_start.py configure-repo \
+       --root <root> \
+       --disable-linear-sync \
+       --reason "<reason>"
+     ```
+
    - Save the answer with:
 
      ```bash
@@ -42,8 +53,9 @@ Start Linear-linked implementation work before any code edits.
    ```
 
    - Future kickoff in this repo uses the saved binding automatically.
+   - Future work in an opted-out repo is allowed without Linear kickoff until a normal team/project binding is saved again.
    - Do not create the Linear issue, branch, PR, or code changes until the chosen repo destination is saved.
-   - If a write is blocked because no repo destination is saved, do not answer with a code patch or say you are blocked. Continue by listing Linear destinations and asking the user which team/project this repo should use.
+   - If a write is blocked because no repo destination is saved, do not answer with a code patch or say you are blocked. Continue by listing Linear destinations and asking the user to choose from the Linear project list.
 
 3. Resolve the Linear issue.
    - If `issue` is present, read it with `mcp__codex_apps__linear._get_issue` or `mcp__codex_apps__linear._fetch` using the known issue identifier. If the direct Linear MCP namespace is exposed instead, use `mcp__linear.get_issue`.
