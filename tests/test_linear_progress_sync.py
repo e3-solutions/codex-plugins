@@ -874,20 +874,39 @@ def test_pre_tool_guard_blocks_chained_branch_creation_after_kickoff_helper(tmp_
         assert decision.blocked is True, command
 
 
-def test_pre_tool_guard_allows_read_only_and_kickoff_commands_without_active_state(tmp_path, monkeypatch):
+def test_pre_tool_guard_blocks_kickoff_until_global_linear_user_profile_is_saved(tmp_path, monkeypatch):
     monkeypatch.setenv("LINEAR_SYNC_STATE_DIR", str(tmp_path))
+    monkeypatch.setenv("LINEAR_SYNC_CONFIG_DIR", str(tmp_path / "config"))
 
     read_decision = linear_sync.pre_tool_guard_decision(
         {"tool_name": "Bash", "command": "git status --short"},
         root=tmp_path,
     )
-    kickoff_decision = linear_sync.pre_tool_guard_decision(
+    missing_user_decision = linear_sync.pre_tool_guard_decision(
+        {"tool_name": "Bash", "command": "python3 plugins/linear-progress-sync/scripts/linear_start.py kickoff"},
+        root=tmp_path,
+    )
+    profile_decision = linear_sync.pre_tool_guard_decision(
+        {
+            "tool_name": "Bash",
+            "command": (
+                "python3 plugins/linear-progress-sync/scripts/linear_start.py "
+                "configure-user --linear-name 'Arya G'"
+            ),
+        },
+        root=tmp_path,
+    )
+    linear_sync.save_linear_user_profile(linear_name="Arya G")
+    ready_decision = linear_sync.pre_tool_guard_decision(
         {"tool_name": "Bash", "command": "python3 plugins/linear-progress-sync/scripts/linear_start.py kickoff"},
         root=tmp_path,
     )
 
     assert read_decision.blocked is False
-    assert kickoff_decision.blocked is False
+    assert missing_user_decision.blocked is True
+    assert "LINEAR USER REQUIRED" in missing_user_decision.message
+    assert profile_decision.blocked is False
+    assert ready_decision.blocked is False
 
 
 def test_enqueue_event_carries_active_issue_key(tmp_path, monkeypatch):
@@ -1412,6 +1431,31 @@ def test_codex_prompt_includes_linear_user_footer(tmp_path, monkeypatch):
     )
 
     assert "Codex bot: Arya G at 2026-07-03T18:42:10+00:00" in prompt
+
+
+def test_codex_prompt_uses_one_timestamp_when_now_is_implicit(tmp_path, monkeypatch):
+    monkeypatch.setenv("LINEAR_SYNC_CONFIG_DIR", str(tmp_path / "config"))
+    linear_sync.save_linear_user_profile(linear_name="Arya G")
+
+    class FakeDateTime(datetime):
+        calls = 0
+
+        @classmethod
+        def now(cls, tz=None):
+            cls.calls += 1
+            second = 10 if cls.calls == 1 else 11
+            value = datetime(2026, 7, 3, 18, 42, second, tzinfo=timezone.utc)
+            return value if tz is None else value.astimezone(tz)
+
+    monkeypatch.setattr(linear_sync, "datetime", FakeDateTime)
+
+    prompt = linear_sync.build_codex_prompt(
+        {"type": "post_commit", "commit_sha": "abc", "commit_subject": "COR-9 work"},
+        linear_sync.IssueInference("COR-9", 0.95, "branch"),
+    )
+
+    assert "Codex bot: Arya G at 2026-07-03T18:42:10+00:00" in prompt
+    assert "Codex bot: Arya G at 2026-07-03T18:42:11+00:00" not in prompt
 
 
 def test_foreground_prepare_returns_eligible_event_without_mutation(tmp_path, monkeypatch):

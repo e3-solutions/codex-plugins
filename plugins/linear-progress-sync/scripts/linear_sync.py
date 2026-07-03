@@ -1629,6 +1629,7 @@ def skip_foreground_event(
 
 def build_codex_prompt(event: JsonDict, inference: IssueInference, *, now: datetime | None = None) -> str:
     event_json = json.dumps(event, indent=2, sort_keys=True)
+    comment_now = now or datetime.now(timezone.utc)
     if event.get("type") == "session_progress":
         comment_template = """Codex session progress update
 
@@ -1650,8 +1651,8 @@ Changed areas:
 
 Status:
 - Work appears to be in progress."""
-    comment_template = with_codex_attribution(comment_template, now=now)
-    footer = codex_attribution_footer(now=now)
+    comment_template = with_codex_attribution(comment_template, now=comment_now)
+    footer = codex_attribution_footer(now=comment_now)
 
     return f"""You are Linear Progress Sync running inside Codex.
 
@@ -1735,6 +1736,8 @@ def pre_tool_guard_decision(payload: JsonDict, *, root: str | Path | None = None
     if normalized_tool == "bash":
         command = tool_command(payload)
         if is_linear_start_command(command):
+            if user_profile_required and not linear_start_allowed_without_user_profile(command):
+                return PreToolGuardDecision(True, linear_user_profile_required_message(root=root))
             return PreToolGuardDecision(False)
         if looks_like_branch_creation(command):
             if user_profile_required:
@@ -2525,39 +2528,60 @@ def git_branch_args_are_read_only(args: list[str]) -> bool:
 
 
 def is_linear_start_command(command: str) -> bool:
+    return linear_start_command_subcommands(command) is not None
+
+
+def linear_start_allowed_without_user_profile(command: str) -> bool:
+    subcommands = linear_start_command_subcommands(command)
+    return bool(subcommands) and all(subcommand in {"user-profile", "configure-user"} for subcommand in subcommands)
+
+
+def linear_start_command_subcommands(command: str) -> list[str] | None:
     if shell_command_has_write_redirection(command):
-        return False
+        return None
     segments = shell_command_tokens(command or "")
-    return bool(segments) and all(command_tokens_are_linear_start(tokens) for tokens in segments)
+    if not segments:
+        return None
+    subcommands = [linear_start_subcommand_from_tokens(tokens) for tokens in segments]
+    if any(subcommand is None for subcommand in subcommands):
+        return None
+    return [str(subcommand) for subcommand in subcommands]
 
 
 def command_tokens_are_linear_start(tokens: list[str]) -> bool:
+    return linear_start_subcommand_from_tokens(tokens) is not None
+
+
+def linear_start_subcommand_from_tokens(tokens: list[str]) -> str | None:
     tokens = strip_env_prefix(tokens)
     if not tokens:
-        return False
+        return None
     executable = Path(tokens[0]).name
     script_index = 0
     if executable in {"python", "python3"}:
         if len(tokens) < 2:
-            return False
+            return None
         script_index = 1
     elif executable == "linear_start.py":
         script_index = 0
     elif tokens[0] == "/linear-start":
-        return True
+        return "/linear-start"
     else:
-        return False
+        return None
     script = Path(tokens[script_index]).name
     if script != "linear_start.py":
-        return False
-    return len(tokens) > script_index + 1 and tokens[script_index + 1] in {
+        return None
+    if len(tokens) <= script_index + 1:
+        return None
+    subcommand = tokens[script_index + 1]
+    return subcommand if subcommand in {
         "kickoff",
         "activate",
         "repo-binding",
         "configure-repo",
         "user-profile",
         "configure-user",
-    }
+    } else None
 
 
 
