@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import importlib.util
+import hashlib
 import json
 import subprocess
 import sys
+import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -23,6 +25,50 @@ setup_spec = importlib.util.spec_from_file_location("linear_setup", SETUP_PATH)
 linear_setup = importlib.util.module_from_spec(setup_spec)
 assert setup_spec.loader is not None
 setup_spec.loader.exec_module(linear_setup)
+
+UPDATE_PATH = ROOT / "plugins" / "linear-progress-sync" / "scripts" / "update_plugin.py"
+
+
+def load_update_plugin():
+    update_spec = importlib.util.spec_from_file_location("linear_update_plugin", UPDATE_PATH)
+    update_plugin = importlib.util.module_from_spec(update_spec)
+    assert update_spec.loader is not None
+    update_spec.loader.exec_module(update_plugin)
+    return update_plugin
+
+
+def write_minimal_plugin(path: Path, *, version: str) -> Path:
+    plugin = path / "linear-progress-sync"
+    (plugin / ".codex-plugin").mkdir(parents=True)
+    (plugin / "scripts").mkdir()
+    (plugin / "hooks").mkdir()
+    (plugin / ".codex-plugin" / "plugin.json").write_text(
+        json.dumps(
+            {
+                "name": "linear-progress-sync",
+                "version": version,
+                "hooks": "./hooks/hooks.json",
+                "skills": "./skills/",
+            },
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (plugin / "scripts" / "linear_sync.py").write_text(f"VERSION = {version!r}\n", encoding="utf-8")
+    (plugin / "hooks" / "hooks.json").write_text('{"hooks": {}}\n', encoding="utf-8")
+    return plugin
+
+
+def make_plugin_archive(tmp_path: Path, *, version: str) -> tuple[Path, str]:
+    payload_root = tmp_path / "payload" / "codex-plugins-main" / "plugins"
+    plugin = write_minimal_plugin(payload_root, version=version)
+    archive = tmp_path / f"linear-progress-sync-{version}.zip"
+    with zipfile.ZipFile(archive, "w") as zip_file:
+        for path in plugin.rglob("*"):
+            zip_file.write(path, path.relative_to(tmp_path / "payload"))
+    digest = hashlib.sha256(archive.read_bytes()).hexdigest()
+    return archive, digest
 
 
 def init_git_repo(path: Path, branch: str = "arya/cor-1-work") -> Path:
@@ -1461,6 +1507,8 @@ def test_setup_plan_is_global_by_default_and_does_not_install_repo_hook(tmp_path
     assert "First use lists Linear users" in notes
     assert "First use in a repo lists Linear teams/projects" in notes
     assert "--disable-linear-sync" in notes
+    assert "SessionStart" in notes
+    assert "LINEAR_SYNC_AUTO_UPDATE=0" in notes
     assert "read-only allowlist" in notes
     assert "unknown scripts, tests, builds, writes, and branch creation" in notes
     assert "install_git_hook.py" not in commands
@@ -1507,8 +1555,123 @@ def test_setup_summary_prints_team_next_steps(capsys):
     assert "trust the Linear Progress Sync hooks once" in output
     assert "list Linear users/projects" in output
     assert "--disable-linear-sync" in output
+    assert "LINEAR_SYNC_AUTO_UPDATE=0" in output
     assert "Before Linear kickoff, Bash is read-only allowlisted" in output
     assert "No per-repo setup is needed" in output
+
+
+def test_update_plugin_installs_newer_manifest_archive(tmp_path, monkeypatch):
+    update_plugin = load_update_plugin()
+    monkeypatch.setenv("LINEAR_SYNC_CONFIG_DIR", str(tmp_path / "config"))
+    cache_parent = tmp_path / "cache" / "coreedge-local" / "linear-progress-sync"
+    current = write_minimal_plugin(cache_parent / "0.2.0", version="0.2.0")
+    archive, digest = make_plugin_archive(tmp_path, version="0.2.1")
+    manifest = tmp_path / "latest.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "version": "0.2.1",
+                "archive_url": archive.as_uri(),
+                "sha256": digest,
+                "plugin_subdir": "plugins/linear-progress-sync",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = update_plugin.run_update(
+        current_plugin_root=current,
+        cache_parent=cache_parent,
+        manifest_url=manifest.as_uri(),
+        state_path=tmp_path / "update-state.json",
+        force=True,
+        install_hooks=False,
+    )
+
+    installed_manifest = json.loads((cache_parent / "0.2.1" / ".codex-plugin" / "plugin.json").read_text())
+    assert result["updated"] is True
+    assert result["installed_version"] == "0.2.1"
+    assert installed_manifest["version"] == "0.2.1"
+
+
+def test_update_plugin_rejects_archive_with_wrong_sha(tmp_path, monkeypatch):
+    update_plugin = load_update_plugin()
+    monkeypatch.setenv("LINEAR_SYNC_CONFIG_DIR", str(tmp_path / "config"))
+    cache_parent = tmp_path / "cache" / "coreedge-local" / "linear-progress-sync"
+    current = write_minimal_plugin(cache_parent / "0.2.0", version="0.2.0")
+    archive, _digest = make_plugin_archive(tmp_path, version="0.2.1")
+    manifest = tmp_path / "latest.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "version": "0.2.1",
+                "archive_url": archive.as_uri(),
+                "sha256": "0" * 64,
+                "plugin_subdir": "plugins/linear-progress-sync",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="SHA256 mismatch"):
+        update_plugin.run_update(
+            current_plugin_root=current,
+            cache_parent=cache_parent,
+            manifest_url=manifest.as_uri(),
+            state_path=tmp_path / "update-state.json",
+            force=True,
+            install_hooks=False,
+        )
+
+    assert not (cache_parent / "0.2.1").exists()
+
+
+def test_update_plugin_skips_recent_check(tmp_path):
+    update_plugin = load_update_plugin()
+    state_path = tmp_path / "update-state.json"
+    update_plugin.write_update_state(
+        state_path,
+        {"last_checked_at": "2026-07-03T18:00:00+00:00"},
+    )
+
+    result = update_plugin.run_update(
+        current_plugin_root=write_minimal_plugin(tmp_path / "current", version="0.2.0"),
+        cache_parent=tmp_path / "cache",
+        manifest_url=(tmp_path / "missing.json").as_uri(),
+        state_path=state_path,
+        now=datetime(2026, 7, 3, 18, 30, tzinfo=timezone.utc),
+        interval_seconds=3600,
+        install_hooks=False,
+    )
+
+    assert result["updated"] is False
+    assert result["skipped"] == "not due"
+
+
+def test_maybe_spawn_auto_update_passes_state_path(tmp_path, monkeypatch):
+    update_plugin = load_update_plugin()
+    calls = []
+
+    def fake_popen(args, **kwargs):
+        calls.append((args, kwargs))
+        return object()
+
+    monkeypatch.setattr(update_plugin.subprocess, "Popen", fake_popen)
+    state_path = tmp_path / "update-state.json"
+
+    result = update_plugin.maybe_spawn_auto_update(
+        plugin_root=tmp_path / "plugin",
+        state_path=state_path,
+    )
+
+    assert result == {"spawned": True}
+    args, kwargs = calls[0]
+    assert "--plugin-root" in args
+    assert "--state-path" in args
+    assert str(state_path) in args
+    assert kwargs["stdout"] == subprocess.DEVNULL
+    assert kwargs["stderr"] == subprocess.DEVNULL
+    assert kwargs["stdin"] == subprocess.DEVNULL
 
 
 def test_install_codex_hooks_merges_existing_user_hooks(tmp_path):
@@ -1556,6 +1719,8 @@ def test_readmes_register_linear_mcp_before_linear_login():
         assert "Run this once per teammate, not once per repo" in text
         assert "trust the Linear Progress Sync hooks once" in text
         assert "saves it in `~/.codex/linear-sync/repos.json`" in text
+        assert "update_plugin.py --force" in text
+        assert "LINEAR_SYNC_AUTO_UPDATE=0" in text
         assert "Bash uses a read-only allowlist" in text
         assert "Unknown scripts, tests, builds, file writes, and branch creation wait" in text
 
@@ -1639,9 +1804,13 @@ def test_plugin_exposes_linear_start_command_and_pre_tool_guard_hook():
     manifest = json.loads((ROOT / "plugins/linear-progress-sync/.codex-plugin/plugin.json").read_text(encoding="utf-8"))
     command = ROOT / "plugins/linear-progress-sync/commands/linear-start.md"
     skill = ROOT / "plugins/linear-progress-sync/skills/linear-progress-sync/SKILL.md"
+    session_start = ROOT / "plugins/linear-progress-sync/scripts/session_start.py"
+    update_script = ROOT / "plugins/linear-progress-sync/scripts/update_plugin.py"
     assert command.exists()
+    assert update_script.exists()
     command_text = command.read_text(encoding="utf-8")
     skill_text = skill.read_text(encoding="utf-8")
+    session_start_text = session_start.read_text(encoding="utf-8")
     sync_command_text = (ROOT / "plugins/linear-progress-sync/commands/sync-linear-progress.md").read_text(
         encoding="utf-8"
     )
@@ -1683,9 +1852,12 @@ def test_plugin_exposes_linear_start_command_and_pre_tool_guard_hook():
     assert "choose their Linear user from that list" in skill_text
     assert "choose the project from that list" in skill_text
     assert "--disable-linear-sync" in skill_text
+    assert "update_plugin.py --force" in skill_text
+    assert "LINEAR_SYNC_AUTO_UPDATE=0" in skill_text
     assert "configure-user" in skill_text
     assert "Do not create the Linear issue, branch, PR, or code changes until the chosen repo destination is saved" in skill_text
     assert "mcp__codex_apps__linear._list_comments" in sync_command_text
+    assert "maybe_spawn_auto_update" in session_start_text
     assert manifest["hooks"] == "./hooks/hooks.json"
     for rel in (
         "plugins/linear-progress-sync/hooks.json",

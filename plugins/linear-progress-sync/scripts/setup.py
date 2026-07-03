@@ -116,6 +116,7 @@ def print_summary(result: dict) -> None:
         print("- GitHub auth is checked by setup; run gh auth login if that step failed.")
         print("- Linear auth is manual; setup registers the MCP server but does not log you in.")
         print("- Repos can opt out with linear_start.py configure-repo --disable-linear-sync.")
+        print("- Installed plugins check for updates on SessionStart; set LINEAR_SYNC_AUTO_UPDATE=0 to disable.")
         print("- Before Linear kickoff, Bash is read-only allowlisted.")
         print("- Unknown scripts, tests, builds, writes, and branch creation wait for active Linear state.")
         print("- No per-repo setup is needed unless you want the optional outside-Codex Git commit hook.")

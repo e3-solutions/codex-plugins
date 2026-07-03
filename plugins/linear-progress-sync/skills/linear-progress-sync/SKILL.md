@@ -69,6 +69,18 @@ Set up the plugin, GitHub CLI check, and Linear MCP once:
 python3 plugins/linear-progress-sync/scripts/setup.py
 ```
 
+Installed plugin caches check for updates on SessionStart at most every six hours. Disable this with:
+
+```bash
+LINEAR_SYNC_AUTO_UPDATE=0
+```
+
+Force a manual update check when needed:
+
+```bash
+python3 ~/.codex/plugins/cache/coreedge-local/linear-progress-sync/0.2.1/scripts/update_plugin.py --force
+```
+
 If Codex asks to review hooks after setup, trust the Linear Progress Sync hooks once. Automatic kickoff depends on those hooks running.
 
 Authenticate Linear after setup registers the MCP server when needed:
