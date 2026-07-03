@@ -1,0 +1,26 @@
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh -c 'script=$(ls -td \"$HOME\"/.codex/plugins/cache/*/codex-session-logging/*/scripts/user_prompt_submit.py 2>/dev/null | head -n 1); [ -n \"$script\" ] && exec python3 \"$script\" || exit 0'",
+            "statusMessage": "Capturing Codex prompt"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh -c 'script=$(ls -td \"$HOME\"/.codex/plugins/cache/*/codex-session-logging/*/scripts/stop.py 2>/dev/null | head -n 1); [ -n \"$script\" ] && exec python3 \"$script\" || exit 0'",
+            "statusMessage": "Capturing Codex response"
+          }
+        ]
+      }
+    ]
+  }
+}
