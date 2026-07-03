@@ -439,6 +439,34 @@ def test_pre_tool_guard_blocks_until_global_linear_user_profile_is_saved(tmp_pat
     assert "Linear kickoff has not created active issue state" in ready_for_kickoff.message
 
 
+@pytest.mark.parametrize(
+    "tool",
+    [
+        "mcp__codex_apps__linear._save_issue",
+        "mcp__codex_apps__linear._save_comment",
+        "mcp__linear.save_issue",
+        "mcp__linear.save_comment",
+        "save_issue",
+        "save_comment",
+    ],
+)
+def test_pre_tool_guard_blocks_linear_writes_until_global_user_profile_is_saved(tmp_path, monkeypatch, tool):
+    state_dir = tmp_path / "state"
+    config_dir = tmp_path / "config"
+    monkeypatch.setenv("LINEAR_SYNC_STATE_DIR", str(state_dir))
+    monkeypatch.setenv("LINEAR_SYNC_CONFIG_DIR", str(config_dir))
+    repo = init_git_repo(tmp_path / "repo", branch="arya/profile-required")
+    linear_sync.save_repo_linear_binding(team="Engineering", project="Codex Plugins", root=repo)
+
+    missing_user = linear_sync.pre_tool_guard_decision({"tool_name": tool}, root=repo)
+    linear_sync.save_linear_user_profile(linear_name="Arya G")
+    ready = linear_sync.pre_tool_guard_decision({"tool_name": tool}, root=repo)
+
+    assert missing_user.blocked is True
+    assert missing_user.message.startswith("LINEAR USER REQUIRED")
+    assert ready.blocked is False
+
+
 def test_pre_tool_guard_blocks_unbound_repo_writes_until_linear_destination_is_saved(tmp_path, monkeypatch):
     state_dir = tmp_path / "state"
     config_dir = tmp_path / "config"

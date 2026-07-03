@@ -1733,6 +1733,7 @@ def read_stdin_json() -> JsonDict:
 def pre_tool_guard_decision(payload: JsonDict, *, root: str | Path | None = None) -> PreToolGuardDecision:
     tool = tool_name(payload)
     normalized_tool = tool.lower()
+    is_linear_write = linear_tool_is_write(normalized_tool)
     requires_active_state = normalized_tool in {
         "apply_patch",
         "edit",
@@ -1785,6 +1786,9 @@ def pre_tool_guard_decision(payload: JsonDict, *, root: str | Path | None = None
             return PreToolGuardDecision(True, linear_kickoff_required_message(problem, root=root))
         return PreToolGuardDecision(False)
 
+    if is_linear_write and user_profile_required:
+        return PreToolGuardDecision(True, linear_user_profile_required_message(root=root))
+
     return PreToolGuardDecision(False)
 
 
@@ -1797,6 +1801,17 @@ def linear_guard_enabled(*, root: str | Path | None = None) -> bool:
 
 def linear_start_script_path() -> str:
     return str(Path(__file__).with_name("linear_start.py"))
+
+
+def linear_tool_is_write(normalized_tool: str) -> bool:
+    return normalized_tool in {
+        "mcp__codex_apps__linear._save_issue",
+        "mcp__codex_apps__linear._save_comment",
+        "mcp__linear.save_issue",
+        "mcp__linear.save_comment",
+        "save_issue",
+        "save_comment",
+    }
 
 
 def linear_guard_repo_arg(*, root: str | Path | None = None) -> str:
