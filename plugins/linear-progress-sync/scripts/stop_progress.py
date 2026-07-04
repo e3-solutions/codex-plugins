@@ -6,6 +6,7 @@ import json
 from linear_sync import (
     enqueue_event,
     first_issue_key,
+    linear_guard_disabled,
     read_state,
     read_stdin_json,
     session_progress_payload,
@@ -15,6 +16,8 @@ from linear_sync import (
 
 
 def main() -> None:
+    if linear_guard_disabled():
+        return
     payload = session_progress_payload(read_stdin_json())
     if payload is None:
         return
@@ -28,4 +31,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

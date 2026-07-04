@@ -12,6 +12,7 @@ from linear_sync import (
     run_linear_start,
     save_linear_user_profile,
     save_repo_linear_binding,
+    save_repo_linear_opt_out,
 )
 
 
@@ -45,8 +46,10 @@ def main() -> None:
 
     configure = sub.add_parser("configure-repo", help="Save Linear team/project binding for this repo.")
     cli_root_arg(configure)
-    configure.add_argument("--team", required=True)
-    configure.add_argument("--project", required=True)
+    configure.add_argument("--team")
+    configure.add_argument("--project")
+    configure.add_argument("--disable-linear-sync", action="store_true", help="Opt this repo out of Linear kickoff enforcement.")
+    configure.add_argument("--reason", help="Optional reason when opting this repo out of Linear sync.")
 
     user_profile = sub.add_parser("user-profile", help="Print saved global Linear user profile.")
     cli_root_arg(user_profile)
@@ -83,7 +86,12 @@ def main() -> None:
     elif args.command == "repo-binding":
         print(json.dumps(repo_binding_status(root=args.root), indent=2, sort_keys=True))
     elif args.command == "configure-repo":
-        result = save_repo_linear_binding(team=args.team, project=args.project, root=args.root)
+        if args.disable_linear_sync:
+            result = save_repo_linear_opt_out(reason=args.reason, root=args.root)
+        else:
+            if not args.team or not args.project:
+                parser.error("configure-repo requires --team and --project unless --disable-linear-sync is set")
+            result = save_repo_linear_binding(team=args.team, project=args.project, root=args.root)
         print(json.dumps(result, indent=2, sort_keys=True))
     elif args.command == "user-profile":
         print(json.dumps(linear_user_profile_status(), indent=2, sort_keys=True))

@@ -5,6 +5,12 @@ from linear_sync import ensure_state, read_state
 
 
 def main() -> None:
+    try:
+        from update_plugin import maybe_spawn_auto_update
+
+        maybe_spawn_auto_update()
+    except Exception:
+        pass
     ensure_state()
     state = read_state()
     cache = state.get("stale_issue_cache") or {}
@@ -23,4 +29,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
