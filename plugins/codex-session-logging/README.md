@@ -18,7 +18,7 @@ Default URL:
 https://pmdfllwuctzkdjiehezq.supabase.co
 ```
 
-Apply the schema in `supabase/migrations/001_codex_session_logging.sql`.
+Apply the SQL files in `supabase/migrations` in order.
 
 ## Environment
 

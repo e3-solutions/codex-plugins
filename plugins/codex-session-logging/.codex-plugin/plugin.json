@@ -11,6 +11,7 @@
     "logging",
     "supabase"
   ],
+  "hooks": "./hooks/hooks.json",
   "interface": {
     "displayName": "Codex Session Logging",
     "shortDescription": "Capture prompt and assistant message history.",

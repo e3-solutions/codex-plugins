@@ -113,7 +113,7 @@ def capture_hook_event(payload: JsonDict, *, event_name: str | None = None) -> J
         "uploaded_at": None,
     }
     append_jsonl(base / "events.jsonl", event)
-    append_jsonl(base / "queue.jsonl", event)
+    enqueue_record(base, event)
     try_auto_drain()
     return event
 
@@ -231,29 +231,62 @@ def append_jsonl(path: Path, payload: JsonDict) -> None:
         handle.write(json.dumps(payload, sort_keys=True) + "\n")
 
 
-def drain_queue() -> JsonDict:
-    base = ensure_state_dir()
+def enqueue_record(base: Path, record: JsonDict) -> None:
+    write_json_atomic(queue_record_path(base, record), record)
+
+
+def queue_record_path(base: Path, record: JsonDict) -> Path:
+    record_id = safe_segment(str(record["id"]))
+    return base / "queue" / f"{record_id}.json"
+
+
+def pending_queue_paths(base: Path) -> list[Path]:
+    return sorted((base / "queue").glob("*.json"))
+
+
+def read_json_file(path: Path) -> JsonDict:
+    loaded = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(loaded, dict):
+        raise ValueError(f"{path} does not contain a JSON object")
+    return loaded
+
+
+def migrate_legacy_queue(base: Path) -> None:
     queue_path = base / "queue.jsonl"
     records = read_jsonl(queue_path)
     if not records:
+        return
+    for record in records:
+        enqueue_record(base, record)
+    queue_path.unlink(missing_ok=True)
+
+
+def drain_queue() -> JsonDict:
+    base = ensure_state_dir()
+    migrate_legacy_queue(base)
+    queue_paths = pending_queue_paths(base)
+    if not queue_paths:
         return {"uploaded": 0, "failed": 0, "remaining": 0}
 
     uploader = SupabaseUploader.from_env()
-    remaining: list[JsonDict] = []
     uploaded = 0
     failed = 0
-    for record in records:
+    for queue_path in queue_paths:
+        record: JsonDict | None = None
         try:
+            record = read_json_file(queue_path)
             uploader.upload_message(record, base=base)
         except Exception as exc:  # noqa: BLE001 - hook uploader must preserve queue on any failure.
             failed += 1
+            if record is None:
+                continue
             record["last_upload_error"] = str(exc)
             record["last_upload_failed_at"] = now_iso()
-            remaining.append(record)
+            write_json_atomic(queue_path, record)
         else:
             uploaded += 1
-    rewrite_jsonl(queue_path, remaining)
-    return {"uploaded": uploaded, "failed": failed, "remaining": len(remaining)}
+            queue_path.unlink(missing_ok=True)
+    return {"uploaded": uploaded, "failed": failed, "remaining": len(pending_queue_paths(base))}
 
 
 def try_auto_drain() -> None:
@@ -292,6 +325,18 @@ def rewrite_jsonl(path: Path, records: list[JsonDict]) -> None:
     path.write_text("".join(json.dumps(record, sort_keys=True) + "\n" for record in records), encoding="utf-8")
 
 
+def storage_path_for_user(record: JsonDict, user_id: str) -> str:
+    user_key = safe_segment(user_id)
+    existing_path = str(record.get("storage_path") or "")
+    parts = existing_path.split("/")
+    if len(parts) >= 6 and parts[0] == "users" and parts[2] == "sessions":
+        parts[1] = user_key
+        return "/".join(parts)
+    session_id = safe_segment(str(record["session_id"]))
+    role = safe_segment(str(record["role"]))
+    return f"users/{user_key}/sessions/{session_id}/messages/{int(record['seq']):06d}-{role}.json"
+
+
 class SupabaseUploader:
     def __init__(self, *, supabase_url: str, service_role_key: str, user_id: str, bucket: str) -> None:
         self.supabase_url = supabase_url.rstrip("/")
@@ -317,11 +362,12 @@ class SupabaseUploader:
     def upload_message(self, record: JsonDict, *, base: Path) -> None:
         content_path = base / str(record["local_content_path"])
         content = content_path.read_bytes()
-        self.storage_upload(str(record["storage_path"]), content)
+        storage_path = storage_path_for_user(record, self.user_id)
+        self.storage_upload(storage_path, content)
         session_row = {
             "id": record["session_id"],
             "user_id": self.user_id,
-            "storage_prefix": f"users/{self.user_id}/sessions/{record['session_id']}",
+            "storage_prefix": f"users/{safe_segment(self.user_id)}/sessions/{record['session_id']}",
             "metadata": record.get("metadata") or {},
             "updated_at": now_iso(),
         }
@@ -334,14 +380,14 @@ class SupabaseUploader:
             "seq": record["seq"],
             "role": record["role"],
             "storage_bucket": self.bucket,
-            "storage_path": record["storage_path"],
+            "storage_path": storage_path,
             "content_sha256": record["content_sha256"],
             "content_byte_size": record["content_byte_size"],
             "content_excerpt": record.get("content_excerpt"),
             "metadata": record.get("metadata") or {},
             "created_at": record["created_at"],
         }
-        self.rest_insert("codex_session_messages", message_row)
+        self.rest_upsert("codex_session_messages", message_row, conflict="id")
 
     def storage_upload(self, path: str, content: bytes) -> None:
         quoted_path = "/".join(urllib.parse.quote(part, safe="") for part in path.split("/"))
