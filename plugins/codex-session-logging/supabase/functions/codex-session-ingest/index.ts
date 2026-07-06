@@ -1,18 +1,32 @@
+import { sanitizeEventPayload } from "./event_sanitizer.ts";
+
 type JsonObject = Record<string, unknown>;
 
 const DEFAULT_BUCKET = "codex-sessions";
 const DEFAULT_ALLOWED_ORG = "e3-solutions";
 const DNS_NAMESPACE_UUID_BYTES = new Uint8Array([
-  0x6b, 0xa7, 0xb8, 0x10,
-  0x9d, 0xad,
-  0x11, 0xd1,
-  0x80, 0xb4,
-  0x00, 0xc0, 0x4f, 0xd4, 0x30, 0xc8,
+  0x6b,
+  0xa7,
+  0xb8,
+  0x10,
+  0x9d,
+  0xad,
+  0x11,
+  0xd1,
+  0x80,
+  0xb4,
+  0x00,
+  0xc0,
+  0x4f,
+  0xd4,
+  0x30,
+  0xc8,
 ]);
 
 const corsHeaders = {
   "access-control-allow-origin": "*",
-  "access-control-allow-headers": "authorization, x-client-info, apikey, content-type, x-codex-session-log-token",
+  "access-control-allow-headers":
+    "authorization, x-client-info, apikey, content-type, x-codex-session-log-token",
   "access-control-allow-methods": "POST, OPTIONS",
 };
 
@@ -40,16 +54,25 @@ Deno.serve(async (req) => {
       return jsonResponse({ error: "repo_not_allowed" }, 403);
     }
 
-    const gitEmail = requireString(client.git_email, "client.git_email").trim().toLowerCase();
-    const userId = userIdForEmail(gitEmail) ?? await deterministicUserIdForEmail(gitEmail);
+    const gitEmail = requireString(client.git_email, "client.git_email").trim()
+      .toLowerCase();
+    const userId = userIdForEmail(gitEmail) ??
+      await deterministicUserIdForEmail(gitEmail);
     const recordType = optionalString(record.type) ?? "message";
     const storagePath = storagePathForRecord(record, userId);
 
     if (recordType === "event") {
       const event = requireObject(payload.event, "event");
-      await uploadStorageObject(storagePath, event);
-      await upsertSession(record, client, userId, remote);
-      await upsertEvent(record, userId, storagePath);
+      const sanitizedEvent = sanitizeEventPayload(record, event);
+      await uploadStorageObject(storagePath, sanitizedEvent);
+      await upsertSession(
+        record,
+        client,
+        userId,
+        remote,
+        optionalObject(sanitizedEvent.metadata),
+      );
+      await upsertEvent(record, userId, storagePath, sanitizedEvent);
       return jsonResponse({
         ok: true,
         id: record.id,
@@ -93,7 +116,10 @@ function userIdForEmail(email: string): string | null {
 
 async function deterministicUserIdForEmail(email: string): Promise<string> {
   const normalizedEmail = email.trim().toLowerCase();
-  return uuidV5(`codex-session-logging:${normalizedEmail}`, DNS_NAMESPACE_UUID_BYTES);
+  return uuidV5(
+    `codex-session-logging:${normalizedEmail}`,
+    DNS_NAMESPACE_UUID_BYTES,
+  );
 }
 
 async function uuidV5(name: string, namespace: Uint8Array): Promise<string> {
@@ -110,12 +136,17 @@ async function uuidV5(name: string, namespace: Uint8Array): Promise<string> {
 }
 
 function formatUuid(bytes: Uint8Array): string {
-  const hex = Array.from(bytes).map((byte) => byte.toString(16).padStart(2, "0")).join("");
-  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+  const hex = Array.from(bytes).map((byte) =>
+    byte.toString(16).padStart(2, "0")
+  ).join("");
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${
+    hex.slice(16, 20)
+  }-${hex.slice(20)}`;
 }
 
 function allowedGithubOrg(): string {
-  return Deno.env.get("CODEX_SESSION_LOG_ALLOWED_GITHUB_ORG") ?? DEFAULT_ALLOWED_ORG;
+  return Deno.env.get("CODEX_SESSION_LOG_ALLOWED_GITHUB_ORG") ??
+    DEFAULT_ALLOWED_ORG;
 }
 
 function remoteBelongsToOrg(remote: string, org: string): boolean {
@@ -131,15 +162,24 @@ function escapeRegExp(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
-async function validateMessageIntegrity(record: JsonObject, message: JsonObject): Promise<void> {
+async function validateMessageIntegrity(
+  record: JsonObject,
+  message: JsonObject,
+): Promise<void> {
   const content = requireString(message.content, "message.content");
-  const expectedHash = requireString(record.content_sha256, "record.content_sha256");
+  const expectedHash = requireString(
+    record.content_sha256,
+    "record.content_sha256",
+  );
   const actualHash = await sha256Hex(content);
   if (actualHash !== expectedHash) {
     throw new Error("content hash mismatch");
   }
 
-  const expectedByteSize = requireNumber(record.content_byte_size, "record.content_byte_size");
+  const expectedByteSize = requireNumber(
+    record.content_byte_size,
+    "record.content_byte_size",
+  );
   const actualByteSize = new TextEncoder().encode(content).byteLength;
   if (actualByteSize !== expectedByteSize) {
     throw new Error("content byte size mismatch");
@@ -147,24 +187,38 @@ async function validateMessageIntegrity(record: JsonObject, message: JsonObject)
 }
 
 async function sha256Hex(value: string): Promise<string> {
-  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value));
+  const digest = await crypto.subtle.digest(
+    "SHA-256",
+    new TextEncoder().encode(value),
+  );
   return Array.from(new Uint8Array(digest))
     .map((byte) => byte.toString(16).padStart(2, "0"))
     .join("");
 }
 
 function storagePathForRecord(record: JsonObject, userId: string): string {
-  const sessionId = safeSegment(requireString(record.session_id, "record.session_id"));
+  const sessionId = safeSegment(
+    requireString(record.session_id, "record.session_id"),
+  );
   const seq = requireNumber(record.seq, "record.seq");
   if (optionalString(record.type) === "event") {
-    const eventType = safeSegment(requireString(record.event_type, "record.event_type"));
-    return `users/${safeSegment(userId)}/sessions/${sessionId}/events/${String(seq).padStart(6, "0")}-${eventType}.json`;
+    const eventType = safeSegment(
+      requireString(record.event_type, "record.event_type"),
+    );
+    return `users/${safeSegment(userId)}/sessions/${sessionId}/events/${
+      String(seq).padStart(6, "0")
+    }-${eventType}.json`;
   }
   const role = safeSegment(requireString(record.role, "record.role"));
-  return `users/${safeSegment(userId)}/sessions/${sessionId}/messages/${String(seq).padStart(6, "0")}-${role}.json`;
+  return `users/${safeSegment(userId)}/sessions/${sessionId}/messages/${
+    String(seq).padStart(6, "0")
+  }-${role}.json`;
 }
 
-async function uploadStorageObject(storagePath: string, payload: JsonObject): Promise<void> {
+async function uploadStorageObject(
+  storagePath: string,
+  payload: JsonObject,
+): Promise<void> {
   const bucket = Deno.env.get("CODEX_SESSION_LOG_BUCKET") ?? DEFAULT_BUCKET;
   const quotedPath = storagePath.split("/").map(encodeURIComponent).join("/");
   await supabaseFetch(
@@ -180,16 +234,24 @@ async function uploadStorageObject(storagePath: string, payload: JsonObject): Pr
   );
 }
 
-async function upsertSession(record: JsonObject, client: JsonObject, userId: string, remote: string): Promise<void> {
+async function upsertSession(
+  record: JsonObject,
+  client: JsonObject,
+  userId: string,
+  remote: string,
+  metadata = optionalObject(record.metadata),
+): Promise<void> {
   const sessionId = requireString(record.session_id, "record.session_id");
   const row = {
     id: sessionId,
     user_id: userId,
     repo: remote,
     branch: optionalString(client.git_branch),
-    storage_prefix: `users/${safeSegment(userId)}/sessions/${safeSegment(sessionId)}`,
+    storage_prefix: `users/${safeSegment(userId)}/sessions/${
+      safeSegment(sessionId)
+    }`,
     metadata: {
-      ...optionalObject(record.metadata),
+      ...metadata,
       client,
     },
     updated_at: new Date().toISOString(),
@@ -197,7 +259,11 @@ async function upsertSession(record: JsonObject, client: JsonObject, userId: str
   await restUpsert("codex_sessions", row, "id");
 }
 
-async function upsertMessage(record: JsonObject, userId: string, storagePath: string): Promise<void> {
+async function upsertMessage(
+  record: JsonObject,
+  userId: string,
+  storagePath: string,
+): Promise<void> {
   const row = {
     id: requireString(record.id, "record.id"),
     session_id: requireString(record.session_id, "record.session_id"),
@@ -207,8 +273,14 @@ async function upsertMessage(record: JsonObject, userId: string, storagePath: st
     role: requireString(record.role, "record.role"),
     storage_bucket: Deno.env.get("CODEX_SESSION_LOG_BUCKET") ?? DEFAULT_BUCKET,
     storage_path: storagePath,
-    content_sha256: requireString(record.content_sha256, "record.content_sha256"),
-    content_byte_size: requireNumber(record.content_byte_size, "record.content_byte_size"),
+    content_sha256: requireString(
+      record.content_sha256,
+      "record.content_sha256",
+    ),
+    content_byte_size: requireNumber(
+      record.content_byte_size,
+      "record.content_byte_size",
+    ),
     content_excerpt: optionalString(record.content_excerpt),
     metadata: optionalObject(record.metadata),
     created_at: requireString(record.created_at, "record.created_at"),
@@ -216,7 +288,12 @@ async function upsertMessage(record: JsonObject, userId: string, storagePath: st
   await restUpsert("codex_session_messages", row, "id");
 }
 
-async function upsertEvent(record: JsonObject, userId: string, storagePath: string): Promise<void> {
+async function upsertEvent(
+  record: JsonObject,
+  userId: string,
+  storagePath: string,
+  event: JsonObject,
+): Promise<void> {
   const row = {
     id: requireString(record.id, "record.id"),
     session_id: requireString(record.session_id, "record.session_id"),
@@ -225,13 +302,17 @@ async function upsertEvent(record: JsonObject, userId: string, storagePath: stri
     event_type: requireString(record.event_type, "record.event_type"),
     storage_bucket: Deno.env.get("CODEX_SESSION_LOG_BUCKET") ?? DEFAULT_BUCKET,
     storage_path: storagePath,
-    metadata: optionalObject(record.metadata),
+    metadata: optionalObject(event.metadata),
     created_at: requireString(record.created_at, "record.created_at"),
   };
   await restUpsert("codex_session_events", row, "id");
 }
 
-async function restUpsert(table: string, row: JsonObject, conflict: string): Promise<void> {
+async function restUpsert(
+  table: string,
+  row: JsonObject,
+  conflict: string,
+): Promise<void> {
   await supabaseFetch(
     `/rest/v1/${table}?on_conflict=${encodeURIComponent(conflict)}`,
     {
@@ -256,7 +337,9 @@ async function supabaseFetch(path: string, init: RequestInit): Promise<void> {
     },
   });
   if (!response.ok) {
-    throw new Error(`Supabase request failed ${response.status}: ${await response.text()}`);
+    throw new Error(
+      `Supabase request failed ${response.status}: ${await response.text()}`,
+    );
   }
 }
 
@@ -289,7 +372,9 @@ function supabaseSecretKey(): string {
     return legacyServiceRole;
   }
 
-  throw new Error("SUPABASE_SECRET_KEYS or SUPABASE_SERVICE_ROLE_KEY is required");
+  throw new Error(
+    "SUPABASE_SECRET_KEYS or SUPABASE_SERVICE_ROLE_KEY is required",
+  );
 }
 
 function jsonResponse(payload: JsonObject, status = 200): Response {
@@ -310,7 +395,9 @@ function requireObject(value: unknown, name: string): JsonObject {
 }
 
 function optionalObject(value: unknown): JsonObject {
-  return value && typeof value === "object" && !Array.isArray(value) ? value as JsonObject : {};
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? value as JsonObject
+    : {};
 }
 
 function requireString(value: unknown, name: string): string {

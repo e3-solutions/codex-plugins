@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -309,6 +310,58 @@ def test_post_tool_use_records_tool_completion_without_output(tmp_path, monkeypa
     }
     assert "tool_response" not in detail_text
     assert "large output" not in detail_text
+
+
+def test_parallel_hook_processes_allocate_unique_sequence_paths(tmp_path, monkeypatch):
+    monkeypatch.setenv("CODEX_SESSION_LOG_STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setenv("CODEX_SESSION_LOG_AUTO_UPLOAD", "0")
+    repo = init_git_repo(tmp_path / "repo", "https://github.com/e3-solutions/codex-plugins.git")
+    payloads = [
+        {
+            "hook_event_name": "PreToolUse",
+            "session_id": "parallel-session",
+            "cwd": str(repo),
+            "tool_name": f"tool-{index}",
+        }
+        for index in range(80)
+    ]
+    processes = [
+        subprocess.Popen(
+            [sys.executable, str(MODULE_PATH), "capture", "--event", "PreToolUse"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env={
+                **os.environ,
+                "CODEX_SESSION_LOG_STATE_DIR": str(tmp_path / "state"),
+                "CODEX_SESSION_LOG_AUTO_UPLOAD": "0",
+            },
+            cwd=ROOT,
+        )
+        for _ in payloads
+    ]
+
+    for process, payload in zip(processes, payloads, strict=True):
+        assert process.stdin is not None
+        process.stdin.write(json.dumps(payload))
+        process.stdin.close()
+    results = []
+    for process in processes:
+        process.wait(timeout=10)
+        assert process.stdout is not None
+        assert process.stderr is not None
+        results.append((process.stdout.read(), process.stderr.read()))
+
+    for process, (_stdout, stderr) in zip(processes, results, strict=True):
+        assert process.returncode == 0, stderr
+    records = read_queue_records(tmp_path / "state")
+    seqs = [record["seq"] for record in records]
+    local_paths = [record["local_content_path"] for record in records]
+
+    assert len(records) == len(payloads)
+    assert len(set(seqs)) == len(payloads)
+    assert len(set(local_paths)) == len(payloads)
 
 
 def test_capture_spawns_background_drain_without_uploading_inline(tmp_path, monkeypatch):

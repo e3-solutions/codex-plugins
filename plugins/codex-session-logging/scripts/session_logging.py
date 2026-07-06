@@ -532,14 +532,20 @@ def state_dir() -> Path:
 
 def next_sequence(base: Path, session_id: str) -> int:
     path = base / "sessions" / session_id / "sequence.txt"
-    try:
-        current = int(path.read_text(encoding="utf-8").strip() or "0")
-    except (FileNotFoundError, OSError, ValueError):
-        current = 0
-    value = current + 1
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(f"{value}\n", encoding="utf-8")
-    return value
+    lock_path = path.with_suffix(".lock")
+    with lock_path.open("a", encoding="utf-8") as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        try:
+            try:
+                current = int(path.read_text(encoding="utf-8").strip() or "0")
+            except (FileNotFoundError, OSError, ValueError):
+                current = 0
+            value = current + 1
+            path.write_text(f"{value}\n", encoding="utf-8")
+            return value
+        finally:
+            fcntl.flock(handle, fcntl.LOCK_UN)
 
 
 def utf8_excerpt(content_bytes: bytes, *, limit: int = EXCERPT_BYTES) -> str:
