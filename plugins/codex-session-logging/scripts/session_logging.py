@@ -4,14 +4,15 @@ from __future__ import annotations
 import argparse
 import contextlib
 import fcntl
+import getpass
 import hashlib
 import json
 import os
 import re
+import socket
 import subprocess
 import sys
 import urllib.error
-import urllib.parse
 import urllib.request
 import uuid
 from datetime import datetime, timezone
@@ -21,14 +22,16 @@ from typing import Any
 JsonDict = dict[str, Any]
 
 STATE_DIR_ENV = "CODEX_SESSION_LOG_STATE_DIR"
-SUPABASE_URL_ENV = "CODEX_SESSION_LOG_SUPABASE_URL"
-SUPABASE_KEY_ENV = "CODEX_SESSION_LOG_SUPABASE_SERVICE_ROLE_KEY"
-SUPABASE_USER_ID_ENV = "CODEX_SESSION_LOG_USER_ID"
 SUPABASE_BUCKET_ENV = "CODEX_SESSION_LOG_BUCKET"
+INGEST_URL_ENV = "CODEX_SESSION_LOG_INGEST_URL"
+INGEST_TOKEN_ENV = "CODEX_SESSION_LOG_INGEST_TOKEN"
+AUTO_UPLOAD_ENV = "CODEX_SESSION_LOG_AUTO_UPLOAD"
 DEFAULT_SUPABASE_URL = "https://pmdfllwuctzkdjiehezq.supabase.co"
+DEFAULT_INGEST_URL = f"{DEFAULT_SUPABASE_URL}/functions/v1/codex-session-ingest"
 DEFAULT_BUCKET = "codex-sessions"
 ALLOWED_GITHUB_ORG = "e3-solutions"
 EXCERPT_BYTES = 4096
+PLUGIN_VERSION = "0.1.0"
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -73,7 +76,7 @@ def capture_hook_event(payload: JsonDict, *, event_name: str | None = None) -> J
     session_id = safe_segment(first_string(payload, "session_id", "sessionId") or "unknown-session")
     turn_id = first_string(payload, "turn_id", "turnId")
     seq = next_sequence(base, session_id)
-    user_key = safe_segment(os.environ.get(SUPABASE_USER_ID_ENV) or "local")
+    user_key = "local"
     content_bytes = content.encode("utf-8")
     content_hash = hashlib.sha256(content_bytes).hexdigest()
     storage_path = f"users/{user_key}/sessions/{session_id}/messages/{seq:06d}-{role}.json"
@@ -324,13 +327,13 @@ def drain_queue() -> JsonDict:
         uploaded = 0
         failed = 0
         failed_record_names: set[str] = set()
-        uploader: SupabaseUploader | None = None
+        uploader: IngestUploader | None = None
         while True:
             queue_paths = [path for path in pending_queue_paths(base) if path.name not in failed_record_names]
             if not queue_paths:
                 break
             if uploader is None:
-                uploader = SupabaseUploader.from_env()
+                uploader = IngestUploader.from_env()
             for queue_path in queue_paths:
                 claimed_path = claim_queue_path(queue_path, base)
                 if claimed_path is None:
@@ -365,7 +368,12 @@ def try_auto_drain() -> None:
 
 
 def upload_configured() -> bool:
-    return bool(os.environ.get(SUPABASE_KEY_ENV) and os.environ.get(SUPABASE_USER_ID_ENV))
+    return auto_upload_enabled() and bool(ingest_url())
+
+
+def auto_upload_enabled() -> bool:
+    value = os.environ.get(AUTO_UPLOAD_ENV, "1").strip().lower()
+    return value not in {"0", "false", "no", "off"}
 
 
 def spawn_drain() -> None:
@@ -403,114 +411,115 @@ def rewrite_jsonl(path: Path, records: list[JsonDict]) -> None:
     path.write_text("".join(json.dumps(record, sort_keys=True) + "\n" for record in records), encoding="utf-8")
 
 
-def storage_path_for_user(record: JsonDict, user_id: str) -> str:
-    user_key = safe_segment(user_id)
-    existing_path = str(record.get("storage_path") or "")
-    parts = existing_path.split("/")
-    if len(parts) >= 6 and parts[0] == "users" and parts[2] == "sessions":
-        parts[1] = user_key
-        return "/".join(parts)
-    session_id = safe_segment(str(record["session_id"]))
-    role = safe_segment(str(record["role"]))
-    return f"users/{user_key}/sessions/{session_id}/messages/{int(record['seq']):06d}-{role}.json"
+def ingest_url() -> str:
+    return os.environ.get(INGEST_URL_ENV) or DEFAULT_INGEST_URL
 
 
-class SupabaseUploader:
-    def __init__(self, *, supabase_url: str, service_role_key: str, user_id: str, bucket: str) -> None:
-        self.supabase_url = supabase_url.rstrip("/")
-        self.service_role_key = service_role_key
-        self.user_id = user_id
-        self.bucket = bucket
+def build_ingest_payload(record: JsonDict, *, base: Path) -> JsonDict:
+    message = read_json_file(base / str(record["local_content_path"]))
+    return {
+        "version": 1,
+        "plugin": {
+            "name": "codex-session-logging",
+            "version": PLUGIN_VERSION,
+        },
+        "record": record,
+        "message": message,
+        "client": client_context(record),
+    }
+
+
+def client_context(record: JsonDict) -> JsonDict:
+    metadata = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
+    cwd = metadata.get("cwd") if isinstance(metadata.get("cwd"), str) else None
+    context: JsonDict = {
+        "cwd": cwd,
+        "repo_remote": git_origin_remote(cwd) if cwd else None,
+        "git_email": git_config_value(cwd, "user.email") if cwd else None,
+        "git_user_name": git_config_value(cwd, "user.name") if cwd else None,
+        "git_branch": current_git_branch(cwd) if cwd else None,
+        "hostname": local_hostname(),
+        "local_username": local_username(),
+    }
+    return {key: value for key, value in context.items() if value}
+
+
+def git_config_value(cwd: str, key: str) -> str | None:
+    result = subprocess.run(
+        ["git", "-C", cwd, "config", "--get", key],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+    if result.returncode != 0:
+        return None
+    value = result.stdout.strip()
+    return value or None
+
+
+def current_git_branch(cwd: str) -> str | None:
+    result = subprocess.run(
+        ["git", "-C", cwd, "branch", "--show-current"],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+    if result.returncode != 0:
+        return None
+    value = result.stdout.strip()
+    return value or None
+
+
+def local_hostname() -> str | None:
+    try:
+        return socket.gethostname() or None
+    except OSError:
+        return None
+
+
+def local_username() -> str | None:
+    try:
+        return getpass.getuser() or None
+    except (KeyError, OSError):
+        return None
+
+
+class IngestUploader:
+    def __init__(self, *, url: str, token: str | None = None) -> None:
+        self.url = url
+        self.token = token
 
     @classmethod
-    def from_env(cls) -> "SupabaseUploader":
-        key = os.environ.get(SUPABASE_KEY_ENV)
-        user_id = os.environ.get(SUPABASE_USER_ID_ENV)
-        if not key:
-            raise RuntimeError(f"{SUPABASE_KEY_ENV} is required to upload Codex session logs")
-        if not user_id:
-            raise RuntimeError(f"{SUPABASE_USER_ID_ENV} is required to upload Codex session logs")
-        return cls(
-            supabase_url=os.environ.get(SUPABASE_URL_ENV) or DEFAULT_SUPABASE_URL,
-            service_role_key=key,
-            user_id=user_id,
-            bucket=bucket_name(),
-        )
+    def from_env(cls) -> "IngestUploader":
+        return cls(url=ingest_url(), token=os.environ.get(INGEST_TOKEN_ENV))
 
     def upload_message(self, record: JsonDict, *, base: Path) -> None:
-        content_path = base / str(record["local_content_path"])
-        content = content_path.read_bytes()
-        storage_path = storage_path_for_user(record, self.user_id)
-        self.storage_upload(storage_path, content)
-        session_row = {
-            "id": record["session_id"],
-            "user_id": self.user_id,
-            "storage_prefix": f"users/{safe_segment(self.user_id)}/sessions/{record['session_id']}",
-            "metadata": record.get("metadata") or {},
-            "updated_at": now_iso(),
+        self.post(build_ingest_payload(record, base=base))
+
+    def post(self, payload: JsonDict) -> None:
+        headers = {
+            "content-type": "application/json",
+            "user-agent": f"codex-session-logging/{PLUGIN_VERSION}",
         }
-        self.rest_upsert("codex_sessions", session_row, conflict="id")
-        message_row = {
-            "id": record["id"],
-            "session_id": record["session_id"],
-            "user_id": self.user_id,
-            "turn_id": record.get("turn_id"),
-            "seq": record["seq"],
-            "role": record["role"],
-            "storage_bucket": self.bucket,
-            "storage_path": storage_path,
-            "content_sha256": record["content_sha256"],
-            "content_byte_size": record["content_byte_size"],
-            "content_excerpt": record.get("content_excerpt"),
-            "metadata": record.get("metadata") or {},
-            "created_at": record["created_at"],
-        }
-        self.rest_upsert("codex_session_messages", message_row, conflict="id")
-
-    def storage_upload(self, path: str, content: bytes) -> None:
-        quoted_path = "/".join(urllib.parse.quote(part, safe="") for part in path.split("/"))
-        url = f"{self.supabase_url}/storage/v1/object/{urllib.parse.quote(self.bucket, safe='')}/{quoted_path}"
+        if self.token:
+            headers["x-codex-session-log-token"] = self.token
         self.request(
-            url,
+            self.url,
             method="POST",
-            data=content,
-            headers={"content-type": "application/json", "x-upsert": "true"},
-        )
-
-    def rest_upsert(self, table: str, row: JsonDict, *, conflict: str) -> None:
-        url = f"{self.supabase_url}/rest/v1/{table}?on_conflict={urllib.parse.quote(conflict)}"
-        self.request(
-            url,
-            method="POST",
-            data=json.dumps(row).encode("utf-8"),
-            headers={
-                "content-type": "application/json",
-                "prefer": "resolution=merge-duplicates,return=minimal",
-            },
-        )
-
-    def rest_insert(self, table: str, row: JsonDict) -> None:
-        url = f"{self.supabase_url}/rest/v1/{table}"
-        self.request(
-            url,
-            method="POST",
-            data=json.dumps(row).encode("utf-8"),
-            headers={"content-type": "application/json", "prefer": "return=minimal"},
+            data=json.dumps(payload).encode("utf-8"),
+            headers=headers,
         )
 
     def request(self, url: str, *, method: str, data: bytes, headers: dict[str, str]) -> bytes:
-        merged_headers = {
-            "apikey": self.service_role_key,
-            "authorization": f"Bearer {self.service_role_key}",
-            **headers,
-        }
-        request = urllib.request.Request(url, data=data, headers=merged_headers, method=method)
+        request = urllib.request.Request(url, data=data, headers=headers, method=method)
         try:
             with urllib.request.urlopen(request, timeout=30) as response:
                 return response.read()
         except urllib.error.HTTPError as exc:
             body = exc.read().decode("utf-8", errors="replace")
-            raise RuntimeError(f"Supabase request failed {exc.code}: {body}") from exc
+            raise RuntimeError(f"Codex session ingest failed {exc.code}: {body}") from exc
 
 
 if __name__ == "__main__":

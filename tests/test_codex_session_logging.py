@@ -6,9 +6,16 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 
 ROOT = Path(__file__).resolve().parents[1]
 MODULE_PATH = ROOT / "plugins" / "codex-session-logging" / "scripts" / "session_logging.py"
+
+
+@pytest.fixture(autouse=True)
+def disable_background_uploads_by_default(monkeypatch):
+    monkeypatch.setenv("CODEX_SESSION_LOG_AUTO_UPLOAD", "0")
 
 
 def load_session_logging():
@@ -134,8 +141,7 @@ def test_capture_skips_repos_outside_e3_solutions(tmp_path, monkeypatch):
 
 def test_capture_spawns_background_drain_without_uploading_inline(tmp_path, monkeypatch):
     monkeypatch.setenv("CODEX_SESSION_LOG_STATE_DIR", str(tmp_path / "state"))
-    monkeypatch.setenv("CODEX_SESSION_LOG_SUPABASE_SERVICE_ROLE_KEY", "service-role-key")
-    monkeypatch.setenv("CODEX_SESSION_LOG_USER_ID", "11111111-1111-1111-1111-111111111111")
+    monkeypatch.setenv("CODEX_SESSION_LOG_AUTO_UPLOAD", "1")
     session_logging = load_session_logging()
     repo = init_git_repo(tmp_path / "repo", "https://github.com/e3-solutions/codex-plugins.git")
     launches = []
@@ -173,8 +179,6 @@ def test_capture_spawns_background_drain_without_uploading_inline(tmp_path, monk
 
 def test_drain_uploads_records_enqueued_during_upload_before_returning(tmp_path, monkeypatch):
     monkeypatch.setenv("CODEX_SESSION_LOG_STATE_DIR", str(tmp_path / "state"))
-    monkeypatch.delenv("CODEX_SESSION_LOG_SUPABASE_SERVICE_ROLE_KEY", raising=False)
-    monkeypatch.delenv("CODEX_SESSION_LOG_USER_ID", raising=False)
     session_logging = load_session_logging()
     repo = init_git_repo(tmp_path / "repo", "https://github.com/e3-solutions/codex-plugins.git")
 
@@ -206,7 +210,7 @@ def test_drain_uploads_records_enqueued_during_upload_before_returning(tmp_path,
                 )
 
     uploader = CapturingUploader()
-    monkeypatch.setattr(session_logging.SupabaseUploader, "from_env", classmethod(lambda cls: uploader))
+    monkeypatch.setattr(session_logging.IngestUploader, "from_env", classmethod(lambda cls: uploader))
 
     result = session_logging.drain_queue()
     queued = read_queue_records(tmp_path / "state")
@@ -216,11 +220,11 @@ def test_drain_uploads_records_enqueued_during_upload_before_returning(tmp_path,
     assert queued == []
 
 
-def test_drain_remaps_local_spool_records_to_configured_user_storage_path(tmp_path, monkeypatch):
+def test_drain_posts_full_message_to_ingest_endpoint_without_local_supabase_secret(tmp_path, monkeypatch):
     monkeypatch.setenv("CODEX_SESSION_LOG_STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setenv("CODEX_SESSION_LOG_INGEST_URL", "https://logs.example.test/ingest")
     session_logging = load_session_logging()
     repo = init_git_repo(tmp_path / "repo", "https://github.com/e3-solutions/codex-plugins.git")
-    user_id = "11111111-1111-1111-1111-111111111111"
 
     session_logging.capture_hook_event(
         {
@@ -232,39 +236,48 @@ def test_drain_remaps_local_spool_records_to_configured_user_storage_path(tmp_pa
         }
     )
 
-    class RecordingUploader(session_logging.SupabaseUploader):
-        def __init__(self):
-            super().__init__(
-                supabase_url="https://example.supabase.co",
-                service_role_key="key",
-                user_id=user_id,
-                bucket="codex-sessions",
-            )
-            self.uploaded_paths = []
-            self.upserts = []
+    requests = []
 
-        def storage_upload(self, path, content):
-            self.uploaded_paths.append(path)
+    class Response:
+        def __enter__(self):
+            return self
 
-        def rest_upsert(self, table, row, *, conflict):
-            self.upserts.append((table, row, conflict))
+        def __exit__(self, exc_type, exc, tb):
+            return False
 
-    uploader = RecordingUploader()
-    monkeypatch.setattr(session_logging.SupabaseUploader, "from_env", classmethod(lambda cls: uploader))
+        def read(self):
+            return b'{"ok":true}'
+
+    def fake_urlopen(request, timeout):
+        requests.append(request)
+        return Response()
+
+    monkeypatch.setattr(session_logging.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(session_logging.socket, "gethostname", lambda: "arya-mbp")
+    monkeypatch.setattr(session_logging.getpass, "getuser", lambda: "arya")
 
     result = session_logging.drain_queue()
-    message_rows = [row for table, row, conflict in uploader.upserts if table == "codex_session_messages"]
+    body = json.loads(requests[0].data.decode("utf-8"))
 
     assert result["uploaded"] == 1
-    assert uploader.uploaded_paths == [f"users/{user_id}/sessions/session-123/messages/000001-user.json"]
-    assert message_rows[0]["storage_path"] == f"users/{user_id}/sessions/session-123/messages/000001-user.json"
+    assert requests[0].full_url == "https://logs.example.test/ingest"
+    assert requests[0].headers["Content-type"] == "application/json"
+    assert "Authorization" not in requests[0].headers
+    assert body["record"]["session_id"] == "session-123"
+    assert body["message"]["content"] == "Captured before user id is configured."
+    assert body["client"]["repo_remote"] == "https://github.com/e3-solutions/codex-plugins.git"
+    assert body["client"]["hostname"] == "arya-mbp"
+    assert body["client"]["local_username"] == "arya"
 
 
-def test_upload_message_upserts_message_rows_for_idempotent_retries(tmp_path, monkeypatch):
+def test_ingest_payload_includes_git_identity_hints_for_server_side_user_mapping(tmp_path, monkeypatch):
     session_logging = load_session_logging()
+    repo = init_git_repo(tmp_path / "repo", "https://github.com/e3-solutions/codex-plugins.git")
+    subprocess.run(["git", "config", "user.email", "arya@e3.solutions"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.name", "Arya"], cwd=repo, check=True)
     message_path = tmp_path / "users" / "local" / "sessions" / "session-123" / "messages" / "000001-user.json"
     message_path.parent.mkdir(parents=True)
-    message_path.write_text('{"content": "retry me"}\n', encoding="utf-8")
+    message_path.write_text('{"content": "map me", "role": "user"}\n', encoding="utf-8")
     record = {
         "id": "22222222222222222222222222222222",
         "session_id": "session-123",
@@ -274,35 +287,22 @@ def test_upload_message_upserts_message_rows_for_idempotent_retries(tmp_path, mo
         "storage_path": "users/local/sessions/session-123/messages/000001-user.json",
         "local_content_path": "users/local/sessions/session-123/messages/000001-user.json",
         "content_sha256": "abc123",
-        "content_byte_size": 23,
-        "content_excerpt": "retry me",
-        "metadata": {},
+        "content_byte_size": 6,
+        "content_excerpt": "map me",
+        "metadata": {"cwd": str(repo)},
         "created_at": "2026-07-03T00:00:00+00:00",
     }
 
-    class RecordingUploader(session_logging.SupabaseUploader):
-        def __init__(self):
-            super().__init__(
-                supabase_url="https://example.supabase.co",
-                service_role_key="key",
-                user_id="11111111-1111-1111-1111-111111111111",
-                bucket="codex-sessions",
-            )
-            self.upserts = []
+    monkeypatch.setattr(session_logging.socket, "gethostname", lambda: "arya-mbp")
+    monkeypatch.setattr(session_logging.getpass, "getuser", lambda: "arya")
 
-        def storage_upload(self, path, content):
-            pass
+    payload = session_logging.build_ingest_payload(record, base=tmp_path)
 
-        def rest_upsert(self, table, row, *, conflict):
-            self.upserts.append((table, conflict))
-
-        def rest_insert(self, table, row):
-            raise AssertionError(f"{table} should be upserted, not inserted")
-
-    uploader = RecordingUploader()
-    uploader.upload_message(record, base=tmp_path)
-
-    assert ("codex_session_messages", "id") in uploader.upserts
+    assert payload["message"]["content"] == "map me"
+    assert payload["client"]["git_email"] == "arya@e3.solutions"
+    assert payload["client"]["git_user_name"] == "Arya"
+    assert payload["client"]["repo_remote"] == "https://github.com/e3-solutions/codex-plugins.git"
+    assert payload["client"]["hostname"] == "arya-mbp"
 
 
 def test_plugin_packaging_and_supabase_migration_are_present():
@@ -317,6 +317,16 @@ def test_plugin_packaging_and_supabase_migration_are_present():
         / "migrations"
         / "001_codex_session_logging.sql"
     )
+    function_path = (
+        ROOT
+        / "plugins"
+        / "codex-session-logging"
+        / "supabase"
+        / "functions"
+        / "codex-session-ingest"
+        / "index.ts"
+    )
+    config_path = ROOT / "plugins" / "codex-session-logging" / "supabase" / "config.toml"
 
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     hooks = json.loads(hooks_path.read_text(encoding="utf-8"))
@@ -342,3 +352,7 @@ def test_plugin_packaging_and_supabase_migration_are_present():
     assert "grant select, insert, update on public.codex_sessions to authenticated" not in all_migrations
     assert "codex-sessions" in migration
     assert "storage.objects" in migration
+    assert function_path.exists()
+    assert "SUPABASE_SECRET_KEYS" in function_path.read_text(encoding="utf-8")
+    assert "CODEX_SESSION_LOG_USER_EMAIL_MAP" in function_path.read_text(encoding="utf-8")
+    assert "verify_jwt = false" in config_path.read_text(encoding="utf-8")
