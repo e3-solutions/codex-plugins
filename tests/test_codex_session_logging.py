@@ -353,6 +353,9 @@ def test_plugin_packaging_and_supabase_migration_are_present():
     assert "codex-sessions" in migration
     assert "storage.objects" in migration
     assert function_path.exists()
-    assert "SUPABASE_SECRET_KEYS" in function_path.read_text(encoding="utf-8")
-    assert "CODEX_SESSION_LOG_USER_EMAIL_MAP" in function_path.read_text(encoding="utf-8")
+    function_source = function_path.read_text(encoding="utf-8")
+    assert "SUPABASE_SECRET_KEYS" in function_source
+    assert "CODEX_SESSION_LOG_USER_EMAIL_MAP" in function_source
+    assert "deterministicUserIdForEmail" in function_source
+    assert "unknown_user_email" not in function_source
     assert "verify_jwt = false" in config_path.read_text(encoding="utf-8")

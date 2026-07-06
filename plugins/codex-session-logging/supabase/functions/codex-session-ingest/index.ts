@@ -2,6 +2,13 @@ type JsonObject = Record<string, unknown>;
 
 const DEFAULT_BUCKET = "codex-sessions";
 const DEFAULT_ALLOWED_ORG = "e3-solutions";
+const DNS_NAMESPACE_UUID_BYTES = new Uint8Array([
+  0x6b, 0xa7, 0xb8, 0x10,
+  0x9d, 0xad,
+  0x11, 0xd1,
+  0x80, 0xb4,
+  0x00, 0xc0, 0x4f, 0xd4, 0x30, 0xc8,
+]);
 
 const corsHeaders = {
   "access-control-allow-origin": "*",
@@ -35,10 +42,7 @@ Deno.serve(async (req) => {
     }
 
     const gitEmail = requireString(client.git_email, "client.git_email").trim().toLowerCase();
-    const userId = userIdForEmail(gitEmail);
-    if (!userId) {
-      return jsonResponse({ error: "unknown_user_email" }, 403);
-    }
+    const userId = userIdForEmail(gitEmail) ?? await deterministicUserIdForEmail(gitEmail);
 
     await validateMessageIntegrity(record, message);
 
@@ -73,6 +77,29 @@ function userIdForEmail(email: string): string | null {
   const raw = Deno.env.get("CODEX_SESSION_LOG_USER_EMAIL_MAP") ?? "{}";
   const map = JSON.parse(raw) as Record<string, string>;
   return map[email] ?? map[email.toLowerCase()] ?? null;
+}
+
+async function deterministicUserIdForEmail(email: string): Promise<string> {
+  const normalizedEmail = email.trim().toLowerCase();
+  return uuidV5(`codex-session-logging:${normalizedEmail}`, DNS_NAMESPACE_UUID_BYTES);
+}
+
+async function uuidV5(name: string, namespace: Uint8Array): Promise<string> {
+  const nameBytes = new TextEncoder().encode(name);
+  const bytes = new Uint8Array(namespace.length + nameBytes.length);
+  bytes.set(namespace);
+  bytes.set(nameBytes, namespace.length);
+
+  const digest = new Uint8Array(await crypto.subtle.digest("SHA-1", bytes));
+  const uuid = digest.slice(0, 16);
+  uuid[6] = (uuid[6] & 0x0f) | 0x50;
+  uuid[8] = (uuid[8] & 0x3f) | 0x80;
+  return formatUuid(uuid);
+}
+
+function formatUuid(bytes: Uint8Array): string {
+  const hex = Array.from(bytes).map((byte) => byte.toString(16).padStart(2, "0")).join("");
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
 }
 
 function allowedGithubOrg(): string {

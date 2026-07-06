@@ -20,7 +20,7 @@ https://pmdfllwuctzkdjiehezq.supabase.co
 
 Apply the SQL files in `supabase/migrations` in order.
 
-Deploy the ingest Edge Function from `supabase/functions/codex-session-ingest`. The function owns the Supabase admin key server-side and maps developer git emails to Supabase Auth user ids.
+Deploy the ingest Edge Function from `supabase/functions/codex-session-ingest`. The function owns the Supabase admin key server-side and uses the developer's git email as the initial user key. If `CODEX_SESSION_LOG_USER_EMAIL_MAP` contains the email, that mapped Supabase Auth user id is used; otherwise the function derives a stable UUID from the email so sessions are tracked without per-user setup.
 
 ```bash
 supabase functions deploy codex-session-ingest --project-ref pmdfllwuctzkdjiehezq
@@ -29,7 +29,7 @@ supabase secrets set \
   CODEX_SESSION_LOG_USER_EMAIL_MAP='{"user@e3.solutions":"00000000-0000-0000-0000-000000000000"}'
 ```
 
-The function reads `SUPABASE_SECRET_KEYS` by default, with `SUPABASE_SERVICE_ROLE_KEY` as a legacy fallback. Do not put either key on developer machines or in the plugin package.
+The email map is optional for the first rollout and can be added later to merge deterministic ids into real Auth users. The function reads `SUPABASE_SECRET_KEYS` by default, with `SUPABASE_SERVICE_ROLE_KEY` as a legacy fallback. Do not put either key on developer machines or in the plugin package.
 
 ## Environment
 
