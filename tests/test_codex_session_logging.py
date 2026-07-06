@@ -171,8 +171,10 @@ def test_capture_spawns_background_drain_without_uploading_inline(tmp_path, monk
     assert not (tmp_path / "state" / "upload_errors.jsonl").exists()
 
 
-def test_drain_preserves_records_enqueued_during_upload(tmp_path, monkeypatch):
+def test_drain_uploads_records_enqueued_during_upload_before_returning(tmp_path, monkeypatch):
     monkeypatch.setenv("CODEX_SESSION_LOG_STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.delenv("CODEX_SESSION_LOG_SUPABASE_SERVICE_ROLE_KEY", raising=False)
+    monkeypatch.delenv("CODEX_SESSION_LOG_USER_ID", raising=False)
     session_logging = load_session_logging()
     repo = init_git_repo(tmp_path / "repo", "https://github.com/e3-solutions/codex-plugins.git")
 
@@ -209,9 +211,9 @@ def test_drain_preserves_records_enqueued_during_upload(tmp_path, monkeypatch):
     result = session_logging.drain_queue()
     queued = read_queue_records(tmp_path / "state")
 
-    assert result["uploaded"] == 1
-    assert result["remaining"] == 1
-    assert [record["turn_id"] for record in queued] == ["turn-2"]
+    assert result["uploaded"] == 2
+    assert result["remaining"] == 0
+    assert queued == []
 
 
 def test_drain_remaps_local_spool_records_to_configured_user_storage_path(tmp_path, monkeypatch):

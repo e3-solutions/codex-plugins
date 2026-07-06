@@ -321,33 +321,37 @@ def drain_queue() -> JsonDict:
 
         migrate_legacy_queue(base)
         recover_processing_records(base)
-        queue_paths = pending_queue_paths(base)
-        if not queue_paths:
-            return {"uploaded": 0, "failed": 0, "remaining": 0}
-
-        uploader = SupabaseUploader.from_env()
         uploaded = 0
         failed = 0
-        for queue_path in queue_paths:
-            claimed_path = claim_queue_path(queue_path, base)
-            if claimed_path is None:
-                continue
-            record: JsonDict | None = None
-            try:
-                record = read_json_file(claimed_path)
-                uploader.upload_message(record, base=base)
-            except Exception as exc:  # noqa: BLE001 - hook uploader must preserve queue on any failure.
-                failed += 1
-                if record is None:
-                    claimed_path.replace(pending_queue_dir(base) / claimed_path.name)
+        failed_record_names: set[str] = set()
+        uploader: SupabaseUploader | None = None
+        while True:
+            queue_paths = [path for path in pending_queue_paths(base) if path.name not in failed_record_names]
+            if not queue_paths:
+                break
+            if uploader is None:
+                uploader = SupabaseUploader.from_env()
+            for queue_path in queue_paths:
+                claimed_path = claim_queue_path(queue_path, base)
+                if claimed_path is None:
                     continue
-                record["last_upload_error"] = str(exc)
-                record["last_upload_failed_at"] = now_iso()
-                enqueue_record(base, record)
-                claimed_path.unlink(missing_ok=True)
-            else:
-                uploaded += 1
-                claimed_path.unlink(missing_ok=True)
+                record: JsonDict | None = None
+                try:
+                    record = read_json_file(claimed_path)
+                    uploader.upload_message(record, base=base)
+                except Exception as exc:  # noqa: BLE001 - hook uploader must preserve queue on any failure.
+                    failed += 1
+                    failed_record_names.add(claimed_path.name)
+                    if record is None:
+                        claimed_path.replace(pending_queue_dir(base) / claimed_path.name)
+                        continue
+                    record["last_upload_error"] = str(exc)
+                    record["last_upload_failed_at"] = now_iso()
+                    enqueue_record(base, record)
+                    claimed_path.unlink(missing_ok=True)
+                else:
+                    uploaded += 1
+                    claimed_path.unlink(missing_ok=True)
         return {"uploaded": uploaded, "failed": failed, "remaining": len(pending_queue_paths(base))}
 
 
