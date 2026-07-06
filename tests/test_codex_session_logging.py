@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import subprocess
 import sys
 from pathlib import Path
 
@@ -23,16 +24,24 @@ def read_jsonl(path: Path) -> list[dict]:
     return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
 
 
+def init_git_repo(path: Path, remote: str) -> Path:
+    path.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=path, check=True)
+    subprocess.run(["git", "remote", "add", "origin", remote], cwd=path, check=True)
+    return path
+
+
 def test_user_prompt_submit_spools_full_prompt_and_indexes_metadata(tmp_path, monkeypatch):
     monkeypatch.setenv("CODEX_SESSION_LOG_STATE_DIR", str(tmp_path / "state"))
     session_logging = load_session_logging()
+    repo = init_git_repo(tmp_path / "repo", "https://github.com/e3-solutions/codex-plugins.git")
 
     result = session_logging.capture_hook_event(
         {
             "hook_event_name": "UserPromptSubmit",
             "session_id": "session-123",
             "turn_id": "turn-1",
-            "cwd": str(tmp_path / "repo"),
+            "cwd": str(repo),
             "prompt": "Please add session logging.\nInclude exact prompts.",
             "transcript_path": str(tmp_path / "transcript.jsonl"),
         }
@@ -57,12 +66,14 @@ def test_user_prompt_submit_spools_full_prompt_and_indexes_metadata(tmp_path, mo
 def test_stop_spools_assistant_message_with_next_sequence(tmp_path, monkeypatch):
     monkeypatch.setenv("CODEX_SESSION_LOG_STATE_DIR", str(tmp_path / "state"))
     session_logging = load_session_logging()
+    repo = init_git_repo(tmp_path / "repo", "git@github.com:e3-solutions/codex-plugins.git")
 
     session_logging.capture_hook_event(
         {
             "hook_event_name": "UserPromptSubmit",
             "session_id": "session-123",
             "turn_id": "turn-1",
+            "cwd": str(repo),
             "prompt": "What changed?",
         }
     )
@@ -71,6 +82,7 @@ def test_stop_spools_assistant_message_with_next_sequence(tmp_path, monkeypatch)
             "hook_event_name": "Stop",
             "session_id": "session-123",
             "turn_id": "turn-1",
+            "cwd": str(repo),
             "last_assistant_message": "I added a logging plugin and tests.",
             "transcript_path": str(tmp_path / "transcript.jsonl"),
         }
@@ -86,6 +98,25 @@ def test_stop_spools_assistant_message_with_next_sequence(tmp_path, monkeypatch)
     assert message["content"] == "I added a logging plugin and tests."
     assert events[1]["role"] == "assistant"
     assert events[1]["content_sha256"] == result["content_sha256"]
+
+
+def test_capture_skips_repos_outside_e3_solutions(tmp_path, monkeypatch):
+    monkeypatch.setenv("CODEX_SESSION_LOG_STATE_DIR", str(tmp_path / "state"))
+    session_logging = load_session_logging()
+    repo = init_git_repo(tmp_path / "repo", "https://github.com/example/codex-plugins.git")
+
+    result = session_logging.capture_hook_event(
+        {
+            "hook_event_name": "UserPromptSubmit",
+            "session_id": "session-123",
+            "turn_id": "turn-1",
+            "cwd": str(repo),
+            "prompt": "Do not capture this.",
+        }
+    )
+
+    assert result is None
+    assert not (tmp_path / "state" / "events.jsonl").exists()
 
 
 def test_plugin_packaging_and_supabase_migration_are_present():

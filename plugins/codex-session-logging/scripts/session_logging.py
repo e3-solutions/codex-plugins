@@ -5,6 +5,8 @@ import argparse
 import hashlib
 import json
 import os
+import re
+import subprocess
 import sys
 import urllib.error
 import urllib.parse
@@ -23,6 +25,7 @@ SUPABASE_USER_ID_ENV = "CODEX_SESSION_LOG_USER_ID"
 SUPABASE_BUCKET_ENV = "CODEX_SESSION_LOG_BUCKET"
 DEFAULT_SUPABASE_URL = "https://pmdfllwuctzkdjiehezq.supabase.co"
 DEFAULT_BUCKET = "codex-sessions"
+ALLOWED_GITHUB_ORG = "e3-solutions"
 EXCERPT_BYTES = 4096
 
 
@@ -60,6 +63,8 @@ def capture_hook_event(payload: JsonDict, *, event_name: str | None = None) -> J
     hook_event = event_name or str(payload.get("hook_event_name") or payload.get("event") or "")
     role, content = message_from_payload(hook_event, payload)
     if not role or content is None:
+        return None
+    if not should_capture_payload(payload):
         return None
 
     base = ensure_state_dir()
@@ -128,6 +133,38 @@ def metadata_from_payload(payload: JsonDict) -> JsonDict:
         if isinstance(value, str) and value:
             metadata[key] = value
     return metadata
+
+
+def should_capture_payload(payload: JsonDict) -> bool:
+    cwd = first_string(payload, "cwd") or os.getcwd()
+    remote = git_origin_remote(cwd)
+    return remote_belongs_to_org(remote, ALLOWED_GITHUB_ORG)
+
+
+def git_origin_remote(cwd: str) -> str | None:
+    result = subprocess.run(
+        ["git", "-C", cwd, "remote", "get-url", "origin"],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+    if result.returncode != 0:
+        return None
+    remote = result.stdout.strip()
+    return remote or None
+
+
+def remote_belongs_to_org(remote: str | None, org: str) -> bool:
+    if not remote:
+        return False
+    value = remote.strip()
+    patterns = (
+        rf"^https://github\.com/{re.escape(org)}/[^/]+(?:\.git)?/?$",
+        rf"^git@github\.com:{re.escape(org)}/[^/]+(?:\.git)?$",
+        rf"^ssh://git@github\.com/{re.escape(org)}/[^/]+(?:\.git)?$",
+    )
+    return any(re.match(pattern, value, flags=re.IGNORECASE) for pattern in patterns)
 
 
 def first_string(payload: JsonDict, *keys: str) -> str | None:
