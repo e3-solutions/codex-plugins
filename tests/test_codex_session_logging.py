@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import importlib.util
+import io
 import json
 import os
 import subprocess
 import sys
+import urllib.error
 from pathlib import Path
 
 import pytest
@@ -538,6 +540,119 @@ def test_drain_posts_event_payload_to_ingest_endpoint(tmp_path, monkeypatch):
     assert body["event"]["event_type"] == "tool_call_started"
     assert body["event"]["metadata"]["tool_name"] == "functions.exec_command"
     assert "should-not-upload" not in body_text
+
+
+def test_drain_dead_letters_permanent_ingest_rejection(tmp_path, monkeypatch):
+    monkeypatch.setenv("CODEX_SESSION_LOG_STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setenv("CODEX_SESSION_LOG_INGEST_URL", "https://logs.example.test/ingest")
+    session_logging = load_session_logging()
+    repo = init_git_repo(tmp_path / "repo", "https://github.com/e3-solutions/codex-plugins.git")
+
+    captured = session_logging.capture_hook_event(
+        {
+            "hook_event_name": "UserPromptSubmit",
+            "session_id": "session-bad-record",
+            "cwd": str(repo),
+            "prompt": "This record should not retry forever.",
+        }
+    )
+
+    def fake_urlopen(request, timeout):
+        raise urllib.error.HTTPError(
+            request.full_url,
+            400,
+            "Bad Request",
+            {},
+            io.BytesIO(b'{"error":"invalid_payload","message":"client.repo_remote must be a non-empty string"}'),
+        )
+
+    monkeypatch.setattr(session_logging.urllib.request, "urlopen", fake_urlopen)
+
+    result = session_logging.drain_queue()
+    queued = read_queue_records(tmp_path / "state")
+    dead_letter_path = (
+        tmp_path
+        / "state"
+        / "queue"
+        / "dead-letter"
+        / f"{captured['id']}.json"
+    )
+    dead_lettered = json.loads(dead_letter_path.read_text(encoding="utf-8"))
+
+    assert result == {"uploaded": 0, "failed": 0, "dead_lettered": 1, "remaining": 0}
+    assert queued == []
+    assert dead_lettered["id"] == captured["id"]
+    assert dead_lettered["dead_letter_reason"] == "permanent_upload_failure"
+    assert "client.repo_remote" in dead_lettered["last_upload_error"]
+
+
+def test_drain_dead_letters_record_missing_repo_context_without_network(tmp_path, monkeypatch):
+    monkeypatch.setenv("CODEX_SESSION_LOG_STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setenv("CODEX_SESSION_LOG_INGEST_URL", "https://logs.example.test/ingest")
+    session_logging = load_session_logging()
+    repo = init_git_repo(tmp_path / "repo", "https://github.com/e3-solutions/codex-plugins.git")
+
+    captured = session_logging.capture_hook_event(
+        {
+            "hook_event_name": "UserPromptSubmit",
+            "session_id": "session-stale-record",
+            "cwd": str(repo),
+            "prompt": "This stale record has no repo metadata.",
+        }
+    )
+    pending_path = tmp_path / "state" / "queue" / "pending" / f"{captured['id']}.json"
+    pending = json.loads(pending_path.read_text(encoding="utf-8"))
+    pending["metadata"] = {}
+    pending_path.write_text(json.dumps(pending, sort_keys=True) + "\n", encoding="utf-8")
+
+    def fail_urlopen(request, timeout):
+        raise AssertionError("invalid local records should not be posted")
+
+    monkeypatch.setattr(session_logging.urllib.request, "urlopen", fail_urlopen)
+
+    result = session_logging.drain_queue()
+    queued = read_queue_records(tmp_path / "state")
+    dead_letter_path = tmp_path / "state" / "queue" / "dead-letter" / f"{captured['id']}.json"
+    dead_lettered = json.loads(dead_letter_path.read_text(encoding="utf-8"))
+
+    assert result == {"uploaded": 0, "failed": 0, "dead_lettered": 1, "remaining": 0}
+    assert queued == []
+    assert dead_lettered["dead_letter_reason"] == "permanent_upload_failure"
+    assert dead_lettered["last_upload_error"] == "client.repo_remote must be a non-empty string"
+
+
+def test_drain_keeps_transient_ingest_failure_pending(tmp_path, monkeypatch):
+    monkeypatch.setenv("CODEX_SESSION_LOG_STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setenv("CODEX_SESSION_LOG_INGEST_URL", "https://logs.example.test/ingest")
+    session_logging = load_session_logging()
+    repo = init_git_repo(tmp_path / "repo", "https://github.com/e3-solutions/codex-plugins.git")
+
+    captured = session_logging.capture_hook_event(
+        {
+            "hook_event_name": "UserPromptSubmit",
+            "session_id": "session-transient",
+            "cwd": str(repo),
+            "prompt": "This record should retry later.",
+        }
+    )
+
+    def fake_urlopen(request, timeout):
+        raise urllib.error.HTTPError(
+            request.full_url,
+            500,
+            "Internal Server Error",
+            {},
+            io.BytesIO(b'{"error":"ingest_failed"}'),
+        )
+
+    monkeypatch.setattr(session_logging.urllib.request, "urlopen", fake_urlopen)
+
+    result = session_logging.drain_queue()
+    queued = read_queue_records(tmp_path / "state")
+
+    assert result == {"uploaded": 0, "failed": 1, "dead_lettered": 0, "remaining": 1}
+    assert queued[0]["id"] == captured["id"]
+    assert "500" in queued[0]["last_upload_error"]
 
 
 def test_ingest_payload_includes_git_identity_hints_for_server_side_user_mapping(tmp_path, monkeypatch):

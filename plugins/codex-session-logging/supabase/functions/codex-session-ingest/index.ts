@@ -3,6 +3,8 @@ import { sanitizeEventPayload } from "./event_sanitizer.ts";
 
 type JsonObject = Record<string, unknown>;
 
+class PayloadValidationError extends Error {}
+
 const DEFAULT_BUCKET = "codex-sessions";
 const DEFAULT_ALLOWED_ORG = "e3-solutions";
 
@@ -13,7 +15,7 @@ const corsHeaders = {
   "access-control-allow-methods": "POST, OPTIONS",
 };
 
-Deno.serve(async (req) => {
+export async function handleRequest(req: Request): Promise<Response> {
   if (req.method === "OPTIONS") {
     return new Response(null, { status: 204, headers: corsHeaders });
   }
@@ -27,7 +29,7 @@ Deno.serve(async (req) => {
       return tokenError;
     }
 
-    const body = await req.json();
+    const body = await requestJson(req);
     const payload = requireObject(body, "payload");
     const record = requireObject(payload.record, "record");
     const client = requireObject(payload.client, "client");
@@ -73,9 +75,24 @@ Deno.serve(async (req) => {
     });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
+    if (error instanceof PayloadValidationError) {
+      return jsonResponse({ error: "invalid_payload", message }, 400);
+    }
     return jsonResponse({ error: "ingest_failed", message }, 500);
   }
-});
+}
+
+if (import.meta.main) {
+  Deno.serve(handleRequest);
+}
+
+async function requestJson(req: Request): Promise<unknown> {
+  try {
+    return await req.json();
+  } catch {
+    throw new PayloadValidationError("request body must be valid JSON");
+  }
+}
 
 function optionalIngestTokenError(req: Request): Response | null {
   const expected = Deno.env.get("CODEX_SESSION_LOG_INGEST_TOKEN");
@@ -117,7 +134,7 @@ async function validateMessageIntegrity(
   );
   const actualHash = await sha256Hex(content);
   if (actualHash !== expectedHash) {
-    throw new Error("content hash mismatch");
+    throw new PayloadValidationError("content hash mismatch");
   }
 
   const expectedByteSize = requireNumber(
@@ -126,7 +143,7 @@ async function validateMessageIntegrity(
   );
   const actualByteSize = new TextEncoder().encode(content).byteLength;
   if (actualByteSize !== expectedByteSize) {
-    throw new Error("content byte size mismatch");
+    throw new PayloadValidationError("content byte size mismatch");
   }
 }
 
@@ -333,7 +350,7 @@ function jsonResponse(payload: JsonObject, status = 200): Response {
 
 function requireObject(value: unknown, name: string): JsonObject {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
-    throw new Error(`${name} must be an object`);
+    throw new PayloadValidationError(`${name} must be an object`);
   }
   return value as JsonObject;
 }
@@ -346,7 +363,7 @@ function optionalObject(value: unknown): JsonObject {
 
 function requireString(value: unknown, name: string): string {
   if (typeof value !== "string" || value.length === 0) {
-    throw new Error(`${name} must be a non-empty string`);
+    throw new PayloadValidationError(`${name} must be a non-empty string`);
   }
   return value;
 }
@@ -357,7 +374,7 @@ function optionalString(value: unknown): string | null {
 
 function requireNumber(value: unknown, name: string): number {
   if (typeof value !== "number" || !Number.isFinite(value)) {
-    throw new Error(`${name} must be a finite number`);
+    throw new PayloadValidationError(`${name} must be a finite number`);
   }
   return value;
 }

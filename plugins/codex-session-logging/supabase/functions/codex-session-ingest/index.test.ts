@@ -1,4 +1,29 @@
 import { sanitizeEventPayload } from "./event_sanitizer.ts";
+import { handleRequest } from "./index.ts";
+
+Deno.test("handleRequest returns 400 for invalid ingest payloads", async () => {
+  const response = await handleRequest(
+    new Request("https://example.test/codex-session-ingest", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        record: {
+          id: "message-1",
+          session_id: "session-1",
+          seq: 1,
+          role: "user",
+        },
+        client: {},
+        message: { content: "hello" },
+      }),
+    }),
+  );
+  const body = await response.json();
+
+  assertEquals(response.status, 400);
+  assertEquals(body.error, "invalid_payload");
+  assertIncludes(body.message, "client.repo_remote");
+});
 
 Deno.test("sanitizeEventPayload keeps only allowlisted tool event fields", () => {
   const sanitized = sanitizeEventPayload(
@@ -137,5 +162,11 @@ function assertEquals(actual: unknown, expected: unknown): void {
 function assertNotIncludes(value: string, pattern: string): void {
   if (value.includes(pattern)) {
     throw new Error(`Expected serialized payload not to include ${pattern}`);
+  }
+}
+
+function assertIncludes(value: unknown, pattern: string): void {
+  if (typeof value !== "string" || !value.includes(pattern)) {
+    throw new Error(`Expected ${JSON.stringify(value)} to include ${pattern}`);
   }
 }

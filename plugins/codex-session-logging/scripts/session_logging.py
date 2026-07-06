@@ -37,6 +37,7 @@ DEFAULT_BUCKET = "codex-sessions"
 ALLOWED_GITHUB_ORG = "e3-solutions"
 EXCERPT_BYTES = 4096
 PLUGIN_VERSION = "0.1.0"
+PERMANENT_HTTP_STATUSES = {400, 413, 415, 422}
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -215,7 +216,10 @@ def event_from_payload(hook_event: str, payload: JsonDict) -> tuple[str | None, 
 
 def metadata_from_payload(payload: JsonDict) -> JsonDict:
     metadata: JsonDict = {}
-    for key in ("cwd", "transcript_path", "model", "source"):
+    cwd = first_string(payload, "cwd") or os.getcwd()
+    if cwd:
+        metadata["cwd"] = cwd
+    for key in ("transcript_path", "model", "source"):
         value = payload.get(key)
         if isinstance(value, str) and value:
             metadata[key] = value
@@ -600,6 +604,10 @@ def processing_queue_dir(base: Path) -> Path:
     return base / "queue" / "processing"
 
 
+def dead_letter_queue_dir(base: Path) -> Path:
+    return base / "queue" / "dead-letter"
+
+
 def read_json_file(path: Path) -> JsonDict:
     loaded = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(loaded, dict):
@@ -663,12 +671,19 @@ def drain_queue() -> JsonDict:
     base = ensure_state_dir()
     with drain_lock(base) as acquired:
         if not acquired:
-            return {"uploaded": 0, "failed": 0, "remaining": len(pending_queue_paths(base)), "locked": True}
+            return {
+                "uploaded": 0,
+                "failed": 0,
+                "dead_lettered": 0,
+                "remaining": len(pending_queue_paths(base)),
+                "locked": True,
+            }
 
         migrate_legacy_queue(base)
         recover_processing_records(base)
         uploaded = 0
         failed = 0
+        dead_lettered = 0
         failed_record_names: set[str] = set()
         uploader: IngestUploader | None = None
         while True:
@@ -685,6 +700,14 @@ def drain_queue() -> JsonDict:
                 try:
                     record = read_json_file(claimed_path)
                     uploader.upload_message(record, base=base)
+                except PermanentUploadError as exc:
+                    dead_lettered += 1
+                    if record is None:
+                        target = dead_letter_queue_dir(base) / claimed_path.name
+                        target.parent.mkdir(parents=True, exist_ok=True)
+                        claimed_path.replace(target)
+                        continue
+                    dead_letter_record(base, record, claimed_path, exc)
                 except Exception as exc:  # noqa: BLE001 - hook uploader must preserve queue on any failure.
                     failed += 1
                     failed_record_names.add(claimed_path.name)
@@ -698,7 +721,22 @@ def drain_queue() -> JsonDict:
                 else:
                     uploaded += 1
                     claimed_path.unlink(missing_ok=True)
-        return {"uploaded": uploaded, "failed": failed, "remaining": len(pending_queue_paths(base))}
+        return {
+            "uploaded": uploaded,
+            "failed": failed,
+            "dead_lettered": dead_lettered,
+            "remaining": len(pending_queue_paths(base)),
+        }
+
+
+def dead_letter_record(base: Path, record: JsonDict, source_path: Path, exc: Exception) -> None:
+    failed_at = now_iso()
+    record["last_upload_error"] = str(exc)
+    record["last_upload_failed_at"] = failed_at
+    record["dead_letter_reason"] = "permanent_upload_failure"
+    record["dead_lettered_at"] = failed_at
+    write_json_atomic(dead_letter_queue_dir(base) / source_path.name, record)
+    source_path.unlink(missing_ok=True)
 
 
 def try_auto_drain() -> None:
@@ -896,7 +934,9 @@ class IngestUploader:
         return cls(url=ingest_url(), token=os.environ.get(INGEST_TOKEN_ENV))
 
     def upload_message(self, record: JsonDict, *, base: Path) -> None:
-        self.post(build_ingest_payload(record, base=base))
+        payload = build_ingest_payload(record, base=base)
+        validate_ingest_payload(payload)
+        self.post(payload)
 
     def post(self, payload: JsonDict) -> None:
         headers = {
@@ -919,7 +959,26 @@ class IngestUploader:
                 return response.read()
         except urllib.error.HTTPError as exc:
             body = exc.read().decode("utf-8", errors="replace")
-            raise RuntimeError(f"Codex session ingest failed {exc.code}: {body}") from exc
+            message = f"Codex session ingest failed {exc.code}: {body}"
+            if exc.code in PERMANENT_HTTP_STATUSES:
+                raise PermanentUploadError(message, status=exc.code) from exc
+            raise RuntimeError(message) from exc
+
+
+class PermanentUploadError(RuntimeError):
+    def __init__(self, message: str, *, status: int | None = None) -> None:
+        super().__init__(message)
+        self.status = status
+
+
+def validate_ingest_payload(payload: JsonDict) -> None:
+    client = payload.get("client")
+    if not isinstance(client, dict) or not non_empty_string(client.get("repo_remote")):
+        raise PermanentUploadError("client.repo_remote must be a non-empty string")
+
+
+def non_empty_string(value: object) -> bool:
+    return isinstance(value, str) and len(value) > 0
 
 
 if __name__ == "__main__":
