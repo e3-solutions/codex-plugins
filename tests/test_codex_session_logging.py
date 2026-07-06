@@ -480,6 +480,7 @@ def test_drain_posts_full_message_to_ingest_endpoint_without_local_supabase_secr
     monkeypatch.setattr(session_logging.urllib.request, "urlopen", fake_urlopen)
     monkeypatch.setattr(session_logging.socket, "gethostname", lambda: "arya-mbp")
     monkeypatch.setattr(session_logging.getpass, "getuser", lambda: "arya")
+    monkeypatch.setattr(session_logging, "git_config_value", lambda cwd, key: None)
 
     result = session_logging.drain_queue()
     body = json.loads(requests[0].data.decode("utf-8"))
@@ -493,6 +494,9 @@ def test_drain_posts_full_message_to_ingest_endpoint_without_local_supabase_secr
     assert body["client"]["repo_remote"] == "https://github.com/e3-solutions/codex-plugins.git"
     assert body["client"]["hostname"] == "arya-mbp"
     assert body["client"]["local_username"] == "arya"
+    assert body["client"]["identity_key"] == f"installation:{body['client']['installation_id']}"
+    assert len(body["client"]["installation_id"]) > 0
+    assert "git_email" not in body["client"]
 
 
 def test_drain_posts_event_payload_to_ingest_endpoint(tmp_path, monkeypatch):
@@ -592,6 +596,7 @@ def test_plugin_packaging_and_supabase_migration_are_present():
         / "codex-session-ingest"
         / "index.ts"
     )
+    client_identity_path = function_path.with_name("client_identity.ts")
     config_path = ROOT / "plugins" / "codex-session-logging" / "supabase" / "config.toml"
 
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -626,9 +631,11 @@ def test_plugin_packaging_and_supabase_migration_are_present():
     assert "storage.objects" in migration
     assert function_path.exists()
     function_source = function_path.read_text(encoding="utf-8")
+    identity_source = client_identity_path.read_text(encoding="utf-8")
     assert "SUPABASE_SECRET_KEYS" in function_source
-    assert "CODEX_SESSION_LOG_USER_EMAIL_MAP" in function_source
-    assert "deterministicUserIdForEmail" in function_source
+    assert "CODEX_SESSION_LOG_USER_EMAIL_MAP" in identity_source
+    assert "deterministicUserIdForEmail" in identity_source
+    assert "clientIdentityKey" in identity_source
     assert "upsertEvent" in function_source
     assert "unknown_user_email" not in function_source
     assert "verify_jwt = false" in config_path.read_text(encoding="utf-8")

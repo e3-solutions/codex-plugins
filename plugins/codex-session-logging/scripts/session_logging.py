@@ -767,7 +767,7 @@ def build_ingest_payload(record: JsonDict, *, base: Path) -> JsonDict:
             "version": PLUGIN_VERSION,
         },
         "record": record,
-        "client": client_context(record),
+        "client": client_context(record, base=base),
     }
     if record.get("type") == "event":
         payload["event"] = detail
@@ -776,19 +776,72 @@ def build_ingest_payload(record: JsonDict, *, base: Path) -> JsonDict:
     return payload
 
 
-def client_context(record: JsonDict) -> JsonDict:
+def client_context(record: JsonDict, *, base: Path) -> JsonDict:
     metadata = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
     cwd = metadata.get("cwd") if isinstance(metadata.get("cwd"), str) else None
+    git_email = git_config_value(cwd, "user.email") if cwd else None
+    hostname = local_hostname()
+    username = local_username()
+    installation_id = local_installation_id(base)
     context: JsonDict = {
         "cwd": cwd,
         "repo_remote": git_origin_remote(cwd) if cwd else None,
-        "git_email": git_config_value(cwd, "user.email") if cwd else None,
+        "git_email": git_email,
         "git_user_name": git_config_value(cwd, "user.name") if cwd else None,
         "git_branch": current_git_branch(cwd) if cwd else None,
-        "hostname": local_hostname(),
-        "local_username": local_username(),
+        "hostname": hostname,
+        "local_username": username,
+        "installation_id": installation_id,
     }
+    identity_key = client_identity_key(
+        git_email=git_email,
+        installation_id=installation_id,
+        local_username=username,
+        hostname=hostname,
+    )
+    if identity_key:
+        context["identity_key"] = identity_key
     return {key: value for key, value in context.items() if value}
+
+
+def local_installation_id(base: Path) -> str:
+    path = base / "installation_id"
+    try:
+        existing = path.read_text(encoding="utf-8").strip()
+    except (FileNotFoundError, OSError):
+        existing = ""
+    if existing:
+        return existing
+
+    value = str(uuid.uuid4())
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(f"{path.name}.{uuid.uuid4().hex}.tmp")
+        tmp.write_text(f"{value}\n", encoding="utf-8")
+        tmp.replace(path)
+    except OSError:
+        return value
+    return value
+
+
+def client_identity_key(
+    *,
+    git_email: str | None,
+    installation_id: str | None,
+    local_username: str | None,
+    hostname: str | None,
+) -> str | None:
+    if git_email:
+        return f"git_email:{git_email.strip().lower()}"
+    if installation_id:
+        return f"installation:{installation_id.strip()}"
+    if local_username and hostname:
+        return f"local:{local_username.strip()}@{hostname.strip()}"
+    if local_username:
+        return f"local_username:{local_username.strip()}"
+    if hostname:
+        return f"hostname:{hostname.strip()}"
+    return None
 
 
 def git_config_value(cwd: str, key: str) -> str | None:
