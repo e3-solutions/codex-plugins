@@ -19,6 +19,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+try:
+    import tomllib
+except ModuleNotFoundError:  # pragma: no cover - Python < 3.11 fallback.
+    tomllib = None  # type: ignore[assignment]
+
 JsonDict = dict[str, Any]
 
 STATE_DIR_ENV = "CODEX_SESSION_LOG_STATE_DIR"
@@ -50,7 +55,14 @@ def main(argv: list[str] | None = None) -> None:
     payload = read_stdin_json()
     captured = capture_hook_event(payload, event_name=getattr(args, "event", None))
     if captured:
-        print(json.dumps({"captured": captured["id"], "role": captured["role"]}, sort_keys=True))
+        summary = {
+            "captured": captured["id"],
+            "type": captured.get("type", "message"),
+        }
+        for key in ("role", "event_type"):
+            if captured.get(key):
+                summary[key] = captured[key]
+        print(json.dumps(summary, sort_keys=True))
 
 
 def read_stdin_json() -> JsonDict:
@@ -67,11 +79,17 @@ def read_stdin_json() -> JsonDict:
 def capture_hook_event(payload: JsonDict, *, event_name: str | None = None) -> JsonDict | None:
     hook_event = event_name or str(payload.get("hook_event_name") or payload.get("event") or "")
     role, content = message_from_payload(hook_event, payload)
-    if not role or content is None:
-        return None
     if not should_capture_payload(payload):
         return None
+    if role and content is not None:
+        return capture_message_event(payload, hook_event=hook_event, role=role, content=content)
+    event_type, event_metadata = event_from_payload(hook_event, payload)
+    if not event_type:
+        return None
+    return capture_metadata_event(payload, hook_event=hook_event, event_type=event_type, event_metadata=event_metadata)
 
+
+def capture_message_event(payload: JsonDict, *, hook_event: str, role: str, content: str) -> JsonDict:
     base = ensure_state_dir()
     session_id = safe_segment(first_string(payload, "session_id", "sessionId") or "unknown-session")
     turn_id = first_string(payload, "turn_id", "turnId")
@@ -123,12 +141,76 @@ def capture_hook_event(payload: JsonDict, *, event_name: str | None = None) -> J
     return event
 
 
+def capture_metadata_event(
+    payload: JsonDict,
+    *,
+    hook_event: str,
+    event_type: str,
+    event_metadata: JsonDict,
+) -> JsonDict:
+    base = ensure_state_dir()
+    session_id = safe_segment(first_string(payload, "session_id", "sessionId") or "unknown-session")
+    turn_id = first_string(payload, "turn_id", "turnId")
+    seq = next_sequence(base, session_id)
+    created_at = now_iso()
+    metadata = metadata_from_payload(payload)
+    metadata.update(event_metadata)
+    event_id = uuid.uuid4().hex
+    storage_path = f"users/local/sessions/{session_id}/events/{seq:06d}-{safe_segment(event_type)}.json"
+    detail = {
+        "id": event_id,
+        "session_id": session_id,
+        "turn_id": turn_id,
+        "seq": seq,
+        "event_type": event_type,
+        "hook_event_name": hook_event,
+        "created_at": created_at,
+        "metadata": metadata,
+    }
+    write_json_atomic(base / storage_path, detail)
+
+    event = {
+        "id": event_id,
+        "type": "event",
+        "session_id": session_id,
+        "turn_id": turn_id,
+        "seq": seq,
+        "event_type": event_type,
+        "hook_event_name": hook_event,
+        "storage_bucket": bucket_name(),
+        "storage_path": storage_path,
+        "local_content_path": storage_path,
+        "metadata": metadata,
+        "created_at": created_at,
+        "uploaded_at": None,
+    }
+    append_jsonl(base / "events.jsonl", event)
+    enqueue_record(base, event)
+    try_auto_drain()
+    return event
+
+
 def message_from_payload(hook_event: str, payload: JsonDict) -> tuple[str | None, str | None]:
     if hook_event == "UserPromptSubmit":
         return "user", first_string(payload, "prompt")
     if hook_event == "Stop":
         return "assistant", first_string(payload, "last_assistant_message", "lastAssistantMessage")
     return None, None
+
+
+def event_from_payload(hook_event: str, payload: JsonDict) -> tuple[str | None, JsonDict]:
+    if hook_event == "SessionStart":
+        return "environment_snapshot", {"codex_setup": codex_setup_snapshot()}
+    if hook_event == "PreToolUse":
+        metadata = tool_event_metadata(payload, phase="started")
+        return ("tool_call_started", metadata) if metadata.get("tool_name") else (None, {})
+    if hook_event == "PostToolUse":
+        metadata = tool_event_metadata(payload, phase="finished")
+        success = tool_success(payload)
+        if success is not None:
+            metadata["success"] = success
+        return ("tool_call_finished", metadata) if metadata.get("tool_name") else (None, {})
+    return None, {}
 
 
 def metadata_from_payload(payload: JsonDict) -> JsonDict:
@@ -138,6 +220,261 @@ def metadata_from_payload(payload: JsonDict) -> JsonDict:
         if isinstance(value, str) and value:
             metadata[key] = value
     return metadata
+
+
+def tool_event_metadata(payload: JsonDict, *, phase: str) -> JsonDict:
+    tool = tool_name(payload)
+    if not tool:
+        return {}
+    metadata: JsonDict = {
+        "tool_name": tool,
+        "tool_phase": phase,
+    }
+    call_id = first_string(payload, "tool_call_id", "toolCallId", "call_id", "callId")
+    if call_id:
+        metadata["tool_call_id"] = call_id
+    return metadata
+
+
+def tool_name(payload: JsonDict) -> str:
+    for key in ("tool_name", "toolName", "name", "tool"):
+        value = payload.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    tool = payload.get("tool")
+    if isinstance(tool, dict) and isinstance(tool.get("name"), str):
+        return tool["name"].strip()
+    return ""
+
+
+def tool_success(payload: JsonDict) -> bool | None:
+    for key in ("success", "succeeded", "ok"):
+        value = payload.get(key)
+        if isinstance(value, bool):
+            return value
+    status = first_string(payload, "status", "result")
+    if status:
+        normalized = status.strip().lower()
+        if normalized in {"success", "succeeded", "ok", "passed", "complete", "completed"}:
+            return True
+        if normalized in {"failure", "failed", "error", "errored"}:
+            return False
+    return None
+
+
+def codex_setup_snapshot() -> JsonDict:
+    config = read_codex_config()
+    snapshot: JsonDict = {
+        "settings": codex_settings(config),
+        "plugins": codex_plugins(config),
+        "skills": codex_skills(),
+        "mcp_servers": codex_mcp_servers(config),
+        "marketplaces": codex_marketplaces(config),
+        "apps": codex_apps(config),
+        "connections": codex_connections(config),
+    }
+    return {key: value for key, value in snapshot.items() if value not in ({}, [])}
+
+
+def codex_config_path() -> Path:
+    home = os.environ.get("CODEX_HOME")
+    base = Path(home).expanduser().resolve() if home else Path.home() / ".codex"
+    return base / "config.toml"
+
+
+def read_codex_config() -> JsonDict:
+    path = codex_config_path()
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except OSError:
+        return {}
+    if tomllib is not None:
+        try:
+            data = tomllib.loads(raw)
+        except Exception:
+            return fallback_codex_config(raw)
+        return data if isinstance(data, dict) else {}
+    return fallback_codex_config(raw)
+
+
+def fallback_codex_config(raw: str) -> JsonDict:
+    config: JsonDict = {
+        "plugins": {},
+        "mcp_servers": {},
+        "marketplaces": {},
+        "apps": {},
+    }
+    for match in re.finditer(r'^\[plugins\."([^"]+)"\]', raw, flags=re.MULTILINE):
+        config["plugins"][match.group(1)] = {"enabled": True}
+    for match in re.finditer(r"^\[mcp_servers\.([^\]\.]+)\]", raw, flags=re.MULTILINE):
+        config["mcp_servers"][match.group(1).strip('"')] = {}
+    for match in re.finditer(r"^\[marketplaces\.([^\]]+)\]", raw, flags=re.MULTILINE):
+        config["marketplaces"][match.group(1).strip('"')] = {}
+    for key in ("model", "service_tier", "sandbox_mode", "personality"):
+        match = re.search(rf'^{key}\s*=\s*"([^"]*)"', raw, flags=re.MULTILINE)
+        if match:
+            config[key] = match.group(1)
+    return config
+
+
+def codex_settings(config: JsonDict) -> JsonDict:
+    allowed = (
+        "model",
+        "model_reasoning_effort",
+        "plan_mode_reasoning_effort",
+        "service_tier",
+        "sandbox_mode",
+        "personality",
+    )
+    return {
+        key: value
+        for key in allowed
+        if isinstance((value := config.get(key)), str) and value
+    }
+
+
+def codex_plugins(config: JsonDict) -> list[JsonDict]:
+    plugins = config.get("plugins")
+    if not isinstance(plugins, dict):
+        return []
+    result: list[JsonDict] = []
+    for name, value in plugins.items():
+        if not isinstance(name, str):
+            continue
+        enabled = value.get("enabled") if isinstance(value, dict) else None
+        result.append({"name": name, "enabled": enabled is not False})
+    return sorted(result, key=lambda item: str(item["name"]))
+
+
+def codex_skills() -> list[JsonDict]:
+    result: list[JsonDict] = []
+    seen: set[tuple[str, str, str, str]] = set()
+    for skill_file in iter_skill_files():
+        item = skill_item_for_path(skill_file)
+        if not item:
+            continue
+        key = (
+            str(item.get("source") or ""),
+            str(item.get("marketplace") or ""),
+            str(item.get("plugin") or ""),
+            str(item.get("name") or ""),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(item)
+    return sorted(result, key=lambda item: json.dumps(item, sort_keys=True))
+
+
+def iter_skill_files() -> list[Path]:
+    roots = [
+        codex_config_path().parent / "skills",
+        agents_home_path() / "skills",
+        codex_config_path().parent / "plugins" / "cache",
+    ]
+    files: list[Path] = []
+    for root in roots:
+        try:
+            files.extend(path for path in root.rglob("SKILL.md") if path.is_file())
+        except OSError:
+            continue
+    return files
+
+
+def agents_home_path() -> Path:
+    home = os.environ.get("AGENTS_HOME")
+    return Path(home).expanduser().resolve() if home else Path.home() / ".agents"
+
+
+def skill_item_for_path(path: Path) -> JsonDict | None:
+    codex_home = codex_config_path().parent
+    agents_home = agents_home_path()
+    for base, source in ((codex_home / "skills", "user"), (agents_home / "skills", "agent")):
+        try:
+            rel = path.relative_to(base)
+        except ValueError:
+            continue
+        parts = rel.parts
+        if not parts:
+            return None
+        if parts[0] == ".system" and len(parts) > 1:
+            return {"name": parts[1], "source": "system"}
+        return {"name": parts[0], "source": source}
+
+    cache_root = codex_home / "plugins" / "cache"
+    try:
+        rel = path.relative_to(cache_root)
+    except ValueError:
+        return None
+    parts = rel.parts
+    if "skills" not in parts:
+        return None
+    skills_index = parts.index("skills")
+    if skills_index + 1 >= len(parts):
+        return None
+    item: JsonDict = {
+        "name": parts[skills_index + 1],
+        "source": "plugin",
+    }
+    if len(parts) > 0:
+        item["marketplace"] = parts[0]
+    if len(parts) > 1:
+        item["plugin"] = parts[1]
+    if len(parts) > 2 and skills_index >= 3:
+        item["version"] = parts[2]
+    return item
+
+
+def codex_mcp_servers(config: JsonDict) -> list[JsonDict]:
+    servers = config.get("mcp_servers")
+    if not isinstance(servers, dict):
+        return []
+    result: list[JsonDict] = []
+    for name, value in servers.items():
+        if not isinstance(name, str) or not isinstance(value, dict):
+            continue
+        transport = "url" if isinstance(value.get("url"), str) else "command" if isinstance(value.get("command"), str) else "unknown"
+        result.append({"name": name, "transport": transport})
+    return sorted(result, key=lambda item: str(item["name"]))
+
+
+def codex_marketplaces(config: JsonDict) -> list[JsonDict]:
+    marketplaces = config.get("marketplaces")
+    if not isinstance(marketplaces, dict):
+        return []
+    result: list[JsonDict] = []
+    for name, value in marketplaces.items():
+        if not isinstance(name, str):
+            continue
+        item: JsonDict = {"name": name}
+        if isinstance(value, dict) and isinstance(value.get("source_type"), str):
+            item["source_type"] = value["source_type"]
+        result.append(item)
+    return sorted(result, key=lambda item: str(item["name"]))
+
+
+def codex_apps(config: JsonDict) -> list[JsonDict]:
+    apps = config.get("apps")
+    if not isinstance(apps, dict):
+        return []
+    return [{"id": name} for name in sorted(name for name in apps if isinstance(name, str))]
+
+
+def codex_connections(config: JsonDict) -> list[JsonDict]:
+    apps = config.get("apps")
+    if not isinstance(apps, dict):
+        return []
+    result: list[JsonDict] = []
+    for app_id, value in apps.items():
+        if not isinstance(app_id, str):
+            continue
+        item: JsonDict = {"id": app_id}
+        if isinstance(value, dict) and isinstance(value.get("tools"), dict):
+            tools = sorted(name for name in value["tools"] if isinstance(name, str))
+            if tools:
+                item["tools"] = tools
+        result.append(item)
+    return sorted(result, key=lambda item: str(item["id"]))
 
 
 def should_capture_payload(payload: JsonDict) -> bool:
@@ -416,17 +753,21 @@ def ingest_url() -> str:
 
 
 def build_ingest_payload(record: JsonDict, *, base: Path) -> JsonDict:
-    message = read_json_file(base / str(record["local_content_path"]))
-    return {
+    detail = read_json_file(base / str(record["local_content_path"]))
+    payload = {
         "version": 1,
         "plugin": {
             "name": "codex-session-logging",
             "version": PLUGIN_VERSION,
         },
         "record": record,
-        "message": message,
         "client": client_context(record),
     }
+    if record.get("type") == "event":
+        payload["event"] = detail
+    else:
+        payload["message"] = detail
+    return payload
 
 
 def client_context(record: JsonDict) -> JsonDict:

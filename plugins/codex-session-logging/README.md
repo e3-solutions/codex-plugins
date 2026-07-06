@@ -1,10 +1,12 @@
 # Codex Session Logging
 
-Captures full Codex user prompts and assistant responses through Codex lifecycle hooks.
+Captures Codex session activity through lifecycle hooks, including full user prompts, assistant responses, sanitized setup snapshots, and tool names.
 
-The plugin treats Supabase Storage as the canonical location for full message payloads and Supabase Postgres as the queryable catalog. Hook scripts always spool locally first under `~/.codex/session-logging`, then start `scripts/drain_queue.py` in the background to POST queued records to the shared ingest endpoint.
+The plugin treats Supabase Storage as the canonical location for full message/event payloads and Supabase Postgres as the queryable catalog. Hook scripts always spool locally first under `~/.codex/session-logging`, then start `scripts/drain_queue.py` in the background to POST queued records to the shared ingest endpoint.
 
 Capture is scoped to repositories whose `origin` remote belongs to the `e3-solutions` GitHub organization. In other repositories, the hooks return without writing local or remote session data.
+
+Tool logging records only the tool name, phase, optional tool call id, and success flag when exposed by Codex. Tool arguments, shell commands, and tool outputs are not uploaded. Setup snapshots include sanitized Codex config names such as enabled plugins, installed skill names/sources, MCP server names/transport, marketplaces, app connection ids/tool names, and non-secret model/runtime settings.
 
 ## Supabase
 

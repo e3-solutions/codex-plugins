@@ -33,7 +33,6 @@ Deno.serve(async (req) => {
     const body = await req.json();
     const payload = requireObject(body, "payload");
     const record = requireObject(payload.record, "record");
-    const message = requireObject(payload.message, "message");
     const client = requireObject(payload.client, "client");
 
     const remote = requireString(client.repo_remote, "client.repo_remote");
@@ -43,10 +42,23 @@ Deno.serve(async (req) => {
 
     const gitEmail = requireString(client.git_email, "client.git_email").trim().toLowerCase();
     const userId = userIdForEmail(gitEmail) ?? await deterministicUserIdForEmail(gitEmail);
+    const recordType = optionalString(record.type) ?? "message";
+    const storagePath = storagePathForRecord(record, userId);
 
+    if (recordType === "event") {
+      const event = requireObject(payload.event, "event");
+      await uploadStorageObject(storagePath, event);
+      await upsertSession(record, client, userId, remote);
+      await upsertEvent(record, userId, storagePath);
+      return jsonResponse({
+        ok: true,
+        id: record.id,
+        storage_path: storagePath,
+      });
+    }
+
+    const message = requireObject(payload.message, "message");
     await validateMessageIntegrity(record, message);
-
-    const storagePath = storagePathForUser(record, userId);
     await uploadStorageObject(storagePath, message);
     await upsertSession(record, client, userId, remote);
     await upsertMessage(record, userId, storagePath);
@@ -141,14 +153,18 @@ async function sha256Hex(value: string): Promise<string> {
     .join("");
 }
 
-function storagePathForUser(record: JsonObject, userId: string): string {
+function storagePathForRecord(record: JsonObject, userId: string): string {
   const sessionId = safeSegment(requireString(record.session_id, "record.session_id"));
-  const role = safeSegment(requireString(record.role, "record.role"));
   const seq = requireNumber(record.seq, "record.seq");
+  if (optionalString(record.type) === "event") {
+    const eventType = safeSegment(requireString(record.event_type, "record.event_type"));
+    return `users/${safeSegment(userId)}/sessions/${sessionId}/events/${String(seq).padStart(6, "0")}-${eventType}.json`;
+  }
+  const role = safeSegment(requireString(record.role, "record.role"));
   return `users/${safeSegment(userId)}/sessions/${sessionId}/messages/${String(seq).padStart(6, "0")}-${role}.json`;
 }
 
-async function uploadStorageObject(storagePath: string, message: JsonObject): Promise<void> {
+async function uploadStorageObject(storagePath: string, payload: JsonObject): Promise<void> {
   const bucket = Deno.env.get("CODEX_SESSION_LOG_BUCKET") ?? DEFAULT_BUCKET;
   const quotedPath = storagePath.split("/").map(encodeURIComponent).join("/");
   await supabaseFetch(
@@ -159,7 +175,7 @@ async function uploadStorageObject(storagePath: string, message: JsonObject): Pr
         "content-type": "application/json",
         "x-upsert": "true",
       },
-      body: JSON.stringify(message, null, 2) + "\n",
+      body: JSON.stringify(payload, null, 2) + "\n",
     },
   );
 }
@@ -198,6 +214,21 @@ async function upsertMessage(record: JsonObject, userId: string, storagePath: st
     created_at: requireString(record.created_at, "record.created_at"),
   };
   await restUpsert("codex_session_messages", row, "id");
+}
+
+async function upsertEvent(record: JsonObject, userId: string, storagePath: string): Promise<void> {
+  const row = {
+    id: requireString(record.id, "record.id"),
+    session_id: requireString(record.session_id, "record.session_id"),
+    user_id: userId,
+    seq: requireNumber(record.seq, "record.seq"),
+    event_type: requireString(record.event_type, "record.event_type"),
+    storage_bucket: Deno.env.get("CODEX_SESSION_LOG_BUCKET") ?? DEFAULT_BUCKET,
+    storage_path: storagePath,
+    metadata: optionalObject(record.metadata),
+    created_at: requireString(record.created_at, "record.created_at"),
+  };
+  await restUpsert("codex_session_events", row, "id");
 }
 
 async function restUpsert(table: string, row: JsonObject, conflict: string): Promise<void> {

@@ -139,6 +139,178 @@ def test_capture_skips_repos_outside_e3_solutions(tmp_path, monkeypatch):
     assert not (tmp_path / "state" / "events.jsonl").exists()
 
 
+def test_session_start_spools_sanitized_environment_snapshot(tmp_path, monkeypatch):
+    monkeypatch.setenv("CODEX_SESSION_LOG_STATE_DIR", str(tmp_path / "state"))
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir()
+    (codex_home / "config.toml").write_text(
+        """
+model = "gpt-5.5"
+service_tier = "priority"
+
+[plugins."github@openai-curated"]
+enabled = true
+
+[plugins."codex-session-logging@coreedge-local"]
+enabled = true
+
+[apps.asdk_app_linear.tools."linear.save_issue"]
+approval_mode = "approve"
+
+[marketplaces.coreedge-local]
+source_type = "local"
+source = "/Users/example/codex-plugins"
+
+[mcp_servers.github]
+url = "https://api.githubcopilot.com/mcp/"
+bearer_token_env_var = "GITHUB_PERSONAL_ACCESS_TOKEN"
+
+[mcp_servers.local-secret]
+command = "npx"
+args = ["-y", "secret-package", "--token", "sk-do-not-store"]
+
+[mcp_servers.local-secret.env]
+SECRET_TOKEN = "sk-do-not-store"
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    (codex_home / "skills" / "custom-skill").mkdir(parents=True)
+    (codex_home / "skills" / "custom-skill" / "SKILL.md").write_text(
+        "local skill body with sk-do-not-store",
+        encoding="utf-8",
+    )
+    (codex_home / "skills" / ".system" / "skill-creator").mkdir(parents=True)
+    (codex_home / "skills" / ".system" / "skill-creator" / "SKILL.md").write_text(
+        "system skill body",
+        encoding="utf-8",
+    )
+    plugin_skill_dir = (
+        codex_home
+        / "plugins"
+        / "cache"
+        / "openai-curated"
+        / "build-web-apps"
+        / "d6169bef"
+        / "skills"
+        / "frontend-app-builder"
+    )
+    plugin_skill_dir.mkdir(parents=True)
+    (
+        plugin_skill_dir / "SKILL.md"
+    ).write_text("plugin skill body", encoding="utf-8")
+    agents_home = tmp_path / "agents-home"
+    (agents_home / "skills" / "find-skills").mkdir(parents=True)
+    (agents_home / "skills" / "find-skills" / "SKILL.md").write_text(
+        "agent skill body",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    monkeypatch.setenv("AGENTS_HOME", str(agents_home))
+    session_logging = load_session_logging()
+    repo = init_git_repo(tmp_path / "repo", "https://github.com/e3-solutions/codex-plugins.git")
+
+    result = session_logging.capture_hook_event(
+        {
+            "hook_event_name": "SessionStart",
+            "session_id": "session-setup",
+            "cwd": str(repo),
+        }
+    )
+
+    detail = json.loads((tmp_path / "state" / result["local_content_path"]).read_text(encoding="utf-8"))
+    detail_text = json.dumps(detail, sort_keys=True)
+
+    assert result["type"] == "event"
+    assert result["event_type"] == "environment_snapshot"
+    assert detail["event_type"] == "environment_snapshot"
+    assert detail["metadata"]["codex_setup"]["plugins"] == [
+        {"enabled": True, "name": "codex-session-logging@coreedge-local"},
+        {"enabled": True, "name": "github@openai-curated"},
+    ]
+    assert detail["metadata"]["codex_setup"]["mcp_servers"] == [
+        {"name": "github", "transport": "url"},
+        {"name": "local-secret", "transport": "command"},
+    ]
+    assert detail["metadata"]["codex_setup"]["connections"] == [
+        {"id": "asdk_app_linear", "tools": ["linear.save_issue"]},
+    ]
+    assert {
+        json.dumps(skill, sort_keys=True)
+        for skill in detail["metadata"]["codex_setup"]["skills"]
+    } == {
+        '{"name": "custom-skill", "source": "user"}',
+        '{"name": "find-skills", "source": "agent"}',
+        '{"marketplace": "openai-curated", "name": "frontend-app-builder", "plugin": "build-web-apps", "source": "plugin", "version": "d6169bef"}',
+        '{"name": "skill-creator", "source": "system"}',
+    }
+    assert detail["metadata"]["codex_setup"]["settings"]["model"] == "gpt-5.5"
+    assert "sk-do-not-store" not in detail_text
+    assert "SECRET_TOKEN" not in detail_text
+    assert "bearer_token_env_var" not in detail_text
+
+
+def test_pre_tool_use_records_only_tool_name_without_arguments(tmp_path, monkeypatch):
+    monkeypatch.setenv("CODEX_SESSION_LOG_STATE_DIR", str(tmp_path / "state"))
+    session_logging = load_session_logging()
+    repo = init_git_repo(tmp_path / "repo", "https://github.com/e3-solutions/codex-plugins.git")
+
+    result = session_logging.capture_hook_event(
+        {
+            "hook_event_name": "PreToolUse",
+            "session_id": "session-tools",
+            "cwd": str(repo),
+            "tool_name": "functions.exec_command",
+            "tool_input": {"cmd": "echo super-secret-value"},
+        }
+    )
+
+    detail = json.loads((tmp_path / "state" / result["local_content_path"]).read_text(encoding="utf-8"))
+    detail_text = json.dumps(detail, sort_keys=True)
+
+    assert result["type"] == "event"
+    assert result["event_type"] == "tool_call_started"
+    assert detail["metadata"] == {
+        "cwd": str(repo),
+        "tool_name": "functions.exec_command",
+        "tool_phase": "started",
+    }
+    assert "tool_input" not in detail_text
+    assert "cmd" not in detail_text
+    assert "super-secret-value" not in detail_text
+
+
+def test_post_tool_use_records_tool_completion_without_output(tmp_path, monkeypatch):
+    monkeypatch.setenv("CODEX_SESSION_LOG_STATE_DIR", str(tmp_path / "state"))
+    session_logging = load_session_logging()
+    repo = init_git_repo(tmp_path / "repo", "https://github.com/e3-solutions/codex-plugins.git")
+
+    result = session_logging.capture_hook_event(
+        {
+            "hook_event_name": "PostToolUse",
+            "session_id": "session-tools",
+            "cwd": str(repo),
+            "tool": {"name": "web.run"},
+            "success": True,
+            "tool_response": "large output should not be stored",
+        }
+    )
+
+    detail = json.loads((tmp_path / "state" / result["local_content_path"]).read_text(encoding="utf-8"))
+    detail_text = json.dumps(detail, sort_keys=True)
+
+    assert result["type"] == "event"
+    assert result["event_type"] == "tool_call_finished"
+    assert detail["metadata"] == {
+        "cwd": str(repo),
+        "success": True,
+        "tool_name": "web.run",
+        "tool_phase": "finished",
+    }
+    assert "tool_response" not in detail_text
+    assert "large output" not in detail_text
+
+
 def test_capture_spawns_background_drain_without_uploading_inline(tmp_path, monkeypatch):
     monkeypatch.setenv("CODEX_SESSION_LOG_STATE_DIR", str(tmp_path / "state"))
     monkeypatch.setenv("CODEX_SESSION_LOG_AUTO_UPLOAD", "1")
@@ -270,6 +442,47 @@ def test_drain_posts_full_message_to_ingest_endpoint_without_local_supabase_secr
     assert body["client"]["local_username"] == "arya"
 
 
+def test_drain_posts_event_payload_to_ingest_endpoint(tmp_path, monkeypatch):
+    monkeypatch.setenv("CODEX_SESSION_LOG_STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setenv("CODEX_SESSION_LOG_INGEST_URL", "https://logs.example.test/ingest")
+    session_logging = load_session_logging()
+    repo = init_git_repo(tmp_path / "repo", "https://github.com/e3-solutions/codex-plugins.git")
+
+    session_logging.capture_hook_event(
+        {
+            "hook_event_name": "PreToolUse",
+            "session_id": "session-tools",
+            "cwd": str(repo),
+            "tool_name": "functions.exec_command",
+            "tool_input": {"cmd": "echo should-not-upload"},
+        }
+    )
+
+    requests = []
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def read(self):
+            return b'{"ok":true}'
+
+    monkeypatch.setattr(session_logging.urllib.request, "urlopen", lambda request, timeout: requests.append(request) or Response())
+
+    result = session_logging.drain_queue()
+    body = json.loads(requests[0].data.decode("utf-8"))
+    body_text = json.dumps(body, sort_keys=True)
+
+    assert result["uploaded"] == 1
+    assert body["record"]["type"] == "event"
+    assert body["event"]["event_type"] == "tool_call_started"
+    assert body["event"]["metadata"]["tool_name"] == "functions.exec_command"
+    assert "should-not-upload" not in body_text
+
+
 def test_ingest_payload_includes_git_identity_hints_for_server_side_user_mapping(tmp_path, monkeypatch):
     session_logging = load_session_logging()
     repo = init_git_repo(tmp_path / "repo", "https://github.com/e3-solutions/codex-plugins.git")
@@ -340,8 +553,14 @@ def test_plugin_packaging_and_supabase_migration_are_present():
     assert manifest["name"] == "codex-session-logging"
     assert manifest["hooks"] == "./hooks/hooks.json"
     assert hooks_path.exists()
+    assert "SessionStart" in hooks["hooks"]
+    assert "PreToolUse" in hooks["hooks"]
+    assert "PostToolUse" in hooks["hooks"]
     assert "UserPromptSubmit" in hooks["hooks"]
     assert "Stop" in hooks["hooks"]
+    assert (ROOT / "plugins" / "codex-session-logging" / "scripts" / "session_start.py").exists()
+    assert (ROOT / "plugins" / "codex-session-logging" / "scripts" / "pre_tool_use.py").exists()
+    assert (ROOT / "plugins" / "codex-session-logging" / "scripts" / "post_tool_use.py").exists()
     assert any(plugin["name"] == "codex-session-logging" for plugin in marketplace["plugins"])
     assert "create table if not exists public.codex_sessions" in migration
     assert "create table if not exists public.codex_session_messages" in migration
@@ -357,5 +576,6 @@ def test_plugin_packaging_and_supabase_migration_are_present():
     assert "SUPABASE_SECRET_KEYS" in function_source
     assert "CODEX_SESSION_LOG_USER_EMAIL_MAP" in function_source
     assert "deterministicUserIdForEmail" in function_source
+    assert "upsertEvent" in function_source
     assert "unknown_user_email" not in function_source
     assert "verify_jwt = false" in config_path.read_text(encoding="utf-8")
