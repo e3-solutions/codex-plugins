@@ -1,0 +1,2 @@
+[functions.codex-session-ingest]
+verify_jwt = false

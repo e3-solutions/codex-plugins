@@ -1,0 +1,31 @@
+{
+  "name": "codex-session-logging",
+  "version": "0.1.0",
+  "description": "Capture Codex user prompts and assistant responses for user-owned Supabase session history.",
+  "author": {
+    "name": "Core Edge Solution"
+  },
+  "keywords": [
+    "codex",
+    "sessions",
+    "logging",
+    "supabase"
+  ],
+  "hooks": "./hooks/hooks.json",
+  "interface": {
+    "displayName": "Codex Session Logging",
+    "shortDescription": "Capture prompt and assistant message history.",
+    "longDescription": "Codex Session Logging captures UserPromptSubmit and Stop hook payloads, spools exact message content locally, and queues upload-ready records for a private Supabase Storage bucket with Postgres index rows.",
+    "developerName": "Core Edge Solution",
+    "category": "Productivity",
+    "capabilities": [
+      "Read",
+      "Write"
+    ],
+    "defaultPrompt": [
+      "Capture Codex session messages",
+      "Drain queued Codex session logs to Supabase"
+    ],
+    "brandColor": "#0F766E"
+  }
+}
