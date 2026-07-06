@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
+import fcntl
 import hashlib
 import json
 import os
@@ -237,11 +239,19 @@ def enqueue_record(base: Path, record: JsonDict) -> None:
 
 def queue_record_path(base: Path, record: JsonDict) -> Path:
     record_id = safe_segment(str(record["id"]))
-    return base / "queue" / f"{record_id}.json"
+    return pending_queue_dir(base) / f"{record_id}.json"
 
 
 def pending_queue_paths(base: Path) -> list[Path]:
-    return sorted((base / "queue").glob("*.json"))
+    return sorted(pending_queue_dir(base).glob("*.json"))
+
+
+def pending_queue_dir(base: Path) -> Path:
+    return base / "queue" / "pending"
+
+
+def processing_queue_dir(base: Path) -> Path:
+    return base / "queue" / "processing"
 
 
 def read_json_file(path: Path) -> JsonDict:
@@ -254,52 +264,116 @@ def read_json_file(path: Path) -> JsonDict:
 def migrate_legacy_queue(base: Path) -> None:
     queue_path = base / "queue.jsonl"
     records = read_jsonl(queue_path)
-    if not records:
-        return
     for record in records:
         enqueue_record(base, record)
-    queue_path.unlink(missing_ok=True)
+    if records:
+        queue_path.unlink(missing_ok=True)
+    for legacy_path in sorted((base / "queue").glob("*.json")):
+        target = pending_queue_dir(base) / legacy_path.name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            legacy_path.replace(target)
+        except FileNotFoundError:
+            continue
+
+
+def recover_processing_records(base: Path) -> None:
+    pending_dir = pending_queue_dir(base)
+    pending_dir.mkdir(parents=True, exist_ok=True)
+    for processing_path in sorted(processing_queue_dir(base).glob("*.json")):
+        try:
+            processing_path.replace(pending_dir / processing_path.name)
+        except FileNotFoundError:
+            continue
+
+
+def claim_queue_path(path: Path, base: Path) -> Path | None:
+    claimed_path = processing_queue_dir(base) / path.name
+    claimed_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        path.replace(claimed_path)
+    except FileNotFoundError:
+        return None
+    return claimed_path
+
+
+@contextlib.contextmanager
+def drain_lock(base: Path):
+    lock_path = base / "queue" / "drain.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a", encoding="utf-8") as handle:
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            yield False
+            return
+        try:
+            yield True
+        finally:
+            fcntl.flock(handle, fcntl.LOCK_UN)
 
 
 def drain_queue() -> JsonDict:
     base = ensure_state_dir()
-    migrate_legacy_queue(base)
-    queue_paths = pending_queue_paths(base)
-    if not queue_paths:
-        return {"uploaded": 0, "failed": 0, "remaining": 0}
+    with drain_lock(base) as acquired:
+        if not acquired:
+            return {"uploaded": 0, "failed": 0, "remaining": len(pending_queue_paths(base)), "locked": True}
 
-    uploader = SupabaseUploader.from_env()
-    uploaded = 0
-    failed = 0
-    for queue_path in queue_paths:
-        record: JsonDict | None = None
-        try:
-            record = read_json_file(queue_path)
-            uploader.upload_message(record, base=base)
-        except Exception as exc:  # noqa: BLE001 - hook uploader must preserve queue on any failure.
-            failed += 1
-            if record is None:
+        migrate_legacy_queue(base)
+        recover_processing_records(base)
+        queue_paths = pending_queue_paths(base)
+        if not queue_paths:
+            return {"uploaded": 0, "failed": 0, "remaining": 0}
+
+        uploader = SupabaseUploader.from_env()
+        uploaded = 0
+        failed = 0
+        for queue_path in queue_paths:
+            claimed_path = claim_queue_path(queue_path, base)
+            if claimed_path is None:
                 continue
-            record["last_upload_error"] = str(exc)
-            record["last_upload_failed_at"] = now_iso()
-            write_json_atomic(queue_path, record)
-        else:
-            uploaded += 1
-            queue_path.unlink(missing_ok=True)
-    return {"uploaded": uploaded, "failed": failed, "remaining": len(pending_queue_paths(base))}
+            record: JsonDict | None = None
+            try:
+                record = read_json_file(claimed_path)
+                uploader.upload_message(record, base=base)
+            except Exception as exc:  # noqa: BLE001 - hook uploader must preserve queue on any failure.
+                failed += 1
+                if record is None:
+                    claimed_path.replace(pending_queue_dir(base) / claimed_path.name)
+                    continue
+                record["last_upload_error"] = str(exc)
+                record["last_upload_failed_at"] = now_iso()
+                enqueue_record(base, record)
+                claimed_path.unlink(missing_ok=True)
+            else:
+                uploaded += 1
+                claimed_path.unlink(missing_ok=True)
+        return {"uploaded": uploaded, "failed": failed, "remaining": len(pending_queue_paths(base))}
 
 
 def try_auto_drain() -> None:
     if not upload_configured():
         return
     try:
-        drain_queue()
+        spawn_drain()
     except Exception as exc:  # noqa: BLE001 - capture must not fail because remote upload is unavailable.
         append_jsonl(ensure_state_dir() / "upload_errors.jsonl", {"created_at": now_iso(), "error": str(exc)})
 
 
 def upload_configured() -> bool:
     return bool(os.environ.get(SUPABASE_KEY_ENV) and os.environ.get(SUPABASE_USER_ID_ENV))
+
+
+def spawn_drain() -> None:
+    script = Path(__file__).with_name("drain_queue.py")
+    subprocess.Popen(
+        [sys.executable, str(script)],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        close_fds=True,
+        start_new_session=True,
+    )
 
 
 def read_jsonl(path: Path) -> list[JsonDict]:

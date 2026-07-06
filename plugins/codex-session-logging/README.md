@@ -2,7 +2,7 @@
 
 Captures full Codex user prompts and assistant responses through Codex lifecycle hooks.
 
-The plugin treats Supabase Storage as the canonical location for full message payloads and Supabase Postgres as the queryable catalog. Hook scripts always spool locally first under `~/.codex/session-logging`, then `scripts/drain_queue.py` uploads queued records when Supabase credentials are configured.
+The plugin treats Supabase Storage as the canonical location for full message payloads and Supabase Postgres as the queryable catalog. Hook scripts always spool locally first under `~/.codex/session-logging`, then start `scripts/drain_queue.py` in the background when Supabase credentials are configured.
 
 Capture is scoped to repositories whose `origin` remote belongs to the `e3-solutions` GitHub organization. In other repositories, the hooks return without writing local or remote session data.
 

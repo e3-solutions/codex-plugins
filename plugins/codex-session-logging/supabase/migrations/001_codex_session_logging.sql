@@ -61,42 +61,17 @@ create policy "Users can read own Codex sessions"
   to authenticated
   using ((select auth.uid()) = user_id);
 
-create policy "Users can insert own Codex sessions"
-  on public.codex_sessions
-  for insert
-  to authenticated
-  with check ((select auth.uid()) = user_id);
-
-create policy "Users can update own Codex sessions"
-  on public.codex_sessions
-  for update
-  to authenticated
-  using ((select auth.uid()) = user_id)
-  with check ((select auth.uid()) = user_id);
-
 create policy "Users can read own Codex session messages"
   on public.codex_session_messages
   for select
   to authenticated
   using ((select auth.uid()) = user_id);
 
-create policy "Users can insert own Codex session messages"
-  on public.codex_session_messages
-  for insert
-  to authenticated
-  with check ((select auth.uid()) = user_id);
-
 create policy "Users can read own Codex session events"
   on public.codex_session_events
   for select
   to authenticated
   using ((select auth.uid()) = user_id);
-
-create policy "Users can insert own Codex session events"
-  on public.codex_session_events
-  for insert
-  to authenticated
-  with check ((select auth.uid()) = user_id);
 
 insert into storage.buckets (id, name, public, file_size_limit, allowed_mime_types)
 values (
@@ -117,31 +92,6 @@ create policy "Users can read own Codex session objects"
   for select
   to authenticated
   using (
-    bucket_id = 'codex-sessions'
-    and (storage.foldername(name))[1] = 'users'
-    and (storage.foldername(name))[2] = (select auth.uid())::text
-  );
-
-create policy "Users can upload own Codex session objects"
-  on storage.objects
-  for insert
-  to authenticated
-  with check (
-    bucket_id = 'codex-sessions'
-    and (storage.foldername(name))[1] = 'users'
-    and (storage.foldername(name))[2] = (select auth.uid())::text
-  );
-
-create policy "Users can update own Codex session objects"
-  on storage.objects
-  for update
-  to authenticated
-  using (
-    bucket_id = 'codex-sessions'
-    and (storage.foldername(name))[1] = 'users'
-    and (storage.foldername(name))[2] = (select auth.uid())::text
-  )
-  with check (
     bucket_id = 'codex-sessions'
     and (storage.foldername(name))[1] = 'users'
     and (storage.foldername(name))[2] = (select auth.uid())::text

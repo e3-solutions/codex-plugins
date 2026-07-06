@@ -25,6 +25,12 @@ def read_jsonl(path: Path) -> list[dict]:
 
 
 def read_queue_records(path: Path) -> list[dict]:
+    pending_dir = path / "queue" / "pending"
+    if pending_dir.exists():
+        return [
+            json.loads(record.read_text(encoding="utf-8"))
+            for record in sorted(pending_dir.glob("*.json"))
+        ]
     return [
         json.loads(record.read_text(encoding="utf-8"))
         for record in sorted((path / "queue").glob("*.json"))
@@ -124,6 +130,45 @@ def test_capture_skips_repos_outside_e3_solutions(tmp_path, monkeypatch):
 
     assert result is None
     assert not (tmp_path / "state" / "events.jsonl").exists()
+
+
+def test_capture_spawns_background_drain_without_uploading_inline(tmp_path, monkeypatch):
+    monkeypatch.setenv("CODEX_SESSION_LOG_STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setenv("CODEX_SESSION_LOG_SUPABASE_SERVICE_ROLE_KEY", "service-role-key")
+    monkeypatch.setenv("CODEX_SESSION_LOG_USER_ID", "11111111-1111-1111-1111-111111111111")
+    session_logging = load_session_logging()
+    repo = init_git_repo(tmp_path / "repo", "https://github.com/e3-solutions/codex-plugins.git")
+    launches = []
+
+    def fail_inline_drain():
+        raise AssertionError("capture should not upload inline")
+
+    class RecordingProcess:
+        def __init__(self, args, **kwargs):
+            launches.append((args, kwargs))
+
+    monkeypatch.setattr(session_logging, "drain_queue", fail_inline_drain)
+    monkeypatch.setattr(
+        session_logging,
+        "git_origin_remote",
+        lambda cwd: "https://github.com/e3-solutions/codex-plugins.git",
+    )
+    monkeypatch.setattr(session_logging.subprocess, "Popen", RecordingProcess)
+
+    result = session_logging.capture_hook_event(
+        {
+            "hook_event_name": "UserPromptSubmit",
+            "session_id": "session-123",
+            "turn_id": "turn-1",
+            "cwd": str(repo),
+            "prompt": "Capture quickly.",
+        }
+    )
+
+    assert result["role"] == "user"
+    assert launches
+    assert "drain_queue.py" in launches[0][0][1]
+    assert not (tmp_path / "state" / "upload_errors.jsonl").exists()
 
 
 def test_drain_preserves_records_enqueued_during_upload(tmp_path, monkeypatch):
@@ -290,6 +335,8 @@ def test_plugin_packaging_and_supabase_migration_are_present():
     assert "create table if not exists public.codex_session_messages" in migration
     assert "create table if not exists public.codex_session_events" in migration
     assert "alter table public.codex_sessions enable row level security" in migration
-    assert "grant select, insert, update on public.codex_sessions" in all_migrations
+    assert "revoke all privileges on public.codex_sessions from authenticated" in all_migrations
+    assert "grant select on public.codex_sessions to authenticated" in all_migrations
+    assert "grant select, insert, update on public.codex_sessions to authenticated" not in all_migrations
     assert "codex-sessions" in migration
     assert "storage.objects" in migration
