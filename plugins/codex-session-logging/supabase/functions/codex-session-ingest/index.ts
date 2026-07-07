@@ -203,6 +203,11 @@ async function upsertSession(
   metadata = optionalObject(record.metadata),
 ): Promise<void> {
   const sessionId = requireString(record.session_id, "record.session_id");
+  const sessionMetadata = await sessionMetadataForUpsert(
+    sessionId,
+    metadata,
+    client,
+  );
   const row = {
     id: sessionId,
     user_id: userId,
@@ -211,13 +216,47 @@ async function upsertSession(
     storage_prefix: `users/${safeSegment(userId)}/sessions/${
       safeSegment(sessionId)
     }`,
-    metadata: {
-      ...metadata,
-      client,
-    },
+    metadata: sessionMetadata,
     updated_at: new Date().toISOString(),
   };
   await restUpsert("codex_sessions", row, "id");
+}
+
+async function sessionMetadataForUpsert(
+  sessionId: string,
+  metadata: JsonObject,
+  client: JsonObject,
+): Promise<JsonObject> {
+  const nextMetadata: JsonObject = { ...metadata };
+  if (!hasOwn(nextMetadata, "codex_setup")) {
+    const existingMetadata = await existingSessionMetadata(sessionId);
+    if (hasOwn(existingMetadata, "codex_setup")) {
+      nextMetadata.codex_setup = existingMetadata.codex_setup;
+    }
+  }
+  return {
+    ...nextMetadata,
+    client,
+  };
+}
+
+async function existingSessionMetadata(sessionId: string): Promise<JsonObject> {
+  const response = await supabaseFetch(
+    `/rest/v1/codex_sessions?select=metadata&id=eq.${
+      encodeURIComponent(sessionId)
+    }&limit=1`,
+    {
+      method: "GET",
+      headers: {
+        accept: "application/json",
+      },
+    },
+  );
+  const rows = await response.json();
+  if (!Array.isArray(rows) || rows.length === 0) {
+    return {};
+  }
+  return optionalObject(optionalObject(rows[0]).metadata);
 }
 
 async function upsertMessage(
@@ -287,7 +326,10 @@ async function restUpsert(
   );
 }
 
-async function supabaseFetch(path: string, init: RequestInit): Promise<void> {
+async function supabaseFetch(
+  path: string,
+  init: RequestInit,
+): Promise<Response> {
   const key = supabaseSecretKey();
   const response = await fetch(`${supabaseUrl()}${path}`, {
     ...init,
@@ -302,6 +344,7 @@ async function supabaseFetch(path: string, init: RequestInit): Promise<void> {
       `Supabase request failed ${response.status}: ${await response.text()}`,
     );
   }
+  return response;
 }
 
 function legacyJwtKeyAuthHeader(key: string): Record<string, string> {
@@ -359,6 +402,10 @@ function optionalObject(value: unknown): JsonObject {
   return value && typeof value === "object" && !Array.isArray(value)
     ? value as JsonObject
     : {};
+}
+
+function hasOwn(value: JsonObject, key: string): boolean {
+  return Object.prototype.hasOwnProperty.call(value, key);
 }
 
 function requireString(value: unknown, name: string): string {
