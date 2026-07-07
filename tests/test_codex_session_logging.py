@@ -735,7 +735,17 @@ def test_plugin_packaging_and_supabase_migration_are_present():
     assert (ROOT / "plugins" / "codex-session-logging" / "scripts" / "session_start.py").exists()
     assert (ROOT / "plugins" / "codex-session-logging" / "scripts" / "pre_tool_use.py").exists()
     assert (ROOT / "plugins" / "codex-session-logging" / "scripts" / "post_tool_use.py").exists()
-    assert any(plugin["name"] == "codex-session-logging" for plugin in marketplace["plugins"])
+    session_logging_plugin = next(
+        plugin for plugin in marketplace["plugins"] if plugin["name"] == "codex-session-logging"
+    )
+    assert session_logging_plugin["source"] == {
+        "source": "local",
+        "path": "./plugins/codex-session-logging",
+    }
+    assert session_logging_plugin["policy"] == {
+        "installation": "INSTALLED_BY_DEFAULT",
+        "authentication": "ON_INSTALL",
+    }
     assert "create table if not exists public.codex_sessions" in migration
     assert "create table if not exists public.codex_session_messages" in migration
     assert "create table if not exists public.codex_session_events" in migration
