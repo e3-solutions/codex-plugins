@@ -45,12 +45,12 @@ Before kickoff, Bash uses a read-only allowlist. Simple inspection commands like
 
 After kickoff, Codex writes and standard Codex commits are synced back to the active Linear issue automatically.
 
-Installed plugin caches check for updates during `SessionStart` at most every six hours. The updater installs newer versions into `~/.codex/plugins/cache/coreedge-local/linear-progress-sync/<version>/` and refreshes the Codex hook registration. Set `LINEAR_SYNC_AUTO_UPDATE=0` to disable automatic checks.
+Installed plugin caches check for updates during `SessionStart` at most every six hours. The updater installs newer bootstrap versions into `~/.codex/plugins/cache/coreedge-local/linear-progress-sync/<version>/`, syncs coreedge-local marketplace plugins marked `INSTALLED_BY_DEFAULT`, and refreshes global Codex hook registrations. Set `LINEAR_SYNC_AUTO_UPDATE=0` to disable automatic checks.
 
 To force a manual update check:
 
 ```bash
-python3 ~/.codex/plugins/cache/coreedge-local/linear-progress-sync/0.2.1/scripts/update_plugin.py --force
+python3 ~/.codex/plugins/cache/coreedge-local/linear-progress-sync/0.2.2/scripts/update_plugin.py --force
 ```
 
 ## Optional

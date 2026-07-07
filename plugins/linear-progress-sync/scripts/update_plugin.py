@@ -16,11 +16,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from linear_sync import global_config_dir, install_codex_hooks, write_json_atomic
+from linear_sync import codex_hooks_path, global_config_dir, read_json_object, write_json_atomic
 
 
 JsonDict = dict[str, Any]
 PLUGIN_NAME = "linear-progress-sync"
+MARKETPLACE_PATH = ".agents/plugins/marketplace.json"
+DEFAULT_INSTALL_POLICY = "INSTALLED_BY_DEFAULT"
 DEFAULT_INTERVAL_SECONDS = 6 * 60 * 60
 DEFAULT_MANIFEST_URL = (
     "https://raw.githubusercontent.com/e3-solutions/codex-plugins/main/"
@@ -39,6 +41,10 @@ def default_cache_parent(plugin_root: Path | None = None) -> Path:
     if root.parent.name == PLUGIN_NAME:
         return root.parent
     return Path.home() / ".codex" / "plugins" / "cache" / "coreedge-local" / PLUGIN_NAME
+
+
+def default_marketplace_cache_root(plugin_root: Path | None = None) -> Path:
+    return default_cache_parent(plugin_root).parent
 
 
 def update_state_path() -> Path:
@@ -126,10 +132,27 @@ def version_is_newer(candidate: str, current: str) -> bool:
     return tuple(left) > tuple(right)
 
 
-def plugin_version(plugin_root: str | Path) -> str:
+def plugin_metadata(plugin_root: str | Path) -> JsonDict:
     manifest_path = Path(plugin_root) / ".codex-plugin" / "plugin.json"
     data = json.loads(manifest_path.read_text(encoding="utf-8"))
-    version = data.get("version") if isinstance(data, dict) else None
+    if not isinstance(data, dict):
+        raise ValueError(f"{manifest_path} must contain a JSON object")
+    return data
+
+
+def plugin_name(plugin_root: str | Path) -> str:
+    manifest_path = Path(plugin_root) / ".codex-plugin" / "plugin.json"
+    data = plugin_metadata(plugin_root)
+    name = data.get("name")
+    if not isinstance(name, str) or not name.strip():
+        raise ValueError(f"{manifest_path} missing plugin name")
+    return name.strip()
+
+
+def plugin_version(plugin_root: str | Path) -> str:
+    manifest_path = Path(plugin_root) / ".codex-plugin" / "plugin.json"
+    data = plugin_metadata(plugin_root)
+    version = data.get("version")
     if not isinstance(version, str) or not version.strip():
         raise ValueError(f"{manifest_path} missing plugin version")
     return version.strip()
@@ -223,6 +246,72 @@ def find_plugin_dir(extracted_root: Path, plugin_subdir: str | None = None) -> P
     raise ValueError("update archive did not contain a Codex plugin")
 
 
+def find_marketplace_path(extracted_root: Path, marketplace_path: str | None = None) -> Path | None:
+    configured_path = str(marketplace_path or MARKETPLACE_PATH).strip()
+    parts = Path(configured_path).parts
+    if parts:
+        direct = extracted_root.joinpath(*parts)
+        if direct.is_file():
+            return direct
+        for candidate in extracted_root.rglob(parts[-1]):
+            if candidate.is_file() and candidate.parts[-len(parts) :] == parts:
+                return candidate
+    for candidate in extracted_root.rglob("marketplace.json"):
+        if candidate.parts[-3:] == (".agents", "plugins", "marketplace.json"):
+            return candidate
+    return None
+
+
+def marketplace_repo_root(marketplace_path: Path) -> Path:
+    if marketplace_path.name != "marketplace.json" or len(marketplace_path.parents) < 3:
+        raise ValueError(f"unsupported marketplace path: {marketplace_path}")
+    return marketplace_path.parent.parent.parent
+
+
+def safe_relative_path(root: Path, relative: str) -> Path:
+    path = Path(relative)
+    if path.is_absolute():
+        raise ValueError(f"marketplace source path must be relative: {relative}")
+    target = (root / path).resolve()
+    resolved_root = root.resolve()
+    if resolved_root != target and resolved_root not in target.parents:
+        raise ValueError(f"marketplace source path escapes archive: {relative}")
+    return target
+
+
+def read_default_marketplace_plugins(marketplace_path: Path) -> list[Path]:
+    data = json.loads(marketplace_path.read_text(encoding="utf-8"))
+    if not isinstance(data, dict):
+        raise ValueError(f"{marketplace_path} must contain a JSON object")
+    plugins = data.get("plugins")
+    if not isinstance(plugins, list):
+        raise ValueError(f"{marketplace_path} missing plugins list")
+
+    repo_root = marketplace_repo_root(marketplace_path)
+    default_plugins: list[Path] = []
+    for entry in plugins:
+        if not isinstance(entry, dict):
+            continue
+        policy = entry.get("policy")
+        installation = policy.get("installation") if isinstance(policy, dict) else None
+        if installation != DEFAULT_INSTALL_POLICY:
+            continue
+        source = entry.get("source")
+        if not isinstance(source, dict) or source.get("source") != "local":
+            continue
+        source_path = source.get("path")
+        if not isinstance(source_path, str) or not source_path.strip():
+            raise ValueError(f"default marketplace plugin {entry.get('name') or '<unknown>'} missing local path")
+        plugin_dir = safe_relative_path(repo_root, source_path)
+        if not has_plugin_manifest(plugin_dir):
+            raise ValueError(f"default marketplace plugin missing manifest: {plugin_dir}")
+        expected_name = entry.get("name")
+        if isinstance(expected_name, str) and expected_name.strip() and plugin_name(plugin_dir) != expected_name.strip():
+            raise ValueError(f"default marketplace plugin name mismatch: {plugin_dir}")
+        default_plugins.append(plugin_dir)
+    return default_plugins
+
+
 def install_plugin_dir(source: Path, *, cache_parent: Path, version: str) -> Path:
     cache_parent.mkdir(parents=True, exist_ok=True)
     target = cache_parent / version
@@ -236,6 +325,122 @@ def install_plugin_dir(source: Path, *, cache_parent: Path, version: str) -> Pat
     finally:
         shutil.rmtree(temp_parent, ignore_errors=True)
     return target
+
+
+def marketplace_cache_root(
+    *,
+    cache_parent: str | Path | None = None,
+    plugin_root: str | Path | None = None,
+) -> Path:
+    if cache_parent:
+        parent = Path(cache_parent).expanduser().resolve()
+        if parent.name == PLUGIN_NAME:
+            return parent.parent
+        return parent
+    return default_marketplace_cache_root(Path(plugin_root).resolve() if plugin_root else None)
+
+
+def install_plugin_if_needed(source: Path, *, cache_root: Path) -> JsonDict:
+    name = plugin_name(source)
+    version = plugin_version(source)
+    parent = cache_root / name
+    target = parent / version
+    if has_plugin_manifest(target):
+        try:
+            if plugin_name(target) == name and plugin_version(target) == version:
+                return {"name": name, "version": version, "path": str(target), "installed": False}
+        except (OSError, ValueError, json.JSONDecodeError):
+            pass
+    installed = install_plugin_dir(source, cache_parent=parent, version=version)
+    return {"name": name, "version": version, "path": str(installed), "installed": True}
+
+
+def hook_entry_mentions_plugin(entry: Any, name: str) -> bool:
+    try:
+        text = json.dumps(entry, sort_keys=True)
+    except TypeError:
+        text = str(entry)
+    return name in text
+
+
+def plugin_hooks_path(plugin_root: Path, metadata: JsonDict | None = None) -> Path | None:
+    data = metadata or plugin_metadata(plugin_root)
+    hooks_ref = data.get("hooks")
+    if not isinstance(hooks_ref, str) or not hooks_ref.strip():
+        return None
+    hooks_path = (plugin_root / hooks_ref).resolve()
+    resolved_root = plugin_root.resolve()
+    if resolved_root != hooks_path and resolved_root not in hooks_path.parents:
+        raise ValueError(f"plugin hooks path escapes plugin root: {hooks_ref}")
+    if not hooks_path.is_file():
+        raise FileNotFoundError(f"missing plugin hooks file: {hooks_path}")
+    return hooks_path
+
+
+def merge_plugin_hooks(existing: JsonDict, *, name: str, plugin_config: JsonDict) -> JsonDict:
+    incoming_hooks = plugin_config.get("hooks")
+    if not isinstance(incoming_hooks, dict):
+        raise ValueError(f"{name} hook config missing hooks object")
+
+    merged = json.loads(json.dumps(existing)) if existing else {}
+    merged_hooks = merged.setdefault("hooks", {})
+    if not isinstance(merged_hooks, dict):
+        raise ValueError("existing hooks.json field `hooks` must be an object")
+
+    for event in sorted(set(merged_hooks) | set(incoming_hooks)):
+        current = merged_hooks.get(event, [])
+        if current is None:
+            current = []
+        if not isinstance(current, list):
+            raise ValueError(f"existing hooks event {event} must be a list")
+        replacement = [entry for entry in current if not hook_entry_mentions_plugin(entry, name)]
+        incoming = incoming_hooks.get(event)
+        if incoming is not None:
+            if not isinstance(incoming, list):
+                raise ValueError(f"{name} hook event {event} must be a list")
+            replacement.extend(json.loads(json.dumps(incoming)))
+        if replacement:
+            merged_hooks[event] = replacement
+        else:
+            merged_hooks.pop(event, None)
+    return merged
+
+
+def refresh_plugins_hooks(plugin_roots: list[Path]) -> JsonDict:
+    user_hooks_path = codex_hooks_path()
+    existing = read_json_object(user_hooks_path)
+    merged = existing
+    plugins: list[JsonDict] = []
+    seen: set[str] = set()
+
+    for plugin_root in plugin_roots:
+        root = plugin_root.expanduser().resolve()
+        metadata = plugin_metadata(root)
+        name = plugin_name(root)
+        if name in seen:
+            continue
+        seen.add(name)
+        hooks_path = plugin_hooks_path(root, metadata)
+        if hooks_path is None:
+            continue
+        plugin_config = read_json_object(hooks_path)
+        hooks = plugin_config.get("hooks")
+        if not isinstance(hooks, dict):
+            raise ValueError(f"{hooks_path} missing hooks object")
+        merged = merge_plugin_hooks(merged, name=name, plugin_config=plugin_config)
+        plugins.append(
+            {
+                "name": name,
+                "path": str(user_hooks_path),
+                "source": str(hooks_path),
+                "events": list(hooks),
+            }
+        )
+
+    changed = merged != existing
+    if changed:
+        write_json_atomic(user_hooks_path, merged)
+    return {"changed": changed, "plugins": plugins, "path": str(user_hooks_path)}
 
 
 def update_lock_path(state_path: Path) -> Path:
@@ -305,17 +510,13 @@ def run_update(
             }
         )
 
-        if not version_is_newer(latest_version, current_version):
-            next_state["last_result"] = "current"
-            write_update_state(state_file, next_state)
-            return {
-                "updated": False,
-                "skipped": "current",
-                "current_version": current_version,
-                "latest_version": latest_version,
-            }
+        cache_root = marketplace_cache_root(cache_parent=cache_parent, plugin_root=root)
+        installed_plugins: list[JsonDict] = []
+        hook_results: list[JsonDict] = []
+        hook_roots: list[Path] = []
+        bootstrap_path: Path = root
+        bootstrap_installed = False
 
-        parent = Path(cache_parent) if cache_parent else default_cache_parent(root)
         with tempfile.TemporaryDirectory(prefix="linear-progress-sync-update.") as temp_dir:
             temp = Path(temp_dir)
             archive = temp / "update-archive"
@@ -324,21 +525,75 @@ def run_update(
             extract_dir = temp / "extract"
             extract_dir.mkdir()
             extract_archive(archive, extract_dir)
-            plugin_dir = find_plugin_dir(extract_dir, str(manifest.get("plugin_subdir") or "").strip() or None)
-            installed = install_plugin_dir(plugin_dir, cache_parent=parent, version=latest_version)
+            bootstrap_source = find_plugin_dir(
+                extract_dir,
+                str(manifest.get("plugin_subdir") or "").strip() or None,
+            )
+            if version_is_newer(latest_version, current_version):
+                bootstrap_result = install_plugin_if_needed(bootstrap_source, cache_root=cache_root)
+                bootstrap_path = Path(str(bootstrap_result["path"]))
+                bootstrap_installed = bool(bootstrap_result.get("installed"))
+                if bootstrap_installed:
+                    installed_plugins.append(
+                        {
+                            "name": bootstrap_result["name"],
+                            "version": bootstrap_result["version"],
+                            "path": bootstrap_result["path"],
+                        }
+                    )
 
-        if install_hooks:
-            install_codex_hooks(plugin_repo_root=installed)
+            if install_hooks:
+                hook_roots.append(bootstrap_path)
 
-        next_state["last_result"] = "updated"
-        next_state["installed_version"] = latest_version
+            marketplace_path = find_marketplace_path(
+                extract_dir,
+                str(manifest.get("marketplace_path") or manifest.get("marketplace_subdir") or "").strip() or None,
+            )
+            if marketplace_path:
+                synced_names = {PLUGIN_NAME}
+                for plugin_dir in read_default_marketplace_plugins(marketplace_path):
+                    name = plugin_name(plugin_dir)
+                    if name in synced_names:
+                        continue
+                    synced_names.add(name)
+                    plugin_result = install_plugin_if_needed(plugin_dir, cache_root=cache_root)
+                    plugin_path = Path(str(plugin_result["path"]))
+                    if plugin_result.get("installed"):
+                        installed_plugins.append(
+                            {
+                                "name": plugin_result["name"],
+                                "version": plugin_result["version"],
+                                "path": plugin_result["path"],
+                            }
+                        )
+                    if install_hooks:
+                        hook_roots.append(plugin_path)
+
+        hook_summary = refresh_plugins_hooks(hook_roots) if install_hooks else {"changed": False, "plugins": []}
+        hook_results = hook_summary["plugins"]
+        hooks_changed = bool(hook_summary.get("changed"))
+        updated = bool(installed_plugins or hooks_changed)
+        next_state["last_result"] = "updated" if updated else "current"
+        if bootstrap_installed:
+            next_state["installed_version"] = latest_version
+        next_state["installed_plugins"] = [
+            {"name": item["name"], "version": item["version"], "path": item["path"]} for item in installed_plugins
+        ]
         write_update_state(state_file, next_state)
-        return {
-            "updated": True,
+
+        result: JsonDict = {
+            "updated": updated,
             "current_version": current_version,
-            "installed_version": latest_version,
-            "path": str(parent / latest_version),
+            "latest_version": latest_version,
+            "installed_plugins": installed_plugins,
+            "hooks": hook_results,
         }
+        if bootstrap_installed:
+            result["installed_version"] = latest_version
+            result["path"] = str(bootstrap_path)
+        if not updated:
+            result["skipped"] = "current"
+        return result
     except Exception as exc:
         next_state = dict(state)
         next_state.update({"last_checked_at": now_iso(current_time), "last_result": "failed", "last_error": str(exc)})
@@ -397,7 +652,13 @@ def main() -> None:
     if args.json:
         print(json.dumps(result, indent=2, sort_keys=True))
     elif result.get("updated"):
-        print(f"Installed Linear Progress Sync {result['installed_version']}.")
+        if result.get("installed_version"):
+            print(f"Installed Linear Progress Sync {result['installed_version']}.")
+        else:
+            plugins = ", ".join(
+                f"{item['name']} {item['version']}" for item in result.get("installed_plugins", [])
+            )
+            print(f"Updated default marketplace plugins: {plugins or 'hooks refreshed'}.")
     elif result.get("skipped"):
         print(f"Linear Progress Sync update skipped: {result['skipped']}.")
 
