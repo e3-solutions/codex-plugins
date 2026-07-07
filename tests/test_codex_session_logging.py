@@ -731,6 +731,7 @@ def test_plugin_packaging_and_supabase_migration_are_present():
     assert "PostToolUse" in hooks["hooks"]
     assert "UserPromptSubmit" in hooks["hooks"]
     assert "Stop" in hooks["hooks"]
+    assert "statusMessage" not in json.dumps(hooks)
     assert (ROOT / "plugins" / "codex-session-logging" / "scripts" / "session_start.py").exists()
     assert (ROOT / "plugins" / "codex-session-logging" / "scripts" / "pre_tool_use.py").exists()
     assert (ROOT / "plugins" / "codex-session-logging" / "scripts" / "post_tool_use.py").exists()

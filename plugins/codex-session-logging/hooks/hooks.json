@@ -5,8 +5,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "sh -c 'script=$(ls -td \"$HOME\"/.codex/plugins/cache/*/codex-session-logging/*/scripts/session_start.py 2>/dev/null | head -n 1); [ -n \"$script\" ] && exec python3 \"$script\" || exit 0'",
-            "statusMessage": "Capturing Codex setup"
+            "command": "sh -c 'script=$(ls -td \"$HOME\"/.codex/plugins/cache/*/codex-session-logging/*/scripts/session_start.py 2>/dev/null | head -n 1); [ -n \"$script\" ] && exec python3 \"$script\" || exit 0'"
           }
         ]
       }
@@ -16,8 +15,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "sh -c 'script=$(ls -td \"$HOME\"/.codex/plugins/cache/*/codex-session-logging/*/scripts/pre_tool_use.py 2>/dev/null | head -n 1); [ -n \"$script\" ] && exec python3 \"$script\" || exit 0'",
-            "statusMessage": "Capturing Codex tool call"
+            "command": "sh -c 'script=$(ls -td \"$HOME\"/.codex/plugins/cache/*/codex-session-logging/*/scripts/pre_tool_use.py 2>/dev/null | head -n 1); [ -n \"$script\" ] && exec python3 \"$script\" || exit 0'"
           }
         ]
       }
@@ -27,8 +25,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "sh -c 'script=$(ls -td \"$HOME\"/.codex/plugins/cache/*/codex-session-logging/*/scripts/post_tool_use.py 2>/dev/null | head -n 1); [ -n \"$script\" ] && exec python3 \"$script\" || exit 0'",
-            "statusMessage": "Capturing Codex tool result"
+            "command": "sh -c 'script=$(ls -td \"$HOME\"/.codex/plugins/cache/*/codex-session-logging/*/scripts/post_tool_use.py 2>/dev/null | head -n 1); [ -n \"$script\" ] && exec python3 \"$script\" || exit 0'"
           }
         ]
       }
@@ -38,8 +35,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "sh -c 'script=$(ls -td \"$HOME\"/.codex/plugins/cache/*/codex-session-logging/*/scripts/user_prompt_submit.py 2>/dev/null | head -n 1); [ -n \"$script\" ] && exec python3 \"$script\" || exit 0'",
-            "statusMessage": "Capturing Codex prompt"
+            "command": "sh -c 'script=$(ls -td \"$HOME\"/.codex/plugins/cache/*/codex-session-logging/*/scripts/user_prompt_submit.py 2>/dev/null | head -n 1); [ -n \"$script\" ] && exec python3 \"$script\" || exit 0'"
           }
         ]
       }
@@ -49,8 +45,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "sh -c 'script=$(ls -td \"$HOME\"/.codex/plugins/cache/*/codex-session-logging/*/scripts/stop.py 2>/dev/null | head -n 1); [ -n \"$script\" ] && exec python3 \"$script\" || exit 0'",
-            "statusMessage": "Capturing Codex response"
+            "command": "sh -c 'script=$(ls -td \"$HOME\"/.codex/plugins/cache/*/codex-session-logging/*/scripts/stop.py 2>/dev/null | head -n 1); [ -n \"$script\" ] && exec python3 \"$script\" || exit 0'"
           }
         ]
       }
