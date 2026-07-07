@@ -1,0 +1,54 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh -c 'script=$(ls -td \"$HOME\"/.codex/plugins/cache/*/codex-session-logging/*/scripts/session_start.py 2>/dev/null | head -n 1); [ -n \"$script\" ] && exec python3 \"$script\" || exit 0'"
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh -c 'script=$(ls -td \"$HOME\"/.codex/plugins/cache/*/codex-session-logging/*/scripts/pre_tool_use.py 2>/dev/null | head -n 1); [ -n \"$script\" ] && exec python3 \"$script\" || exit 0'"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh -c 'script=$(ls -td \"$HOME\"/.codex/plugins/cache/*/codex-session-logging/*/scripts/post_tool_use.py 2>/dev/null | head -n 1); [ -n \"$script\" ] && exec python3 \"$script\" || exit 0'"
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh -c 'script=$(ls -td \"$HOME\"/.codex/plugins/cache/*/codex-session-logging/*/scripts/user_prompt_submit.py 2>/dev/null | head -n 1); [ -n \"$script\" ] && exec python3 \"$script\" || exit 0'"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh -c 'script=$(ls -td \"$HOME\"/.codex/plugins/cache/*/codex-session-logging/*/scripts/stop.py 2>/dev/null | head -n 1); [ -n \"$script\" ] && exec python3 \"$script\" || exit 0'"
+          }
+        ]
+      }
+    ]
+  }
+}
