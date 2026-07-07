@@ -37,15 +37,21 @@ def load_update_plugin():
     return update_plugin
 
 
-def write_minimal_plugin(path: Path, *, version: str) -> Path:
-    plugin = path / "linear-progress-sync"
+def write_minimal_plugin(
+    path: Path,
+    *,
+    version: str,
+    name: str = "linear-progress-sync",
+    hook_events: tuple[str, ...] | None = None,
+) -> Path:
+    plugin = path / name
     (plugin / ".codex-plugin").mkdir(parents=True)
     (plugin / "scripts").mkdir()
     (plugin / "hooks").mkdir()
     (plugin / ".codex-plugin" / "plugin.json").write_text(
         json.dumps(
             {
-                "name": "linear-progress-sync",
+                "name": name,
                 "version": version,
                 "hooks": "./hooks/hooks.json",
                 "skills": "./skills/",
@@ -55,8 +61,22 @@ def write_minimal_plugin(path: Path, *, version: str) -> Path:
         + "\n",
         encoding="utf-8",
     )
-    (plugin / "scripts" / "linear_sync.py").write_text(f"VERSION = {version!r}\n", encoding="utf-8")
-    (plugin / "hooks" / "hooks.json").write_text('{"hooks": {}}\n', encoding="utf-8")
+    script_name = "linear_sync.py" if name == "linear-progress-sync" else "session_start.py"
+    (plugin / "scripts" / script_name).write_text(f"VERSION = {version!r}\n", encoding="utf-8")
+    hooks = {
+        event: [
+            {
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": f"python3 ~/.codex/plugins/cache/coreedge-local/{name}/{version}/scripts/{script_name}",
+                    }
+                ]
+            }
+        ]
+        for event in (hook_events or ())
+    }
+    (plugin / "hooks" / "hooks.json").write_text(json.dumps({"hooks": hooks}, indent=2) + "\n", encoding="utf-8")
     return plugin
 
 
@@ -66,6 +86,60 @@ def make_plugin_archive(tmp_path: Path, *, version: str) -> tuple[Path, str]:
     archive = tmp_path / f"linear-progress-sync-{version}.zip"
     with zipfile.ZipFile(archive, "w") as zip_file:
         for path in plugin.rglob("*"):
+            zip_file.write(path, path.relative_to(tmp_path / "payload"))
+    digest = hashlib.sha256(archive.read_bytes()).hexdigest()
+    return archive, digest
+
+
+def make_marketplace_archive(tmp_path: Path, *, bootstrap_version: str) -> tuple[Path, str]:
+    repo_root = tmp_path / "payload" / "codex-plugins-main"
+    plugins_root = repo_root / "plugins"
+    write_minimal_plugin(
+        plugins_root,
+        name="linear-progress-sync",
+        version=bootstrap_version,
+        hook_events=("SessionStart", "PreToolUse"),
+    )
+    write_minimal_plugin(
+        plugins_root,
+        name="codex-session-logging",
+        version="0.1.0",
+        hook_events=("SessionStart", "UserPromptSubmit"),
+    )
+    write_minimal_plugin(
+        plugins_root,
+        name="internal-experiment",
+        version="0.1.0",
+        hook_events=("SessionStart",),
+    )
+    marketplace = {
+        "name": "coreedge-local",
+        "plugins": [
+            {
+                "name": "linear-progress-sync",
+                "source": {"source": "local", "path": "./plugins/linear-progress-sync"},
+                "policy": {"installation": "AVAILABLE"},
+            },
+            {
+                "name": "codex-session-logging",
+                "source": {"source": "local", "path": "./plugins/codex-session-logging"},
+                "policy": {"installation": "INSTALLED_BY_DEFAULT"},
+            },
+            {
+                "name": "internal-experiment",
+                "source": {"source": "local", "path": "./plugins/internal-experiment"},
+                "policy": {"installation": "AVAILABLE"},
+            },
+        ],
+    }
+    (repo_root / ".agents" / "plugins").mkdir(parents=True)
+    (repo_root / ".agents" / "plugins" / "marketplace.json").write_text(
+        json.dumps(marketplace, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    archive = tmp_path / f"coreedge-local-{bootstrap_version}.zip"
+    with zipfile.ZipFile(archive, "w") as zip_file:
+        for path in repo_root.rglob("*"):
             zip_file.write(path, path.relative_to(tmp_path / "payload"))
     digest = hashlib.sha256(archive.read_bytes()).hexdigest()
     return archive, digest
@@ -1675,6 +1749,61 @@ def test_update_plugin_installs_newer_manifest_archive(tmp_path, monkeypatch):
     assert result["updated"] is True
     assert result["installed_version"] == "0.2.1"
     assert installed_manifest["version"] == "0.2.1"
+
+
+def test_update_plugin_syncs_default_marketplace_plugins_and_hooks_when_bootstrap_current(tmp_path, monkeypatch):
+    update_plugin = load_update_plugin()
+    monkeypatch.setenv("LINEAR_SYNC_CONFIG_DIR", str(tmp_path / "config"))
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex-home"))
+    cache_root = tmp_path / "cache" / "coreedge-local"
+    cache_parent = cache_root / "linear-progress-sync"
+    current = write_minimal_plugin(
+        cache_parent / "0.2.2",
+        version="0.2.2",
+        hook_events=("SessionStart", "PreToolUse"),
+    )
+    archive, digest = make_marketplace_archive(tmp_path, bootstrap_version="0.2.2")
+    manifest = tmp_path / "latest.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "version": "0.2.2",
+                "archive_url": archive.as_uri(),
+                "sha256": digest,
+                "plugin_subdir": "plugins/linear-progress-sync",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = update_plugin.run_update(
+        current_plugin_root=current,
+        cache_parent=cache_parent,
+        manifest_url=manifest.as_uri(),
+        state_path=tmp_path / "update-state.json",
+        force=True,
+    )
+    second = update_plugin.run_update(
+        current_plugin_root=current,
+        cache_parent=cache_parent,
+        manifest_url=manifest.as_uri(),
+        state_path=tmp_path / "update-state.json",
+        force=True,
+    )
+
+    hooks = json.loads((tmp_path / "codex-home" / "hooks.json").read_text(encoding="utf-8"))
+    hooks_text = json.dumps(hooks, sort_keys=True)
+    assert result["updated"] is True
+    assert {plugin["name"] for plugin in result["installed_plugins"]} == {"codex-session-logging"}
+    assert second["updated"] is False
+    assert second["installed_plugins"] == []
+    assert (cache_root / "codex-session-logging" / "0.1.0" / ".codex-plugin" / "plugin.json").exists()
+    assert not (cache_root / "internal-experiment").exists()
+    assert "linear-progress-sync" in hooks_text
+    assert "codex-session-logging" in hooks_text
+    assert "internal-experiment" not in hooks_text
+    assert hooks_text.count("codex-session-logging") == 2
+    assert hooks_text.count("linear-progress-sync") == 2
 
 
 def test_update_plugin_rejects_archive_with_wrong_sha(tmp_path, monkeypatch):
