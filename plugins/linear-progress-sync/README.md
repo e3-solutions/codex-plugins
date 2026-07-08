@@ -59,7 +59,7 @@ Installed plugin caches check for updates during every `SessionStart`. The updat
 To force a manual update check:
 
 ```bash
-python3 ~/.codex/plugins/cache/coreedge-local/linear-progress-sync/0.2.2/scripts/update_plugin.py --force
+python3 ~/.codex/plugins/cache/coreedge-local/linear-progress-sync/0.2.3/scripts/update_plugin.py --force
 ```
 
 ## Optional
