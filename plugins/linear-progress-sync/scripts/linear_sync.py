@@ -298,7 +298,7 @@ def normalize_repo_remote(remote: str) -> str | None:
 def repo_in_allowed_org(root: str | Path | None = None) -> bool:
     remote = repo_remote_identity(root)
     if not remote:
-        return True
+        return False
     return remote == ALLOWED_GITHUB_ORG or remote.startswith(f"{ALLOWED_GITHUB_ORG}/")
 
 

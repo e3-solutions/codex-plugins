@@ -19,7 +19,7 @@ Read-only inspection is allowed before kickoff. Before the first write or branch
 
 Pre-kickoff Bash blocks write-like commands and branch creation, not every unknown command. Allow read-only and non-mutating commands before kickoff. Block file edits, commands that appear to write files or mutate repo state, and branch creation until active Linear state exists.
 
-Linear kickoff enforcement only applies to repos whose `origin` remote is under the `e3-solutions` GitHub org. Repos with another GitHub org are out of scope and should be allowed without Linear kickoff.
+Linear kickoff enforcement only applies to repos whose `origin` remote is under the `e3-solutions` GitHub org. Repos with no `origin` remote or another GitHub org are out of scope and should be allowed without Linear kickoff.
 
 If active state is missing, run the Linear kickoff workflow before editing:
 
