@@ -1872,9 +1872,6 @@ def test_plugin_exposes_linear_start_command_and_pre_tool_guard_hook():
     assert "Do not ask the user for a Linear issue key" in command_text
     assert "do not stop, do not test write access" in command_text
     assert "activation_command" in command_text
-    assert "create a new issue automatically from the user's implementation request" in skill_text.lower()
-    assert "Do not ask the user for a Linear issue key" in skill_text
-    assert "do not stop, do not test write access" in skill_text
     assert "mcp__linear.list_teams" in command_text
     assert "mcp__linear.list_projects" in command_text
     assert "mcp__linear.get_issue" in command_text
@@ -1885,14 +1882,14 @@ def test_plugin_exposes_linear_start_command_and_pre_tool_guard_hook():
     assert "short Linear aliases like `list_teams` or `list_projects`" in command_text
     assert "do not stop after listing projects" in command_text
     assert "do not answer with a code patch or say you are blocked" in command_text
-    assert "do not answer with a code patch or say you are blocked" in skill_text
-    assert "choose their Linear user from that list" in skill_text
-    assert "choose the project from that list" in skill_text
+    assert len(skill_text.splitlines()) <= 40
+    assert "The command docs own the full sequence" in skill_text
+    assert "Do not answer with a patch" in skill_text
+    assert "ask for a Linear issue key" in skill_text
     assert "--disable-linear-sync" in skill_text
-    assert "update_plugin.py --force" in skill_text
-    assert "LINEAR_SYNC_AUTO_UPDATE=0" in skill_text
-    assert "configure-user" in skill_text
-    assert "Before writing code, opening implementation changes, or applying Codex file edits" in skill_text
+    assert "Codex bot: <stored Linear user name> at <ISO-8601 UTC timestamp>" in skill_text
+    assert "Before the first Codex file edit" in skill_text
+    assert "General Bash commands are allowed before kickoff" in skill_text
     assert "creating a branch" not in skill_text
     assert "Before the first write or branch creation" not in skill_text
     assert "mcp__codex_apps__linear._list_comments" in sync_command_text
