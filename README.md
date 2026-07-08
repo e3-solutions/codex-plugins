@@ -34,6 +34,8 @@ The first time the plugin is used, Codex lists Linear workspace users, asks you 
 
 The first time a repo needs a new Linear issue, Codex lists Linear teams/projects, asks you to choose the project from that list, and saves it in `~/.codex/linear-sync/repos.json`. Future tasks in that repo reuse the saved team/project automatically.
 
+New Linear issues created by Codex must be assigned to the saved Linear user and use a `What`, `Why`, and `How` description. `What` should describe the expected non-technical business outcome, `Why` should explain the user or business pain with evidence, and `How` should briefly outline the technical approach. Codex also appends `Codex bot: <stored Linear user name> at <ISO-8601 UTC timestamp>` to Linear issue bodies and comments it creates.
+
 To opt a repo out of Linear kickoff enforcement:
 
 ```bash
