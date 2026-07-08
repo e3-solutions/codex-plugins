@@ -36,6 +36,7 @@ CONFIG_DIR_ENV = "LINEAR_SYNC_CONFIG_DIR"
 DRY_RUN_ENV = "LINEAR_SYNC_DRY_RUN"
 CODEX_COMMAND_ENV = "LINEAR_SYNC_CODEX_COMMAND"
 THROTTLE_SECONDS = 30 * 60
+ALLOWED_GITHUB_ORG = "e3-solutions"
 LINEAR_MCP_URL = "https://mcp.linear.app/mcp"
 LINEAR_HOOK_EVENTS = ("SessionStart", "PreToolUse", "PostToolUse", "Stop")
 IGNORED_FILE_PREFIXES = (
@@ -275,9 +276,12 @@ def save_repo_bindings(config: JsonDict) -> JsonDict:
 
 
 def repo_identity(root: str | Path | None = None) -> str:
+    return repo_remote_identity(root) or str(repo_root(root))
+
+
+def repo_remote_identity(root: str | Path | None = None) -> str | None:
     remote = git_output(["remote", "get-url", "origin"], root=root)
-    normalized = normalize_repo_remote(remote)
-    return normalized or str(repo_root(root))
+    return normalize_repo_remote(remote)
 
 
 def normalize_repo_remote(remote: str) -> str | None:
@@ -291,21 +295,36 @@ def normalize_repo_remote(remote: str) -> str | None:
     return value.strip("/")
 
 
+def repo_in_allowed_org(root: str | Path | None = None) -> bool:
+    remote = repo_remote_identity(root)
+    if not remote:
+        return True
+    return remote == ALLOWED_GITHUB_ORG or remote.startswith(f"{ALLOWED_GITHUB_ORG}/")
+
+
 def repo_binding_status(*, root: str | Path | None = None) -> JsonDict:
     repo = repo_identity(root)
+    in_allowed_org = repo_in_allowed_org(root=root)
     config = read_repo_bindings()
     repos = config.get("repos") if isinstance(config.get("repos"), dict) else {}
     binding = repos.get(repo) if isinstance(repos, dict) else None
     disabled = isinstance(binding, dict) and binding.get("disabled") is True
+    scope_disabled = not in_allowed_org
     configured = (
         isinstance(binding, dict)
         and not disabled
+        and not scope_disabled
         and isinstance(binding.get("team"), str)
         and bool(binding.get("team", "").strip())
         and isinstance(binding.get("project"), str)
         and bool(binding.get("project", "").strip())
     )
-    if disabled:
+    if scope_disabled:
+        returned_binding = {
+            "disabled": True,
+            "reason": f"outside {ALLOWED_GITHUB_ORG} GitHub org",
+        }
+    elif disabled:
         returned_binding = {
             "disabled": True,
             "reason": str(binding.get("reason") or "").strip(),
@@ -315,7 +334,8 @@ def repo_binding_status(*, root: str | Path | None = None) -> JsonDict:
     return {
         "repo": repo,
         "configured": configured,
-        "disabled": disabled,
+        "disabled": disabled or scope_disabled,
+        "scope_disabled": scope_disabled,
         "binding": returned_binding,
         "config_path": str(repo_bindings_path()),
     }
@@ -954,7 +974,7 @@ def setup_plan(
             "First use lists Linear users, asks which user to save, and stores it in ~/.codex/linear-sync/user.json for all repos.",
             "First use in a repo lists Linear teams/projects, asks which project to save, and stores it in ~/.codex/linear-sync/repos.json.",
             "Repos that should not use Linear sync can be opted out with linear_start.py configure-repo --disable-linear-sync.",
-            "Installed plugins check for updates on SessionStart at most every six hours; set LINEAR_SYNC_AUTO_UPDATE=0 to disable.",
+            "Installed plugins check for updates on every SessionStart; set LINEAR_SYNC_AUTO_UPDATE=0 to disable.",
             "Before kickoff, file edits, write-like Bash commands, and branch creation wait for active Linear state.",
             "Per-repo Git hook setup is optional and only needed to sync commits made outside Codex.",
             "Start a new Codex thread after installing or updating the plugin so hooks and skills reload.",

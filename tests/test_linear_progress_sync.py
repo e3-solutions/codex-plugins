@@ -774,6 +774,53 @@ def test_pre_tool_guard_blocks_unbound_repo_writes_until_linear_destination_is_s
     assert "linear_start.py kickoff" in branch_decision.message
 
 
+def test_pre_tool_guard_allows_non_e3_origin_without_linear_binding(tmp_path, monkeypatch):
+    state_dir = tmp_path / "state"
+    config_dir = tmp_path / "config"
+    monkeypatch.setenv("LINEAR_SYNC_STATE_DIR", str(state_dir))
+    monkeypatch.setenv("LINEAR_SYNC_CONFIG_DIR", str(config_dir))
+    repo = init_git_repo(tmp_path / "repo", branch="arya/external-work")
+    add_origin(repo, "https://github.com/other-org/example.git")
+    linear_sync.save_linear_user_profile(linear_name="Arya G")
+
+    write_decision = linear_sync.pre_tool_guard_decision({"tool_name": "apply_patch"}, root=repo)
+    bash_decision = linear_sync.pre_tool_guard_decision(
+        {"tool_name": "Bash", "command": "rm app.py"},
+        root=repo,
+    )
+    branch_decision = linear_sync.pre_tool_guard_decision(
+        {"tool_name": "Bash", "command": "git switch -c arya/normal-work"},
+        root=repo,
+    )
+    status = linear_sync.repo_binding_status(root=repo)
+
+    assert status["disabled"] is True
+    assert status["scope_disabled"] is True
+    assert status["configured"] is False
+    assert status["binding"]["reason"] == "outside e3-solutions GitHub org"
+    assert write_decision.blocked is False
+    assert bash_decision.blocked is False
+    assert branch_decision.blocked is False
+
+
+def test_pre_tool_guard_blocks_e3_origin_without_linear_binding(tmp_path, monkeypatch):
+    state_dir = tmp_path / "state"
+    config_dir = tmp_path / "config"
+    monkeypatch.setenv("LINEAR_SYNC_STATE_DIR", str(state_dir))
+    monkeypatch.setenv("LINEAR_SYNC_CONFIG_DIR", str(config_dir))
+    repo = init_git_repo(tmp_path / "repo", branch="arya/e3-work")
+    add_origin(repo, "git@github.com:e3-solutions/example.git")
+    linear_sync.save_linear_user_profile(linear_name="Arya G")
+
+    write_decision = linear_sync.pre_tool_guard_decision({"tool_name": "apply_patch"}, root=repo)
+    status = linear_sync.repo_binding_status(root=repo)
+
+    assert status["disabled"] is False
+    assert status["scope_disabled"] is False
+    assert write_decision.blocked is True
+    assert write_decision.message.startswith("LINEAR DESTINATION REQUIRED")
+
+
 def test_pre_tool_guard_allows_opted_out_repo_without_user_or_active_state(tmp_path, monkeypatch):
     state_dir = tmp_path / "state"
     config_dir = tmp_path / "config"
@@ -1922,8 +1969,22 @@ def test_update_plugin_rejects_archive_with_wrong_sha(tmp_path, monkeypatch):
     assert not (cache_parent / "0.2.1").exists()
 
 
-def test_update_plugin_skips_recent_check(tmp_path):
+def test_update_plugin_checks_even_when_recently_checked(tmp_path):
     update_plugin = load_update_plugin()
+    current = write_minimal_plugin(tmp_path / "current", version="0.2.0")
+    archive, sha = make_plugin_archive(tmp_path, version="0.2.1")
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "version": "0.2.1",
+                "archive_url": archive.as_uri(),
+                "sha256": sha,
+                "plugin_subdir": "plugins/linear-progress-sync",
+            }
+        ),
+        encoding="utf-8",
+    )
     state_path = tmp_path / "update-state.json"
     update_plugin.write_update_state(
         state_path,
@@ -1931,17 +1992,16 @@ def test_update_plugin_skips_recent_check(tmp_path):
     )
 
     result = update_plugin.run_update(
-        current_plugin_root=write_minimal_plugin(tmp_path / "current", version="0.2.0"),
+        current_plugin_root=current,
         cache_parent=tmp_path / "cache",
-        manifest_url=(tmp_path / "missing.json").as_uri(),
+        manifest_url=manifest.as_uri(),
         state_path=state_path,
         now=datetime(2026, 7, 3, 18, 30, tzinfo=timezone.utc),
-        interval_seconds=3600,
         install_hooks=False,
     )
 
-    assert result["updated"] is False
-    assert result["skipped"] == "not due"
+    assert result["updated"] is True
+    assert result["installed_version"] == "0.2.1"
 
 
 def test_maybe_spawn_auto_update_passes_state_path(tmp_path, monkeypatch):
