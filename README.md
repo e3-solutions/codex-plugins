@@ -7,7 +7,7 @@ Current behavior:
 - Enforcement is scoped to git repos whose `origin` remote is under `e3-solutions/*`.
 - Repos with no `origin` remote, no git repo, or a non-E3 origin are out of scope and file edits are allowed without Linear kickoff.
 - Before kickoff in scoped repos, only file edits, write-like Bash commands, and branch creation are blocked. Read-only inspection and non-mutating commands are allowed.
-- Installed plugin caches auto-check for updates on every Codex `SessionStart`, install newer plugin versions, sync default marketplace plugins, and refresh global hook registrations.
+- Installed plugin caches auto-check for updates on every Codex `SessionStart`, install newer plugin versions from the current `main` archive, sync default marketplace plugins, and refresh global hook registrations.
 
 ## Setup
 
@@ -54,13 +54,28 @@ Before kickoff, file edits, write-like Bash commands, and branch creation wait u
 
 After kickoff, Codex writes and standard Codex commits are synced back to the active Linear issue automatically.
 
-Installed plugin caches check for updates during every `SessionStart`. The updater installs newer bootstrap versions into `~/.codex/plugins/cache/coreedge-local/linear-progress-sync/<version>/`, syncs coreedge-local marketplace plugins marked `INSTALLED_BY_DEFAULT`, and refreshes global Codex hook registrations. Set `LINEAR_SYNC_AUTO_UPDATE=0` to disable automatic checks.
+Installed plugin caches check for updates during every `SessionStart`. The updater downloads the current `main.zip` archive, reads the plugin manifest from that archive, installs newer bootstrap versions into `~/.codex/plugins/cache/coreedge-local/linear-progress-sync/<version>/`, syncs coreedge-local marketplace plugins marked `INSTALLED_BY_DEFAULT`, and refreshes global Codex hook registrations. Set `LINEAR_SYNC_AUTO_UPDATE=0` to disable automatic checks.
 
 To force a manual update check:
 
 ```bash
-python3 ~/.codex/plugins/cache/coreedge-local/linear-progress-sync/0.2.2/scripts/update_plugin.py --force
+python3 ~/.codex/plugins/cache/coreedge-local/linear-progress-sync/0.2.6/scripts/update_plugin.py --force
 ```
+
+## Rolling Out Updates
+
+Teammates install this repository once with `setup.py`. After that, they should not need to reinstall from the marketplace for normal plugin, skill, command, hook, or extension updates.
+
+To roll out a new default plugin or extension:
+
+1. Add or update the plugin under `plugins/<name>/`.
+2. Set a new version in `plugins/<name>/.codex-plugin/plugin.json`.
+3. Add the plugin to `.agents/plugins/marketplace.json`.
+4. Set its marketplace policy to `INSTALLED_BY_DEFAULT`.
+5. Bump `plugins/linear-progress-sync/.codex-plugin/plugin.json` and `plugins/linear-progress-sync/update-manifest.json`.
+6. Merge to `main`.
+
+On the next new Codex thread or session, the installed `linear-progress-sync` hook checks the fresh `main.zip` archive, installs newer default plugins, and refreshes `~/.codex/hooks.json` for hook plugins.
 
 ## Optional
 
