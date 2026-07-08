@@ -27,7 +27,7 @@ Start Linear-linked implementation work before any code edits.
      ```
 
    - This is a user-level setting stored in `~/.codex/linear-sync/user.json` and reused for every repo.
-   - Do not create the Linear issue, branch, PR, or code changes until the user profile is saved.
+   - Do not create the Linear issue, open the PR, or apply code changes until the user profile is saved.
 
 2. Resolve this repo's Linear destination.
    - Run `python3 <plugin-root>/scripts/linear_start.py repo-binding --root <root>`.
@@ -54,7 +54,7 @@ Start Linear-linked implementation work before any code edits.
 
    - Future kickoff in this repo uses the saved binding automatically.
    - Future work in an opted-out repo is allowed without Linear kickoff until a normal team/project binding is saved again.
-   - Do not create the Linear issue, branch, PR, or code changes until the chosen repo destination is saved.
+   - Do not create the Linear issue, open the PR, or apply code changes until the chosen repo destination is saved.
    - If a write is blocked because no repo destination is saved, do not answer with a code patch or say you are blocked. Continue by listing Linear destinations and asking the user to choose from the Linear project list.
 
 3. Resolve the Linear issue.

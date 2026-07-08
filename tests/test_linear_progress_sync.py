@@ -515,19 +515,14 @@ def test_pr_title_and_body_link_linear_without_closing():
     assert "https://linear.app/coreedge/issue/COR-37/create-kickoff-flow" in body
 
 
-def test_pre_tool_guard_blocks_writes_and_branch_creation_without_active_state(tmp_path, monkeypatch):
+def test_pre_tool_guard_blocks_file_edits_without_active_state(tmp_path, monkeypatch):
     monkeypatch.setenv("LINEAR_SYNC_STATE_DIR", str(tmp_path))
     bind_linear_repo(tmp_path, tmp_path, monkeypatch)
     linear_sync.save_linear_user_profile(linear_name="Arya G")
 
     write_decision = linear_sync.pre_tool_guard_decision({"tool_name": "apply_patch"}, root=tmp_path)
-    branch_decision = linear_sync.pre_tool_guard_decision(
-        {"tool_name": "Bash", "command": "git switch -c arya/new-work"},
-        root=tmp_path,
-    )
 
     assert write_decision.blocked is True
-    assert branch_decision.blocked is True
     assert "Linear kickoff" in write_decision.message
     assert "Do not ask the user for a Linear issue key" in write_decision.message
     assert "Create a new Linear issue from the user's implementation request" in write_decision.message
@@ -743,13 +738,8 @@ def test_pre_tool_guard_blocks_unbound_repo_writes_until_linear_destination_is_s
     linear_sync.save_linear_user_profile(linear_name="Arya G")
 
     write_decision = linear_sync.pre_tool_guard_decision({"tool_name": "apply_patch"}, root=repo)
-    branch_decision = linear_sync.pre_tool_guard_decision(
-        {"tool_name": "Bash", "command": "git switch -c arya/normal-work"},
-        root=repo,
-    )
 
     assert write_decision.blocked is True
-    assert branch_decision.blocked is True
     assert write_decision.message.startswith("LINEAR DESTINATION REQUIRED")
     assert "No Linear team/project is saved for this repo" in write_decision.message
     assert "LINEAR DESTINATION REQUIRED" in write_decision.message
@@ -764,15 +754,9 @@ def test_pre_tool_guard_blocks_unbound_repo_writes_until_linear_destination_is_s
     assert "This is the one required first-run human question" in write_decision.message
     assert "do not stop after listing projects" in write_decision.message
     assert "mcp__linear.save_issue" in write_decision.message
-    assert "before creating the issue, branch, or PR" in write_decision.message
+    assert "before creating the issue or opening the PR" in write_decision.message
     assert "Do not ask the user for a Linear issue key" in write_decision.message
     assert "Create a new Linear issue from the user's implementation request" in write_decision.message
-    assert branch_decision.message.startswith("LINEAR DESTINATION REQUIRED")
-    assert "Create or reset implementation branches only after the saved Linear destination exists" in branch_decision.message
-    assert "Do not answer with a code patch" in branch_decision.message
-    assert "This is the one required first-run human question" in branch_decision.message
-    assert "do not stop after listing projects" in branch_decision.message
-    assert "linear_start.py kickoff" in branch_decision.message
 
 
 def test_pre_tool_guard_allows_non_e3_origin_without_linear_binding(tmp_path, monkeypatch):
@@ -1061,41 +1045,19 @@ def test_pre_tool_guard_allows_unbound_repo_read_only_commands(tmp_path, monkeyp
         assert decision.blocked is False, command
 
 
-def test_pre_tool_guard_allows_unknown_non_write_bash_without_active_state(tmp_path, monkeypatch):
+def test_pre_tool_guard_allows_general_bash_without_active_state(tmp_path, monkeypatch):
     monkeypatch.setenv("LINEAR_SYNC_STATE_DIR", str(tmp_path))
     bind_linear_repo(tmp_path, tmp_path, monkeypatch)
-    commands = [
-        "perl -e 'print qq(hi)'",
-        "node -e 'console.log(\"hi\")'",
-        "python -m pytest -q",
-        "awk '{ print $1 }' app.py",
+    payloads = [
+        {"tool_name": "Bash", "command": "python -m pytest -q"},
+        {"tool_name": "Bash", "command": "touch app.py"},
+        {"tool_name": "Bash", "command": "git switch -c arya/normal-work"},
+        {"tool_name": "Bash"},
     ]
 
-    for command in commands:
-        decision = linear_sync.pre_tool_guard_decision(
-            {"tool_name": "Bash", "command": command},
-            root=tmp_path,
-        )
-        assert decision.blocked is False, command
-
-
-def test_pre_tool_guard_blocks_write_like_bash_without_active_state(tmp_path, monkeypatch):
-    monkeypatch.setenv("LINEAR_SYNC_STATE_DIR", str(tmp_path))
-    bind_linear_repo(tmp_path, tmp_path, monkeypatch)
-    linear_sync.save_linear_user_profile(linear_name="Arya G")
-    commands = [
-        "python - <<'PY'\nfrom pathlib import Path\nPath('app.py').write_text('hi')\nPY",
-        "sed -i '' 's/a/b/' app.py",
-        "rm app.py",
-    ]
-
-    for command in commands:
-        decision = linear_sync.pre_tool_guard_decision(
-            {"tool_name": "Bash", "command": command},
-            root=tmp_path,
-        )
-        assert decision.blocked is True, command
-        assert "appears to write files or mutate repo state" in decision.message
+    for payload in payloads:
+        decision = linear_sync.pre_tool_guard_decision(payload, root=tmp_path)
+        assert decision.blocked is False, payload
 
 
 def test_pre_tool_guard_blocks_unbound_repo_without_active_state(tmp_path, monkeypatch):
@@ -1108,16 +1070,15 @@ def test_pre_tool_guard_blocks_unbound_repo_without_active_state(tmp_path, monke
     linear_sync.save_linear_user_profile(linear_name="Arya G")
 
     write_decision = linear_sync.pre_tool_guard_decision({"tool_name": "apply_patch"}, root=repo)
-    branch_decision = linear_sync.pre_tool_guard_decision(
+    bash_decision = linear_sync.pre_tool_guard_decision(
         {"tool_name": "Bash", "command": "git switch -c arya/normal-work"},
         root=repo,
     )
 
     assert write_decision.blocked is True
-    assert branch_decision.blocked is True
+    assert bash_decision.blocked is False
     assert write_decision.message.startswith("LINEAR DESTINATION REQUIRED")
     assert "No Linear team/project is saved for this repo" in write_decision.message
-    assert branch_decision.message.startswith("LINEAR DESTINATION REQUIRED")
 
 
 def test_pre_tool_guard_blocks_writes_with_incomplete_active_state(tmp_path, monkeypatch):
@@ -1177,286 +1138,6 @@ def test_pre_tool_guard_blocks_when_current_branch_cannot_be_verified(tmp_path, 
 
     assert decision.blocked is True
     assert "current branch could not be verified" in decision.message
-
-
-def test_pre_tool_guard_blocks_long_form_branch_creation_without_active_state(tmp_path, monkeypatch):
-    monkeypatch.setenv("LINEAR_SYNC_STATE_DIR", str(tmp_path))
-    bind_linear_repo(tmp_path, tmp_path, monkeypatch)
-
-    commands = [
-        "git switch --create arya/new-work",
-        "git status --short\ngit switch -c arya/new-work",
-        "git status --short\ngit checkout -b arya/new-work",
-        "bash -lc 'git switch -c arya/new-work'",
-        "git checkout --branch arya/new-work",
-        "git checkout -B arya/new-work",
-        "git switch --orphan arya/new-work",
-        "git switch --track origin/arya/new-work",
-        "git checkout --track origin/arya/new-work",
-        "git branch --track arya/new-work origin/main",
-        "git branch -f arya/new-work origin/main",
-        "git branch --force arya/new-work origin/main",
-        "git branch --create-reflog arya/new-work origin/main",
-        "git branch --no-track arya/new-work HEAD",
-        "git branch --quiet arya/new-work HEAD",
-        "git branch -q arya/new-work HEAD",
-        "git worktree add ../new-worktree",
-        "git worktree add --orphan arya/new-work ../new-worktree",
-    ]
-
-    for command in commands:
-        decision = linear_sync.pre_tool_guard_decision(
-            {"tool_name": "Bash", "command": command},
-            root=tmp_path,
-        )
-        assert decision.blocked is True, command
-
-
-def test_pre_tool_guard_blocks_unsafe_bash_writes_without_active_state(tmp_path, monkeypatch):
-    monkeypatch.setenv("LINEAR_SYNC_STATE_DIR", str(tmp_path))
-    bind_linear_repo(tmp_path, tmp_path, monkeypatch)
-    commands = [
-        "touch app.py",
-        "sed -i '' 's/a/b/' app.py",
-        "perl -0pi -e 's/a/b/' app.py",
-        "perl -pi -e 's/a/b/' app.py",
-        "ruby -pi -e 'gsub(/a/, \"b\")' app.py",
-        "python3 -c 'open(\"app.py\", \"w\").write(\"x\")'",
-        "cat > app.py",
-        "echo hi > app.py",
-        "echo hi>app.py",
-        "cat README.md>copy.md",
-        "rg foo>out",
-        "echo hi &>out.log",
-        "python3 plugins/linear-progress-sync/scripts/linear_start.py repo-binding --root . > app.py",
-        "/linear-start > app.py",
-    ]
-
-    for command in commands:
-        decision = linear_sync.pre_tool_guard_decision(
-            {"tool_name": "Bash", "command": command},
-            root=tmp_path,
-        )
-        assert decision.blocked is True, command
-        assert "Linear kickoff" in decision.message
-
-
-def test_pre_tool_guard_blocks_shell_substitutions_without_active_state(tmp_path, monkeypatch):
-    monkeypatch.setenv("LINEAR_SYNC_STATE_DIR", str(tmp_path))
-    bind_linear_repo(tmp_path, tmp_path, monkeypatch)
-    commands = [
-        "git status $(touch app.py)",
-        "git status `touch app.py`",
-        "cat <(touch app.py)",
-        'echo "don\'t $(touch app.py)"',
-    ]
-
-    for command in commands:
-        decision = linear_sync.pre_tool_guard_decision(
-            {"tool_name": "Bash", "command": command},
-            root=tmp_path,
-        )
-        assert decision.blocked is True, command
-
-
-def test_pre_tool_guard_allows_general_bash_with_active_state(tmp_path, monkeypatch):
-    state_dir = tmp_path / "state"
-    monkeypatch.setenv("LINEAR_SYNC_STATE_DIR", str(state_dir))
-    save_linear_user(tmp_path, monkeypatch)
-    repo = init_git_repo(tmp_path / "repo", branch="arya/cor-49-active")
-    linear_sync.write_active_issue(
-        active_payload(repo, issue_key="COR-49", issue_title="Active Bash work", pr_number=49),
-        root=repo,
-    )
-    commands = [
-        "python3 -c 'open(\"app.py\", \"w\").write(\"x\")'",
-        "bash -c 'echo hi > app.py'",
-        "cmd='echo hi > app.py'; eval \"$cmd\"",
-        "cat README.md > copy.md",
-    ]
-
-    for command in commands:
-        decision = linear_sync.pre_tool_guard_decision(
-            {"tool_name": "Bash", "command": command},
-            root=repo,
-        )
-        assert decision.blocked is False, command
-
-
-def test_pre_tool_guard_blocks_update_ref_branch_creation_with_active_state(tmp_path, monkeypatch):
-    state_dir = tmp_path / "state"
-    monkeypatch.setenv("LINEAR_SYNC_STATE_DIR", str(state_dir))
-    save_linear_user(tmp_path, monkeypatch)
-    repo = init_git_repo(tmp_path / "repo", branch="arya/cor-56-active")
-    linear_sync.write_active_issue(
-        active_payload(repo, issue_key="COR-56", issue_title="Active update-ref guard", pr_number=56),
-        root=repo,
-    )
-
-    commands = [
-        "git update-ref refs/heads/arya/cor-57-bypass HEAD",
-        'printf "create refs/heads/arya/cor-57-bypass HEAD\\n" | git update-ref --stdin',
-        "git update-ref --stdin < /tmp/refs.txt",
-    ]
-
-    for command in commands:
-        decision = linear_sync.pre_tool_guard_decision(
-            {"tool_name": "Bash", "command": command},
-            root=repo,
-        )
-        assert decision.blocked is True, command
-        assert "only through the Linear kickoff workflow" in decision.message
-
-
-def test_pre_tool_guard_blocks_ref_writing_git_commands_with_active_state(tmp_path, monkeypatch):
-    state_dir = tmp_path / "state"
-    monkeypatch.setenv("LINEAR_SYNC_STATE_DIR", str(state_dir))
-    save_linear_user(tmp_path, monkeypatch)
-    repo = init_git_repo(tmp_path / "repo", branch="arya/cor-62-active")
-    linear_sync.write_active_issue(
-        active_payload(repo, issue_key="COR-62", issue_title="Active ref guard", pr_number=62),
-        root=repo,
-    )
-    commands = [
-        "/usr/bin/git switch -c arya/cor-63-bypass",
-        "/usr/bin/git update-ref refs/heads/arya/cor-63-bypass HEAD",
-        "git symbolic-ref refs/heads/arya/cor-63-bypass HEAD",
-        "git stash branch arya/cor-63-bypass",
-    ]
-
-    for command in commands:
-        decision = linear_sync.pre_tool_guard_decision(
-            {"tool_name": "Bash", "command": command},
-            root=repo,
-        )
-        assert decision.blocked is True, command
-        assert "only through the Linear kickoff workflow" in decision.message
-
-
-def test_pre_tool_guard_blocks_env_split_string_branch_creation_with_active_state(tmp_path, monkeypatch):
-    state_dir = tmp_path / "state"
-    monkeypatch.setenv("LINEAR_SYNC_STATE_DIR", str(state_dir))
-    save_linear_user(tmp_path, monkeypatch)
-    repo = init_git_repo(tmp_path / "repo", branch="arya/cor-64-active")
-    linear_sync.write_active_issue(
-        active_payload(repo, issue_key="COR-64", issue_title="Active env split guard", pr_number=64),
-        root=repo,
-    )
-
-    decision = linear_sync.pre_tool_guard_decision(
-        {"tool_name": "Bash", "command": 'env -S "git switch -c arya/cor-65-bypass"'},
-        root=repo,
-    )
-
-    assert decision.blocked is True
-    assert "only through the Linear kickoff workflow" in decision.message
-
-
-def test_pre_tool_guard_blocks_switch_and_checkout_with_active_state(tmp_path, monkeypatch):
-    state_dir = tmp_path / "state"
-    monkeypatch.setenv("LINEAR_SYNC_STATE_DIR", str(state_dir))
-    save_linear_user(tmp_path, monkeypatch)
-    repo = init_git_repo(tmp_path / "repo", branch="arya/cor-58-active")
-    linear_sync.write_active_issue(
-        active_payload(repo, issue_key="COR-58", issue_title="Active switch guard", pr_number=58),
-        root=repo,
-    )
-    commands = [
-        "git switch arya/cor-59-bypass",
-        "git checkout arya/cor-59-bypass",
-    ]
-
-    for command in commands:
-        decision = linear_sync.pre_tool_guard_decision(
-            {"tool_name": "Bash", "command": command},
-            root=repo,
-        )
-        assert decision.blocked is True, command
-        assert "only through the Linear kickoff workflow" in decision.message
-
-
-def test_pre_tool_guard_blocks_background_write_segments_without_active_state(tmp_path, monkeypatch):
-    monkeypatch.setenv("LINEAR_SYNC_STATE_DIR", str(tmp_path))
-    bind_linear_repo(tmp_path, tmp_path, monkeypatch)
-    commands = [
-        "git status & touch app.py",
-        "rg foo README.md & touch app.py",
-        "python3 plugins/linear-progress-sync/scripts/linear_start.py repo-binding --root . & touch app.py",
-    ]
-
-    for command in commands:
-        decision = linear_sync.pre_tool_guard_decision(
-            {"tool_name": "Bash", "command": command},
-            root=tmp_path,
-        )
-        assert decision.blocked is True, command
-
-
-def test_pre_tool_guard_allows_quoted_redirection_text_as_read_only(tmp_path, monkeypatch):
-    monkeypatch.setenv("LINEAR_SYNC_STATE_DIR", str(tmp_path))
-
-    commands = [
-        "rg '->' README.md",
-        'rg "foo|bar" README.md',
-        'grep "foo;bar" README.md',
-        'grep "(foo)" README.md',
-        'grep "{foo}" README.md',
-        "rg bash -c README.md",
-        "rg git switch -c README.md",
-        "echo git switch -c",
-        "rg eval README.md",
-        "rg GIT_CONFIG_COUNT=1 README.md",
-        "echo GIT_CONFIG_COUNT=1",
-        "git grep GIT_CONFIG_COUNT=1",
-        "rg env -S README.md",
-        "echo env -S",
-        "find . -name source -print",
-        "find . -name bash -print",
-        "git grep source",
-        "git grep eval",
-        "/usr/bin/git status --short",
-        'git log --pretty=format:"%h|%s"',
-    ]
-
-    for command in commands:
-        decision = linear_sync.pre_tool_guard_decision(
-            {"tool_name": "Bash", "command": command},
-            root=tmp_path,
-        )
-        assert decision.blocked is False, command
-
-
-def test_pre_tool_guard_blocks_branch_creation_even_with_active_state(tmp_path, monkeypatch):
-    state_dir = tmp_path / "state"
-    monkeypatch.setenv("LINEAR_SYNC_STATE_DIR", str(state_dir))
-    save_linear_user(tmp_path, monkeypatch)
-    repo = init_git_repo(tmp_path / "repo", branch="arya/cor-47-active")
-    linear_sync.write_active_issue(active_payload(repo, issue_key="COR-47", issue_title="Active", pr_number=47), root=repo)
-
-    decision = linear_sync.pre_tool_guard_decision(
-        {"tool_name": "Bash", "command": "git switch -c arya/cor-48-other-work"},
-        root=repo,
-    )
-
-    assert decision.blocked is True
-    assert "only through the Linear kickoff workflow" in decision.message
-
-
-def test_pre_tool_guard_blocks_chained_branch_creation_after_kickoff_helper(tmp_path, monkeypatch):
-    monkeypatch.setenv("LINEAR_SYNC_STATE_DIR", str(tmp_path))
-    bind_linear_repo(tmp_path, tmp_path, monkeypatch)
-    commands = [
-        "python3 plugins/linear-progress-sync/scripts/linear_start.py repo-binding --root . && git switch -c arya/bypass",
-        "echo linear_start.py; git switch -c arya/bypass",
-        "/linear-start && git checkout -B arya/bypass",
-    ]
-
-    for command in commands:
-        decision = linear_sync.pre_tool_guard_decision(
-            {"tool_name": "Bash", "command": command},
-            root=tmp_path,
-        )
-        assert decision.blocked is True, command
 
 
 def test_pre_tool_guard_blocks_kickoff_until_global_linear_user_profile_is_saved(tmp_path, monkeypatch):
@@ -1827,8 +1508,8 @@ def test_setup_plan_is_global_by_default_and_does_not_install_repo_hook(tmp_path
     assert "--disable-linear-sync" in notes
     assert "SessionStart" in notes
     assert "LINEAR_SYNC_AUTO_UPDATE=0" in notes
-    assert "write-like Bash commands" in notes
-    assert "branch creation wait for active Linear state" in notes
+    assert "Codex file edits through apply_patch wait" in notes
+    assert "general Bash commands are allowed" in notes
     assert "install_git_hook.py" not in commands
     assert plan["per_repo_setup_required"] is False
 
@@ -1854,7 +1535,7 @@ def test_setup_script_exists_and_exposes_dry_run():
     assert "--dry-run" in text
     assert "--with-git-hook" in text
     assert "codex mcp login linear" in text
-    assert "Before Linear kickoff, file edits, write-like Bash commands, and branch creation wait" in text
+    assert "Before Linear kickoff, Codex file edits through apply_patch wait" in text
     assert "No per-repo setup is needed" in text
 
 
@@ -1874,7 +1555,7 @@ def test_setup_summary_prints_team_next_steps(capsys):
     assert "list Linear users/projects" in output
     assert "--disable-linear-sync" in output
     assert "LINEAR_SYNC_AUTO_UPDATE=0" in output
-    assert "Before Linear kickoff, file edits, write-like Bash commands, and branch creation wait" in output
+    assert "Before Linear kickoff, Codex file edits through apply_patch wait" in output
     assert "No per-repo setup is needed" in output
 
 
@@ -2107,8 +1788,8 @@ def test_readmes_register_linear_mcp_before_linear_login():
         assert "saves it in `~/.codex/linear-sync/repos.json`" in text
         assert "update_plugin.py --force" in text
         assert "LINEAR_SYNC_AUTO_UPDATE=0" in text
-        assert "file edits, write-like Bash commands, and branch creation wait" in text
-        assert "Read-only and non-mutating Bash commands can run before kickoff" in text
+        assert "Codex file edits through `apply_patch` wait" in text
+        assert "General Bash commands are allowed before kickoff" in text
 
 
 def test_setup_run_step_does_not_treat_auth_failure_as_idempotent_success(monkeypatch):
@@ -2241,7 +1922,9 @@ def test_plugin_exposes_linear_start_command_and_pre_tool_guard_hook():
     assert "update_plugin.py --force" in skill_text
     assert "LINEAR_SYNC_AUTO_UPDATE=0" in skill_text
     assert "configure-user" in skill_text
-    assert "Do not create the Linear issue, branch, PR, or code changes until the chosen repo destination is saved" in skill_text
+    assert "Before writing code, opening implementation changes, or applying Codex file edits" in skill_text
+    assert "creating a branch" not in skill_text
+    assert "Before the first write or branch creation" not in skill_text
     assert "mcp__codex_apps__linear._list_comments" in sync_command_text
     assert "maybe_spawn_auto_update" in session_start_text
     assert manifest["hooks"] == "./hooks/hooks.json"

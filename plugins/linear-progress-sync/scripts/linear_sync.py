@@ -46,48 +46,6 @@ IGNORED_FILE_PREFIXES = (
 IGNORED_FILE_NAMES = {
     ".DS_Store",
 }
-READ_ONLY_BASH_EXECUTABLES = {
-    "basename",
-    "cat",
-    "date",
-    "df",
-    "dirname",
-    "du",
-    "egrep",
-    "fgrep",
-    "file",
-    "grep",
-    "head",
-    "id",
-    "ls",
-    "nl",
-    "printenv",
-    "pwd",
-    "readlink",
-    "realpath",
-    "rg",
-    "stat",
-    "tail",
-    "uname",
-    "wc",
-    "which",
-    "whoami",
-}
-WRITE_LIKE_BASH_EXECUTABLES = {
-    "chmod",
-    "chown",
-    "cp",
-    "install",
-    "ln",
-    "mkdir",
-    "mv",
-    "rm",
-    "rmdir",
-    "tee",
-    "touch",
-    "truncate",
-}
-SHELL_SCRIPT_EXECUTABLES = {"bash", "sh", "zsh"}
 SHELL_COMMAND_PUNCTUATION = ";&|<>"
 
 
@@ -975,7 +933,7 @@ def setup_plan(
             "First use in a repo lists Linear teams/projects, asks which project to save, and stores it in ~/.codex/linear-sync/repos.json.",
             "Repos that should not use Linear sync can be opted out with linear_start.py configure-repo --disable-linear-sync.",
             "Installed plugins check for updates on every SessionStart; set LINEAR_SYNC_AUTO_UPDATE=0 to disable.",
-            "Before kickoff, file edits, write-like Bash commands, and branch creation wait for active Linear state.",
+            "Before kickoff, Codex file edits through apply_patch wait for active Linear state; general Bash commands are allowed.",
             "Per-repo Git hook setup is optional and only needed to sync commits made outside Codex.",
             "Start a new Codex thread after installing or updating the plugin so hooks and skills reload.",
         ],
@@ -1822,7 +1780,7 @@ def pre_tool_guard_decision(payload: JsonDict, *, root: str | Path | None = None
     tool = tool_name(payload)
     normalized_tool = tool.lower()
     is_linear_write = linear_tool_is_write(normalized_tool)
-    requires_active_state = tool_requires_active_state(payload, normalized_tool)
+    is_codex_file_edit = codex_file_edit_tool(payload, normalized_tool)
     user_profile_required = not linear_user_profile_configured()
     guard_enabled = linear_guard_enabled(root=root)
     guard_disabled = linear_guard_disabled(root=root)
@@ -1834,33 +1792,9 @@ def pre_tool_guard_decision(payload: JsonDict, *, root: str | Path | None = None
             if user_profile_required and not linear_start_allowed_without_user_profile(command):
                 return PreToolGuardDecision(True, linear_user_profile_required_message(root=root))
             return PreToolGuardDecision(False)
-        if looks_like_branch_creation(command):
-            if user_profile_required:
-                return PreToolGuardDecision(True, linear_user_profile_required_message(root=root))
-            return PreToolGuardDecision(
-                True,
-                linear_branch_creation_blocked_message(root=root, needs_binding=not guard_enabled),
-            )
-        if bash_command_is_read_only(command):
-            return PreToolGuardDecision(False)
-        if not bash_command_is_write_like(command):
-            return PreToolGuardDecision(False)
-        if user_profile_required:
-            return PreToolGuardDecision(True, linear_user_profile_required_message(root=root))
-        if not guard_enabled:
-            return PreToolGuardDecision(True, linear_repo_binding_required_message(root=root))
-        problem = active_issue_write_problem(root=root)
-        if problem:
-            return PreToolGuardDecision(
-                True,
-                linear_kickoff_required_message(
-                    f"{problem}; Bash command appears to write files or mutate repo state",
-                    root=root,
-                ),
-            )
-        requires_active_state = True
+        return PreToolGuardDecision(False)
 
-    if requires_active_state:
+    if is_codex_file_edit:
         if user_profile_required:
             return PreToolGuardDecision(True, linear_user_profile_required_message(root=root))
         if not guard_enabled:
@@ -1880,8 +1814,10 @@ def pre_tool_guard_decision(payload: JsonDict, *, root: str | Path | None = None
     return PreToolGuardDecision(False)
 
 
-def tool_requires_active_state(payload: JsonDict, normalized_tool: str | None = None) -> bool:
+def codex_file_edit_tool(payload: JsonDict, normalized_tool: str | None = None) -> bool:
     tool = normalized_tool if normalized_tool is not None else tool_name(payload).lower()
+    # Codex file edits are reported as apply_patch. Edit/Write/MultiEdit are kept
+    # as compatibility aliases for older hook matcher names and test fixtures.
     if tool in {
         "apply_patch",
         "edit",
@@ -2074,7 +2010,7 @@ def continue_kickoff_instruction(
             f"{hard_stop}"
             "This is the one required first-run human "
             "question; do not ask for a Linear issue key and do not ask for coding approval. After the "
-            "human chooses, save the answer before doing any issue, branch, PR, or code work. Use the "
+            "human chooses, save the answer before creating an issue, opening a PR, or applying code edits. Use the "
             "connected Linear app tools to list destinations: mcp__codex_apps__linear._list_teams and "
             "mcp__codex_apps__linear._list_projects, or mcp__linear.list_teams and "
             "mcp__linear.list_projects. If the session exposes short Linear aliases like list_teams or "
@@ -2113,30 +2049,12 @@ def continue_kickoff_instruction(
     )
 
 
-def linear_branch_creation_blocked_message(
-    *,
-    root: str | Path | None = None,
-    needs_binding: bool = False,
-) -> str:
-    if needs_binding:
-        return (
-            f"{continue_kickoff_instruction(root=root, needs_binding=True)} "
-            "Create or reset implementation branches only after the saved Linear destination exists "
-            "and the Linear kickoff workflow creates the branch."
-        )
-    return (
-        "Create or reset implementation branches only through the Linear kickoff workflow. "
-        f"Run the automatic Linear kickoff workflow first so Linear, the branch, and the draft PR stay linked. "
-        f"{continue_kickoff_instruction(root=root, needs_binding=needs_binding)}"
-    )
-
-
 def linear_repo_binding_required_message(*, root: str | Path | None = None) -> str:
     return (
         "LINEAR DESTINATION REQUIRED. Do not answer with a code patch, do not say you are blocked, "
         "and do not stop. Your next action must be to list Linear teams/projects, then ask the human "
         "which Linear team/project this repo should use. No Linear team/project is saved for this repo. "
-        "Before writing code or creating branches, Codex must save that binding. "
+        "Before applying Codex file edits, Codex must save that binding. "
         "Do not tell the user to configure it manually. "
         "Do not ask the user for a Linear issue key. "
         "Create a new Linear issue from the user's implementation request unless the user explicitly "
@@ -2144,7 +2062,7 @@ def linear_repo_binding_required_message(*, root: str | Path | None = None) -> s
         "mcp__codex_apps__linear._list_projects, or mcp__linear.list_teams and mcp__linear.list_projects "
         "if the direct Linear namespace is exposed; present the Linear project list and ask the user only "
         "which Linear team/project this repo should use; save it with linear_start.py configure-repo before "
-        "creating the issue, branch, or PR. "
+        "creating the issue or opening the PR. "
         f"{continue_kickoff_instruction(root=root, needs_binding=True, include_hard_stop=False)}"
     )
 
@@ -2152,7 +2070,7 @@ def linear_repo_binding_required_message(*, root: str | Path | None = None) -> s
 def linear_kickoff_required_message(reason: str | None = None, *, root: str | Path | None = None) -> str:
     prefix = f"{reason}. " if reason else ""
     return (
-        f"{prefix}Linear kickoff is required before writing code or creating branches. "
+        f"{prefix}Linear kickoff is required before applying Codex file edits. "
         "Run the automatic Linear kickoff workflow first. Do not ask the user for a Linear issue key. "
         "Create a new Linear issue from the user's implementation request unless the user explicitly "
         "supplied an existing issue key; then create the Linear-named branch, push the empty kickoff "
@@ -2173,7 +2091,7 @@ def handle_post_tool_use(payload: JsonDict, *, root: str | Path | None = None) -
             queued = enqueue_event("post_commit", event, root=root)
             spawn_drain(root=root)
             return queued
-    if tool_requires_active_state(payload, tool.lower()):
+    if codex_file_edit_tool(payload, tool.lower()):
         paths = changed_paths_from_payload(payload)
         meaningful = [path for path in paths if meaningful_file(path)]
         if meaningful:
@@ -2244,23 +2162,6 @@ def looks_like_git_commit(command: str) -> bool:
     return bool(re.search(r"(^|[;&|]\s*)git\s+commit(\s|$)", command))
 
 
-def looks_like_branch_creation(command: str) -> bool:
-    if not command:
-        return False
-    return any(command_tokens_create_branch(tokens) for tokens in shell_command_tokens(command))
-
-
-def command_tokens_create_branch(tokens: list[str]) -> bool:
-    executable_tokens = strip_env_prefix(tokens)
-    if not executable_tokens:
-        return False
-    executable = Path(executable_tokens[0]).name
-    if executable in SHELL_SCRIPT_EXECUTABLES:
-        script = shell_c_script(executable_tokens)
-        return bool(script and looks_like_branch_creation(script))
-    return git_tokens_create_branch(executable_tokens)
-
-
 def shell_command_tokens(command: str) -> list[list[str]]:
     try:
         lexer = shlex.shlex(
@@ -2292,239 +2193,6 @@ def shell_token_is_separator(token: str) -> bool:
     return bool(token) and all(char in SHELL_COMMAND_PUNCTUATION for char in token)
 
 
-def git_tokens_create_branch(tokens: list[str]) -> bool:
-    executable_tokens = strip_env_prefix(tokens)
-    if not executable_tokens or read_only_shell_executable(Path(executable_tokens[0]).name):
-        return False
-    git_index = git_token_index(executable_tokens)
-    if git_index is None:
-        return False
-    args = skip_git_global_options(executable_tokens[git_index + 1 :])
-    if not args:
-        return False
-    command = args[0]
-    rest = args[1:]
-
-    if command in {"switch", "checkout"}:
-        return True
-    if command == "branch":
-        return git_branch_args_create_branch(rest)
-    if command == "update-ref":
-        return True
-    if command == "symbolic-ref":
-        return True
-    if command == "stash" and rest and rest[0] == "branch":
-        return True
-    if command == "worktree" and rest and rest[0] == "add":
-        return True
-
-    return False
-
-
-def git_token_index(tokens: list[str]) -> int | None:
-    for index, token in enumerate(tokens):
-        if Path(token).name == "git":
-            return index
-    return None
-
-
-def git_branch_args_create_branch(args: list[str]) -> bool:
-    if not args:
-        return False
-    if has_long_option(args, {"--copy", "--force-copy", "--track"}) or has_short_option(args, {"c", "C", "t"}):
-        return True
-    if has_long_option(args, {"--delete", "--move", "--list", "--all", "--remotes", "--show-current"}):
-        return False
-    if has_short_option(args, {"d", "D", "m", "M", "a", "r"}):
-        return False
-    operands = git_branch_operands(args)
-    if has_long_option(args, {"--force", "--create-reflog"}) or has_short_option(args, {"f"}):
-        return bool(operands)
-    return bool(operands)
-
-
-def git_branch_operands(args: list[str]) -> list[str]:
-    operands: list[str] = []
-    value_options = {
-        "--contains",
-        "--no-contains",
-        "--merged",
-        "--no-merged",
-        "--points-at",
-        "--format",
-        "--sort",
-        "--color",
-        "--column",
-        "--set-upstream-to",
-        "-u",
-    }
-    index = 0
-    while index < len(args):
-        arg = args[index]
-        if arg == "--":
-            operands.extend(args[index + 1 :])
-            break
-        if arg in value_options:
-            index += 2
-            continue
-        if any(arg.startswith(f"{option}=") for option in value_options if option.startswith("--")):
-            index += 1
-            continue
-        if arg.startswith("-"):
-            index += 1
-            continue
-        operands.append(arg)
-        index += 1
-    return operands
-
-
-def skip_git_global_options(args: list[str]) -> list[str]:
-    index = 0
-    value_options = {"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--config-env"}
-    while index < len(args):
-        arg = args[index]
-        if arg == "--":
-            index += 1
-            break
-        if arg in value_options:
-            index += 2
-            continue
-        if any(arg.startswith(f"{option}=") for option in value_options if option.startswith("--")):
-            index += 1
-            continue
-        if arg.startswith("-"):
-            index += 1
-            continue
-        break
-    return args[index:]
-
-
-def has_long_option(args: list[str], options: set[str]) -> bool:
-    return any(arg == option or arg.startswith(f"{option}=") for arg in args for option in options)
-
-
-def has_short_option(args: list[str], letters: set[str]) -> bool:
-    for arg in args:
-        if arg == "--":
-            return False
-        if arg.startswith("--"):
-            continue
-        if arg.startswith("-") and any(letter in arg[1:] for letter in letters):
-            return True
-    return False
-
-
-def bash_command_is_read_only(command: str) -> bool:
-    if (
-        shell_command_has_write_redirection(command)
-        or shell_command_has_substitution(command)
-        or shell_command_has_grouping(command)
-    ):
-        return False
-    segments = shell_command_tokens(command)
-    return bool(segments) and all(command_tokens_are_read_only(tokens) for tokens in segments)
-
-
-def command_tokens_are_read_only(tokens: list[str]) -> bool:
-    if not tokens or command_tokens_have_write_redirection(tokens):
-        return False
-    tokens = strip_env_prefix(tokens)
-    if not tokens:
-        return False
-    executable = Path(tokens[0]).name
-    if executable == "git":
-        return git_tokens_are_read_only(tokens)
-    if executable in READ_ONLY_BASH_EXECUTABLES:
-        return True
-    if executable == "sed":
-        return not has_short_option(tokens[1:], {"i"}) and not has_long_option(tokens[1:], {"--in-place"})
-    if executable == "find":
-        unsafe = {"-delete", "-exec", "-execdir", "-ok", "-okdir"}
-        return not any(token in unsafe for token in tokens[1:])
-    if executable in {"test", "[", "true", "false", "echo"}:
-        return True
-    return False
-
-
-def bash_command_is_write_like(command: str) -> bool:
-    if (
-        shell_command_has_write_redirection(command)
-        or shell_command_has_substitution(command)
-        or shell_command_has_grouping(command)
-    ):
-        return True
-    return any(command_tokens_are_write_like(tokens) for tokens in shell_command_tokens(command))
-
-
-def command_tokens_are_write_like(tokens: list[str]) -> bool:
-    if not tokens or command_tokens_have_write_redirection(tokens):
-        return bool(tokens)
-    tokens = strip_env_prefix(tokens)
-    if not tokens:
-        return False
-    executable = Path(tokens[0]).name
-    if command_tokens_create_branch(tokens):
-        return True
-    if executable in SHELL_SCRIPT_EXECUTABLES:
-        script = shell_c_script(tokens)
-        return bool(script and bash_command_is_write_like(script))
-    if executable == "git":
-        return git_tokens_are_write_like(tokens)
-    if executable in WRITE_LIKE_BASH_EXECUTABLES:
-        return True
-    if executable == "sed":
-        return has_short_option(tokens[1:], {"i"}) or has_long_option(tokens[1:], {"--in-place"})
-    if executable in {"perl", "ruby"}:
-        return in_place_script_tokens_are_write_like(tokens)
-    if executable in {"python", "python3"}:
-        return python_tokens_are_write_like(tokens)
-    return False
-
-
-def shell_c_script(tokens: list[str]) -> str | None:
-    for index, token in enumerate(tokens[1:], start=1):
-        if token == "--":
-            continue
-        if token == "-c" or (token.startswith("-") and not token.startswith("--") and "c" in token[1:]):
-            return tokens[index + 1] if index + 1 < len(tokens) else None
-    return None
-
-
-def python_tokens_are_write_like(tokens: list[str]) -> bool:
-    code: str | None = None
-    for index, token in enumerate(tokens[1:], start=1):
-        if token == "-c":
-            code = tokens[index + 1] if index + 1 < len(tokens) else None
-            break
-    if not code:
-        return False
-    write_markers = (
-        ".write(",
-        ".writelines(",
-        "write_text(",
-        "write_bytes(",
-        "unlink(",
-        "remove(",
-        "rename(",
-        "replace(",
-    )
-    return any(marker in code for marker in write_markers) or bool(
-        re.search(r"\bopen\s*\([^)]*,\s*['\"][^'\"]*[wax+]", code)
-    )
-
-
-def in_place_script_tokens_are_write_like(tokens: list[str]) -> bool:
-    return has_short_option(tokens[1:], {"i"}) or has_long_option(tokens[1:], {"--in-place"})
-
-
-def read_only_shell_executable(executable: str) -> bool:
-    return executable in READ_ONLY_BASH_EXECUTABLES or executable in {"test", "[", "true", "false", "echo"}
-
-
-def command_tokens_have_write_redirection(tokens: list[str]) -> bool:
-    return any(re.match(r"^(?:\d*>>?|&>)(?:.+)?$", token) for token in tokens)
-
-
 def shell_command_has_write_redirection(command: str) -> bool:
     in_single = False
     in_double = False
@@ -2544,63 +2212,6 @@ def shell_command_has_write_redirection(command: str) -> bool:
             continue
         if char == ">" and not in_single and not in_double:
             return True
-    return False
-
-
-def shell_command_has_grouping(command: str) -> bool:
-    in_single = False
-    in_double = False
-    escaped = False
-    for char in command or "":
-        if escaped:
-            escaped = False
-            continue
-        if char == "\\" and not in_single:
-            escaped = True
-            continue
-        if char == "'" and not in_double:
-            in_single = not in_single
-            continue
-        if char == '"' and not in_single:
-            in_double = not in_double
-            continue
-        if char in {"(", ")", "{", "}"} and not in_single and not in_double:
-            return True
-    return False
-
-
-def shell_command_has_substitution(command: str) -> bool:
-    in_single = False
-    in_double = False
-    escaped = False
-    text = command or ""
-    index = 0
-    while index < len(text):
-        char = text[index]
-        if escaped:
-            escaped = False
-            index += 1
-            continue
-        if char == "\\" and not in_single:
-            escaped = True
-            index += 1
-            continue
-        if char == "'" and not in_double:
-            in_single = not in_single
-            index += 1
-            continue
-        if char == '"' and not in_single:
-            in_double = not in_double
-            index += 1
-            continue
-        if not in_single and (
-            text.startswith("$(", index)
-            or text.startswith("<(", index)
-            or text.startswith(">(", index)
-            or char == "`"
-        ):
-            return True
-        index += 1
     return False
 
 
@@ -2644,134 +2255,6 @@ def safe_shlex_split(value: str) -> list[str]:
         return shlex.split(value)
     except ValueError:
         return []
-
-
-def git_tokens_are_read_only(tokens: list[str]) -> bool:
-    git_index = git_token_index(tokens)
-    if git_index is None:
-        return False
-    args = skip_git_global_options(tokens[git_index + 1 :])
-    if not args:
-        return False
-    command = args[0]
-    rest = args[1:]
-    always_read_only = {
-        "status",
-        "diff",
-        "log",
-        "show",
-        "rev-parse",
-        "ls-files",
-        "grep",
-        "describe",
-        "merge-base",
-    }
-    if command in always_read_only:
-        return True
-    if command == "remote":
-        return git_remote_args_are_read_only(rest)
-    if command == "config":
-        return git_config_args_are_read_only(rest)
-    if command == "branch":
-        return git_branch_args_are_read_only(rest)
-    return False
-
-
-def git_tokens_are_write_like(tokens: list[str]) -> bool:
-    git_index = git_token_index(tokens)
-    if git_index is None:
-        return False
-    args = skip_git_global_options(tokens[git_index + 1 :])
-    if not args:
-        return False
-    command = args[0]
-    rest = args[1:]
-    if command == "branch":
-        return not git_branch_args_are_read_only(rest)
-    if command == "config":
-        return not git_config_args_are_read_only(rest)
-    if command == "remote":
-        return not git_remote_args_are_read_only(rest)
-    return command in {
-        "add",
-        "am",
-        "apply",
-        "checkout",
-        "checkout-index",
-        "cherry-pick",
-        "clean",
-        "commit",
-        "merge",
-        "mv",
-        "pull",
-        "push",
-        "rebase",
-        "reset",
-        "restore",
-        "revert",
-        "rm",
-        "stash",
-        "switch",
-        "symbolic-ref",
-        "tag",
-        "update-index",
-        "update-ref",
-        "worktree",
-    }
-
-
-def git_remote_args_are_read_only(args: list[str]) -> bool:
-    if not args:
-        return True
-    if args[0] in {"-v", "--verbose"}:
-        return True
-    return args[0] in {"get-url", "show", "prune", "update"} and not any(arg in {"--add", "--delete"} for arg in args[1:])
-
-
-def git_config_args_are_read_only(args: list[str]) -> bool:
-    if not args:
-        return False
-    read_flags = {"--get", "--get-all", "--get-regexp", "--list", "-l", "--show-origin", "--show-scope"}
-    if any(arg in read_flags or arg.startswith("--get-urlmatch") for arg in args):
-        return True
-    non_value_options = {"--global", "--system", "--local", "--worktree", "--file", "-f"}
-    filtered = [arg for arg in args if arg not in non_value_options]
-    return len(filtered) == 1 and not filtered[0].startswith("-")
-
-
-def git_branch_args_are_read_only(args: list[str]) -> bool:
-    if not args:
-        return True
-    if git_branch_args_create_branch(args):
-        return False
-    if has_long_option(args, {"--delete", "--move", "--copy", "--force-copy"}):
-        return False
-    if has_short_option(args, {"d", "D", "m", "M", "c", "C"}):
-        return False
-    allowed_options = {
-        "--list",
-        "--all",
-        "--remotes",
-        "--show-current",
-        "--contains",
-        "--no-contains",
-        "--merged",
-        "--no-merged",
-        "--points-at",
-        "--format",
-        "--sort",
-        "--color",
-        "--column",
-        "--verbose",
-    }
-    for arg in args:
-        if arg == "--":
-            return True
-        if arg.startswith("--") and not any(arg == option or arg.startswith(f"{option}=") for option in allowed_options):
-            return False
-        if arg.startswith("-") and not arg.startswith("--") and not set(arg[1:]) <= {"a", "r", "v"}:
-            return False
-    return True
 
 
 def is_linear_start_command(command: str) -> bool:
