@@ -27,6 +27,8 @@ DEFAULT_MANIFEST_URL = (
     "https://raw.githubusercontent.com/e3-solutions/codex-plugins/main/"
     "plugins/linear-progress-sync/update-manifest.json"
 )
+DEFAULT_ARCHIVE_URL = "https://github.com/e3-solutions/codex-plugins/archive/refs/heads/main.zip"
+DEFAULT_PLUGIN_SUBDIR = "plugins/linear-progress-sync"
 AUTO_UPDATE_ENV = "LINEAR_SYNC_AUTO_UPDATE"
 MANIFEST_URL_ENV = "LINEAR_SYNC_UPDATE_MANIFEST_URL"
 
@@ -148,6 +150,17 @@ def read_manifest(url: str) -> JsonDict:
     if not isinstance(data, dict):
         raise ValueError("update manifest must be a JSON object")
     return data
+
+
+def read_manifest_file(path: str | Path) -> JsonDict:
+    data = json.loads(Path(path).read_text(encoding="utf-8"))
+    if not isinstance(data, dict):
+        raise ValueError("update manifest must be a JSON object")
+    return data
+
+
+def should_read_manifest_from_default_archive(url: str) -> bool:
+    return url.split("?", 1)[0] == DEFAULT_MANIFEST_URL
 
 
 def download_file(url: str, destination: Path) -> None:
@@ -475,22 +488,6 @@ def run_update(
             return {"updated": False, "skipped": "locked", "current_version": current_version}
 
     try:
-        url = manifest_url or os.environ.get(MANIFEST_URL_ENV) or state.get("manifest_url") or DEFAULT_MANIFEST_URL
-        manifest = read_manifest(str(url))
-        latest_version = str(manifest.get("version") or "").strip()
-        archive_url = str(manifest.get("archive_url") or "").strip()
-        if not latest_version or not archive_url:
-            raise ValueError("update manifest requires version and archive_url")
-
-        next_state = dict(state)
-        next_state.update(
-            {
-                "last_checked_at": now_iso(current_time),
-                "latest_version": latest_version,
-                "manifest_url": str(url),
-            }
-        )
-
         cache_root = marketplace_cache_root(cache_parent=cache_parent, plugin_root=root)
         installed_plugins: list[JsonDict] = []
         hook_results: list[JsonDict] = []
@@ -501,14 +498,40 @@ def run_update(
         with tempfile.TemporaryDirectory(prefix="linear-progress-sync-update.") as temp_dir:
             temp = Path(temp_dir)
             archive = temp / "update-archive"
-            download_file(archive_url, archive)
-            verify_sha256(archive, str(manifest.get("sha256") or "").strip() or None)
             extract_dir = temp / "extract"
             extract_dir.mkdir()
-            extract_archive(archive, extract_dir)
-            bootstrap_source = find_plugin_dir(
-                extract_dir,
-                str(manifest.get("plugin_subdir") or "").strip() or None,
+            url = manifest_url or os.environ.get(MANIFEST_URL_ENV) or state.get("manifest_url") or DEFAULT_MANIFEST_URL
+            if should_read_manifest_from_default_archive(str(url)):
+                archive_url = DEFAULT_ARCHIVE_URL
+                download_file(archive_url, archive)
+                extract_archive(archive, extract_dir)
+                bootstrap_source = find_plugin_dir(extract_dir, DEFAULT_PLUGIN_SUBDIR)
+                manifest = read_manifest_file(bootstrap_source / "update-manifest.json")
+                archive_url = str(manifest.get("archive_url") or "").strip() or DEFAULT_ARCHIVE_URL
+                verify_sha256(archive, str(manifest.get("sha256") or "").strip() or None)
+            else:
+                manifest = read_manifest(str(url))
+                archive_url = str(manifest.get("archive_url") or "").strip()
+                if not archive_url:
+                    raise ValueError("update manifest requires archive_url")
+                download_file(archive_url, archive)
+                verify_sha256(archive, str(manifest.get("sha256") or "").strip() or None)
+                extract_archive(archive, extract_dir)
+                bootstrap_source = find_plugin_dir(
+                    extract_dir,
+                    str(manifest.get("plugin_subdir") or "").strip() or None,
+                )
+
+            latest_version = str(manifest.get("version") or "").strip()
+            if not latest_version:
+                raise ValueError("update manifest requires version")
+            next_state = dict(state)
+            next_state.update(
+                {
+                    "last_checked_at": now_iso(current_time),
+                    "latest_version": latest_version,
+                    "manifest_url": str(url),
+                }
             )
             if version_is_newer(latest_version, current_version):
                 bootstrap_result = install_plugin_if_needed(bootstrap_source, cache_root=cache_root)

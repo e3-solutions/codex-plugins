@@ -83,6 +83,18 @@ def write_minimal_plugin(
 def make_plugin_archive(tmp_path: Path, *, version: str) -> tuple[Path, str]:
     payload_root = tmp_path / "payload" / "codex-plugins-main" / "plugins"
     plugin = write_minimal_plugin(payload_root, version=version)
+    (plugin / "update-manifest.json").write_text(
+        json.dumps(
+            {
+                "version": version,
+                "archive_url": "",
+                "plugin_subdir": "plugins/linear-progress-sync",
+            },
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
     archive = tmp_path / f"linear-progress-sync-{version}.zip"
     with zipfile.ZipFile(archive, "w") as zip_file:
         for path in plugin.rglob("*"):
@@ -2082,6 +2094,36 @@ def test_update_plugin_checks_even_when_recently_checked(tmp_path):
 
     assert result["updated"] is True
     assert result["installed_version"] == "0.2.1"
+
+
+def test_default_update_manifest_is_read_from_archive_not_stale_raw(tmp_path, monkeypatch):
+    update_plugin = load_update_plugin()
+    current = write_minimal_plugin(tmp_path / "current", version="0.2.4")
+    archive, _sha = make_plugin_archive(tmp_path, version="0.2.5")
+    state_path = tmp_path / "update-state.json"
+
+    monkeypatch.setattr(update_plugin, "DEFAULT_ARCHIVE_URL", archive.as_uri())
+    monkeypatch.setattr(
+        update_plugin,
+        "read_manifest",
+        lambda _url: {
+            "version": "0.2.4",
+            "archive_url": "file:///stale-archive.zip",
+            "plugin_subdir": "plugins/linear-progress-sync",
+        },
+    )
+
+    result = update_plugin.run_update(
+        current_plugin_root=current,
+        cache_parent=tmp_path / "cache",
+        manifest_url=update_plugin.DEFAULT_MANIFEST_URL,
+        state_path=state_path,
+        install_hooks=False,
+    )
+
+    assert result["updated"] is True
+    assert result["installed_version"] == "0.2.5"
+    assert result["latest_version"] == "0.2.5"
 
 
 def test_maybe_spawn_auto_update_passes_state_path(tmp_path, monkeypatch):
