@@ -46,6 +46,7 @@ export async function handleRequest(req: Request): Promise<Response> {
     if (recordType === "event") {
       const event = requireObject(payload.event, "event");
       const sanitizedEvent = sanitizeEventPayload(record, event);
+      await upsertSessionUser(record, client, userId);
       await uploadStorageObject(storagePath, sanitizedEvent);
       await upsertSession(
         record,
@@ -64,6 +65,7 @@ export async function handleRequest(req: Request): Promise<Response> {
 
     const message = requireObject(payload.message, "message");
     await validateMessageIntegrity(record, message);
+    await upsertSessionUser(record, client, userId);
     await uploadStorageObject(storagePath, message);
     await upsertSession(record, client, userId, remote);
     await upsertMessage(record, userId, storagePath);
@@ -220,6 +222,35 @@ async function upsertSession(
     updated_at: new Date().toISOString(),
   };
   await restUpsert("codex_sessions", row, "id");
+}
+
+async function upsertSessionUser(
+  record: JsonObject,
+  client: JsonObject,
+  userId: string,
+): Promise<void> {
+  const observedAt = requireString(record.created_at, "record.created_at");
+  const row: JsonObject = {
+    user_id: userId,
+    first_seen_at: observedAt,
+    last_seen_at: observedAt,
+  };
+  for (
+    const [sourceKey, column] of [
+      ["git_email", "git_email"],
+      ["git_user_name", "git_user_name"],
+      ["linear_user_name", "linear_user_name"],
+      ["local_username", "local_username"],
+      ["hostname", "hostname"],
+      ["installation_id", "installation_id"],
+    ]
+  ) {
+    const value = optionalString(client[sourceKey]);
+    if (value) {
+      row[column] = value;
+    }
+  }
+  await restUpsert("codex_session_users", row, "user_id");
 }
 
 async function sessionMetadataForUpsert(

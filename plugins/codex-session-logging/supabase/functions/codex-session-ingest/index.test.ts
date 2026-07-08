@@ -109,6 +109,94 @@ Deno.test("handleRequest preserves existing session codex setup on later event u
   }
 });
 
+Deno.test("handleRequest upserts session user identity rollup", async () => {
+  const requests: Array<{ url: string; body: JsonObject | null }> = [];
+  const originalFetch = globalThis.fetch;
+  const previousUrl = Deno.env.get("SUPABASE_URL");
+  const previousServiceRole = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
+
+  Deno.env.set("SUPABASE_URL", "https://project.supabase.co");
+  Deno.env.set("SUPABASE_SERVICE_ROLE_KEY", "service-role-key");
+  globalThis.fetch = async (input, init = {}) => {
+    const url = input instanceof Request
+      ? input.url
+      : input instanceof URL
+      ? input.toString()
+      : input;
+    const requestInit = init as { body?: BodyInit | null };
+    const body = typeof requestInit.body === "string"
+      ? JSON.parse(requestInit.body) as JsonObject
+      : null;
+    requests.push({ url, body });
+    if (url.includes("/rest/v1/codex_sessions?select=metadata")) {
+      return new Response(JSON.stringify([]), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    }
+    return new Response("", { status: 201 });
+  };
+
+  try {
+    const response = await handleRequest(
+      new Request("https://example.test/codex-session-ingest", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          version: 1,
+          record: {
+            id: "804fd832-7779-4665-9bec-2f10462c721b",
+            session_id: "session-users",
+            seq: 1,
+            role: "user",
+            content_sha256:
+              "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824",
+            content_byte_size: 5,
+            content_excerpt: "hello",
+            created_at: "2026-07-07T00:00:00.000Z",
+            metadata: { cwd: "/repo" },
+          },
+          message: {
+            content: "hello",
+          },
+          client: {
+            repo_remote: "https://github.com/e3-solutions/codex-plugins.git",
+            git_email: "priyal@example.test",
+            git_user_name: "Priyal Taneja",
+            linear_user_name: "Priyal",
+            local_username: "priayltaneja",
+            hostname: "e3s-MacBook-Air.local",
+            installation_id: "2ae2052b-f419-47d5-b76a-fe5afdbe4394",
+          },
+        }),
+      }),
+    );
+    const userUpsert = requests.find((request) =>
+      request.url.includes("/rest/v1/codex_session_users?on_conflict=user_id")
+    );
+    const sessionUpsert = requests.find((request) =>
+      request.url.includes("/rest/v1/codex_sessions?on_conflict=")
+    );
+
+    assertEquals(response.status, 200);
+    assertEquals(userUpsert?.body, {
+      user_id: sessionUpsert?.body?.user_id,
+      first_seen_at: "2026-07-07T00:00:00.000Z",
+      last_seen_at: "2026-07-07T00:00:00.000Z",
+      git_email: "priyal@example.test",
+      git_user_name: "Priyal Taneja",
+      linear_user_name: "Priyal",
+      local_username: "priayltaneja",
+      hostname: "e3s-MacBook-Air.local",
+      installation_id: "2ae2052b-f419-47d5-b76a-fe5afdbe4394",
+    });
+  } finally {
+    globalThis.fetch = originalFetch;
+    restoreEnv("SUPABASE_URL", previousUrl);
+    restoreEnv("SUPABASE_SERVICE_ROLE_KEY", previousServiceRole);
+  }
+});
+
 Deno.test("sanitizeEventPayload keeps only allowlisted tool event fields", () => {
   const sanitized = sanitizeEventPayload(
     {
