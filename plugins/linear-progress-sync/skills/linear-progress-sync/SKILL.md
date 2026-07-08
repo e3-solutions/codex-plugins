@@ -69,7 +69,7 @@ Set up the plugin, GitHub CLI check, and Linear MCP once:
 python3 plugins/linear-progress-sync/scripts/setup.py
 ```
 
-Installed plugin caches check for updates on SessionStart at most every six hours. The updater syncs coreedge-local marketplace plugins marked `INSTALLED_BY_DEFAULT`. Disable this with:
+Installed plugin caches check for updates on every SessionStart. The updater syncs coreedge-local marketplace plugins marked `INSTALLED_BY_DEFAULT`. Disable this with:
 
 ```bash
 LINEAR_SYNC_AUTO_UPDATE=0

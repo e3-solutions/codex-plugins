@@ -45,7 +45,7 @@ Before kickoff, file edits, write-like Bash commands, and branch creation wait u
 
 After kickoff, Codex writes and standard Codex commits are synced back to the active Linear issue automatically.
 
-Installed plugin caches check for updates during `SessionStart` at most every six hours. The updater installs newer bootstrap versions into `~/.codex/plugins/cache/coreedge-local/linear-progress-sync/<version>/`, syncs coreedge-local marketplace plugins marked `INSTALLED_BY_DEFAULT`, and refreshes global Codex hook registrations. Set `LINEAR_SYNC_AUTO_UPDATE=0` to disable automatic checks.
+Installed plugin caches check for updates during every `SessionStart`. The updater installs newer bootstrap versions into `~/.codex/plugins/cache/coreedge-local/linear-progress-sync/<version>/`, syncs coreedge-local marketplace plugins marked `INSTALLED_BY_DEFAULT`, and refreshes global Codex hook registrations. Set `LINEAR_SYNC_AUTO_UPDATE=0` to disable automatic checks.
 
 To force a manual update check:
 

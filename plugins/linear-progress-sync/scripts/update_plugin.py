@@ -23,7 +23,6 @@ JsonDict = dict[str, Any]
 PLUGIN_NAME = "linear-progress-sync"
 MARKETPLACE_PATH = ".agents/plugins/marketplace.json"
 DEFAULT_INSTALL_POLICY = "INSTALLED_BY_DEFAULT"
-DEFAULT_INTERVAL_SECONDS = 6 * 60 * 60
 DEFAULT_MANIFEST_URL = (
     "https://raw.githubusercontent.com/e3-solutions/codex-plugins/main/"
     "plugins/linear-progress-sync/update-manifest.json"
@@ -93,21 +92,6 @@ def auto_update_enabled(state: JsonDict | None = None) -> bool:
         return False
     config = state or {}
     return config.get("enabled") is not False
-
-
-def should_check_for_update(
-    state: JsonDict,
-    *,
-    now: datetime | None = None,
-    interval_seconds: int = DEFAULT_INTERVAL_SECONDS,
-) -> bool:
-    last_checked = parse_time(state.get("last_checked_at"))
-    if last_checked is None:
-        return True
-    current = now or utc_now()
-    if current.tzinfo is None:
-        current = current.replace(tzinfo=timezone.utc)
-    return (current.astimezone(timezone.utc) - last_checked).total_seconds() >= interval_seconds
 
 
 def version_parts(version: str) -> tuple[int, ...]:
@@ -471,7 +455,6 @@ def run_update(
     state_path: str | Path | None = None,
     force: bool = False,
     now: datetime | None = None,
-    interval_seconds: int = DEFAULT_INTERVAL_SECONDS,
     install_hooks: bool = True,
     use_lock: bool = True,
 ) -> JsonDict:
@@ -482,8 +465,6 @@ def run_update(
     current_time = now or utc_now()
     if not auto_update_enabled(state):
         return {"updated": False, "skipped": "disabled", "current_version": current_version}
-    if not force and not should_check_for_update(state, now=current_time, interval_seconds=interval_seconds):
-        return {"updated": False, "skipped": "not due", "current_version": current_version}
 
     lock_fd: int | None = None
     lock_path = update_lock_path(state_file)
@@ -608,14 +589,11 @@ def maybe_spawn_auto_update(
     *,
     plugin_root: str | Path | None = None,
     state_path: str | Path | None = None,
-    interval_seconds: int = DEFAULT_INTERVAL_SECONDS,
 ) -> JsonDict:
     state_file = Path(state_path or update_state_path())
     state = read_update_state(state_file)
     if not auto_update_enabled(state):
         return {"spawned": False, "reason": "disabled"}
-    if not should_check_for_update(state, interval_seconds=interval_seconds):
-        return {"spawned": False, "reason": "not due"}
     script = Path(__file__).resolve()
     args = [sys.executable, str(script)]
     if plugin_root:

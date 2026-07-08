@@ -954,7 +954,7 @@ def setup_plan(
             "First use lists Linear users, asks which user to save, and stores it in ~/.codex/linear-sync/user.json for all repos.",
             "First use in a repo lists Linear teams/projects, asks which project to save, and stores it in ~/.codex/linear-sync/repos.json.",
             "Repos that should not use Linear sync can be opted out with linear_start.py configure-repo --disable-linear-sync.",
-            "Installed plugins check for updates on SessionStart at most every six hours; set LINEAR_SYNC_AUTO_UPDATE=0 to disable.",
+            "Installed plugins check for updates on every SessionStart; set LINEAR_SYNC_AUTO_UPDATE=0 to disable.",
             "Before kickoff, file edits, write-like Bash commands, and branch creation wait for active Linear state.",
             "Per-repo Git hook setup is optional and only needed to sync commits made outside Codex.",
             "Start a new Codex thread after installing or updating the plugin so hooks and skills reload.",
