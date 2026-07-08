@@ -690,6 +690,44 @@ def test_ingest_payload_includes_git_identity_hints_for_server_side_user_mapping
     assert payload["client"]["hostname"] == "arya-mbp"
 
 
+def test_ingest_payload_includes_saved_linear_user_name_when_git_identity_is_missing(tmp_path, monkeypatch):
+    codex_home = tmp_path / "codex-home"
+    user_profile_path = codex_home / "linear-sync" / "user.json"
+    user_profile_path.parent.mkdir(parents=True)
+    user_profile_path.write_text(json.dumps({"linear_name": "Priyal"}) + "\n", encoding="utf-8")
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    session_logging = load_session_logging()
+    repo = init_git_repo(tmp_path / "repo", "https://github.com/e3-solutions/codex-plugins.git")
+    message_path = tmp_path / "users" / "local" / "sessions" / "session-123" / "messages" / "000001-user.json"
+    message_path.parent.mkdir(parents=True)
+    message_path.write_text('{"content": "map me", "role": "user"}\n', encoding="utf-8")
+    record = {
+        "id": "22222222222222222222222222222222",
+        "session_id": "session-123",
+        "turn_id": "turn-1",
+        "seq": 1,
+        "role": "user",
+        "storage_path": "users/local/sessions/session-123/messages/000001-user.json",
+        "local_content_path": "users/local/sessions/session-123/messages/000001-user.json",
+        "content_sha256": "abc123",
+        "content_byte_size": 6,
+        "content_excerpt": "map me",
+        "metadata": {"cwd": str(repo)},
+        "created_at": "2026-07-03T00:00:00+00:00",
+    }
+
+    monkeypatch.setattr(session_logging.socket, "gethostname", lambda: "e3s-MacBook-Air.local")
+    monkeypatch.setattr(session_logging.getpass, "getuser", lambda: "priayltaneja")
+    monkeypatch.setattr(session_logging, "git_config_value", lambda cwd, key: None)
+
+    payload = session_logging.build_ingest_payload(record, base=tmp_path)
+
+    assert payload["client"]["linear_user_name"] == "Priyal"
+    assert payload["client"]["identity_key"] == f"installation:{payload['client']['installation_id']}"
+    assert "git_email" not in payload["client"]
+    assert "git_user_name" not in payload["client"]
+
+
 def test_plugin_packaging_and_supabase_migration_are_present():
     manifest_path = ROOT / "plugins" / "codex-session-logging" / ".codex-plugin" / "plugin.json"
     hooks_path = ROOT / "plugins" / "codex-session-logging" / "hooks" / "hooks.json"

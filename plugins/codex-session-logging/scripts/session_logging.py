@@ -827,6 +827,7 @@ def client_context(record: JsonDict, *, base: Path) -> JsonDict:
         "git_email": git_email,
         "git_user_name": git_config_value(cwd, "user.name") if cwd else None,
         "git_branch": current_git_branch(cwd) if cwd else None,
+        "linear_user_name": saved_linear_user_name(),
         "hostname": hostname,
         "local_username": username,
         "installation_id": installation_id,
@@ -880,6 +881,21 @@ def client_identity_key(
     if hostname:
         return f"hostname:{hostname.strip()}"
     return None
+
+
+def saved_linear_user_name() -> str | None:
+    path = codex_config_path().parent / "linear-sync" / "user.json"
+    try:
+        loaded = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(loaded, dict):
+        return None
+    value = loaded.get("linear_name")
+    if not isinstance(value, str):
+        return None
+    stripped = value.strip()
+    return stripped or None
 
 
 def git_config_value(cwd: str, key: str) -> str | None:
