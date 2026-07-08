@@ -880,7 +880,7 @@ def test_opted_out_repo_does_not_drain_or_prepare_linear_sync(tmp_path, monkeypa
     assert remaining_events == []
 
 
-def test_pre_tool_guard_blocks_desktop_file_change_without_active_state(tmp_path, monkeypatch):
+def test_pre_tool_guard_blocks_apply_patch_without_active_state(tmp_path, monkeypatch):
     state_dir = tmp_path / "state"
     config_dir = tmp_path / "config"
     monkeypatch.setenv("LINEAR_SYNC_STATE_DIR", str(state_dir))
@@ -891,13 +891,10 @@ def test_pre_tool_guard_blocks_desktop_file_change_without_active_state(tmp_path
     decisions = [
         linear_sync.pre_tool_guard_decision({"tool_name": name}, root=repo)
         for name in (
-            "fileChange",
-            "FileChange",
-            "file_change",
+            "apply_patch",
+            "Edit",
             "MultiEdit",
-            "create_file",
-            "fileCreate",
-            "FileCreate",
+            "Write",
         )
     ]
 
@@ -905,49 +902,65 @@ def test_pre_tool_guard_blocks_desktop_file_change_without_active_state(tmp_path
     assert all("No Linear team/project is saved for this repo" in decision.message for decision in decisions)
 
 
-def test_pre_tool_guard_blocks_create_operation_with_path_without_active_state(tmp_path, monkeypatch):
+def test_changed_paths_from_apply_patch_command_includes_added_files():
+    paths = linear_sync.changed_paths_from_payload(
+        {
+            "tool_name": "apply_patch",
+            "tool_input": {
+                "command": """*** Begin Patch
+*** Add File: src/new_module.py
++print("hello")
+*** Update File: src/existing.py
+@@
+-old
++new
+*** Delete File: obsolete.py
+*** End Patch
+""",
+            },
+        }
+    )
+
+    assert paths == ["obsolete.py", "src/existing.py", "src/new_module.py"]
+
+
+def test_handle_post_tool_use_queues_apply_patch_added_file(tmp_path, monkeypatch):
     state_dir = tmp_path / "state"
     config_dir = tmp_path / "config"
     monkeypatch.setenv("LINEAR_SYNC_STATE_DIR", str(state_dir))
     monkeypatch.setenv("LINEAR_SYNC_CONFIG_DIR", str(config_dir))
-    repo = init_git_repo(tmp_path / "repo", branch="arya/no-linear-binding")
+    repo = init_git_repo(tmp_path / "repo", branch="arya/cor-55-work")
     linear_sync.save_linear_user_profile(linear_name="Arya G")
-
-    decision = linear_sync.pre_tool_guard_decision(
+    linear_sync.write_active_issue(
         {
-            "tool_name": "desktop_file",
+            "issue_key": "COR-55",
+            "issue_title": "Track new files",
+            "issue_url": "https://linear.app/coreedge/issue/COR-55/track-new-files",
+            "branch": "arya/cor-55-work",
+            "repo": str(repo),
+            "pr_url": "https://github.com/e3-solutions/codex-plugins/pull/55",
+            "pr_number": 55,
+            "linear_linked_at": "2026-07-01T00:00:00+00:00",
+        },
+        root=repo,
+    )
+
+    queued = linear_sync.handle_post_tool_use(
+        {
+            "tool_name": "apply_patch",
             "tool_input": {
-                "operation": "create",
-                "file_path": "new_module.py",
+                "command": """*** Begin Patch
+*** Add File: src/new_module.py
++print("hello")
+*** End Patch
+""",
             },
         },
         root=repo,
     )
 
-    assert decision.blocked is True
-    assert "No Linear team/project is saved for this repo" in decision.message
-
-
-def test_pre_tool_guard_allows_generic_create_without_file_path(tmp_path, monkeypatch):
-    state_dir = tmp_path / "state"
-    config_dir = tmp_path / "config"
-    monkeypatch.setenv("LINEAR_SYNC_STATE_DIR", str(state_dir))
-    monkeypatch.setenv("LINEAR_SYNC_CONFIG_DIR", str(config_dir))
-    repo = init_git_repo(tmp_path / "repo", branch="arya/no-linear-binding")
-    linear_sync.save_linear_user_profile(linear_name="Arya G")
-
-    decision = linear_sync.pre_tool_guard_decision(
-        {
-            "tool_name": "Create",
-            "tool_input": {
-                "operation": "create",
-                "title": "Non-file resource",
-            },
-        },
-        root=repo,
-    )
-
-    assert decision.blocked is False
+    assert queued is not None
+    assert queued["changed_files"] == ["src/new_module.py"]
 
 
 def test_pre_tool_guard_allows_unbound_repo_read_only_commands(tmp_path, monkeypatch):

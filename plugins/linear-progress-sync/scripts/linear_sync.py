@@ -1864,23 +1864,11 @@ def tool_requires_active_state(payload: JsonDict, normalized_tool: str | None = 
     tool = normalized_tool if normalized_tool is not None else tool_name(payload).lower()
     if tool in {
         "apply_patch",
-        "create_file",
         "edit",
-        "filechange",
-        "file_change",
-        "filecreate",
-        "file_create",
         "multiedit",
         "write",
     }:
         return True
-    operation = (
-        payload.get("operation")
-        or nested(payload, "tool_input", "operation")
-        or nested(payload, "input", "operation")
-    )
-    if isinstance(operation, str) and operation.strip().lower() in {"add", "create", "new", "write"}:
-        return bool(changed_paths_from_payload(payload))
     return False
 
 
@@ -2852,7 +2840,25 @@ def changed_paths_from_payload(payload: JsonDict) -> list[str]:
         value = payload.get(key)
         if isinstance(value, list):
             paths.extend(str(item) for item in value)
+    if tool_name(payload).lower() == "apply_patch":
+        paths.extend(paths_from_apply_patch_command(tool_command(payload)))
     return sorted({normalize_repo_path(path) for path in paths if path})
+
+
+def paths_from_apply_patch_command(command: str) -> list[str]:
+    paths: list[str] = []
+    for raw_line in command.splitlines():
+        line = raw_line.strip()
+        for prefix in (
+            "*** Add File: ",
+            "*** Update File: ",
+            "*** Delete File: ",
+            "*** Move to: ",
+        ):
+            if line.startswith(prefix):
+                paths.append(line[len(prefix) :].strip())
+                break
+    return paths
 
 
 def normalize_repo_path(path: str) -> str:
