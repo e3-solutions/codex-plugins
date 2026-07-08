@@ -955,7 +955,7 @@ def setup_plan(
             "First use in a repo lists Linear teams/projects, asks which project to save, and stores it in ~/.codex/linear-sync/repos.json.",
             "Repos that should not use Linear sync can be opted out with linear_start.py configure-repo --disable-linear-sync.",
             "Installed plugins check for updates on SessionStart at most every six hours; set LINEAR_SYNC_AUTO_UPDATE=0 to disable.",
-            "Before kickoff, Bash is a read-only allowlist; unknown scripts, tests, builds, writes, and branch creation wait for active Linear state.",
+            "Before kickoff, file edits, write-like Bash commands, and branch creation wait for active Linear state.",
             "Per-repo Git hook setup is optional and only needed to sync commits made outside Codex.",
             "Start a new Codex thread after installing or updating the plugin so hooks and skills reload.",
         ],
@@ -1823,6 +1823,8 @@ def pre_tool_guard_decision(payload: JsonDict, *, root: str | Path | None = None
             )
         if bash_command_is_read_only(command):
             return PreToolGuardDecision(False)
+        if not bash_command_is_write_like(command):
+            return PreToolGuardDecision(False)
         if user_profile_required:
             return PreToolGuardDecision(True, linear_user_profile_required_message(root=root))
         if not guard_enabled:
@@ -1832,12 +1834,10 @@ def pre_tool_guard_decision(payload: JsonDict, *, root: str | Path | None = None
             return PreToolGuardDecision(
                 True,
                 linear_kickoff_required_message(
-                    f"{problem}; Bash command is not on the pre-kickoff read-only allowlist",
+                    f"{problem}; Bash command appears to write files or mutate repo state",
                     root=root,
                 ),
             )
-        if not bash_command_is_write_like(command):
-            return PreToolGuardDecision(False)
         requires_active_state = True
 
     if requires_active_state:

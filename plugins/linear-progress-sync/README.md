@@ -41,7 +41,7 @@ python3 plugins/linear-progress-sync/scripts/linear_start.py configure-repo \
   --reason "No Linear tracking"
 ```
 
-Before kickoff, Bash uses a read-only allowlist. Simple inspection commands like `pwd`, `ls`, `cat`, `rg`, `grep`, `stat`, and read-only `git` commands work. Unknown scripts, tests, builds, file writes, and branch creation wait until active Linear state exists.
+Before kickoff, file edits, write-like Bash commands, and branch creation wait until active Linear state exists. Read-only and non-mutating Bash commands can run before kickoff.
 
 After kickoff, Codex writes and standard Codex commits are synced back to the active Linear issue automatically.
 

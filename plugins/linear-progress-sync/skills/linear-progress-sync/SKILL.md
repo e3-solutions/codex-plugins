@@ -17,7 +17,7 @@ Before writing code, creating a branch, or opening implementation changes, check
 
 Read-only inspection is allowed before kickoff. Before the first write or branch creation in any repo, Codex must have a saved Linear team/project binding or an existing active state.
 
-Pre-kickoff Bash uses a read-only allowlist, not a write-command blacklist. Allow simple inspection commands such as `pwd`, `ls`, `cat`, `head`, `tail`, `wc`, `rg`, `grep`, `sed` without `-i`, `find` without exec/delete actions, `stat`, `date`, and read-only `git` commands. Block unknown shell commands until active Linear state exists.
+Pre-kickoff Bash blocks write-like commands and branch creation, not every unknown command. Allow read-only and non-mutating commands before kickoff. Block file edits, commands that appear to write files or mutate repo state, and branch creation until active Linear state exists.
 
 If active state is missing, run the Linear kickoff workflow before editing:
 
