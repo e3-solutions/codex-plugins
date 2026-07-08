@@ -880,7 +880,7 @@ def test_opted_out_repo_does_not_drain_or_prepare_linear_sync(tmp_path, monkeypa
     assert remaining_events == []
 
 
-def test_pre_tool_guard_blocks_desktop_file_change_without_active_state(tmp_path, monkeypatch):
+def test_pre_tool_guard_blocks_apply_patch_without_active_state(tmp_path, monkeypatch):
     state_dir = tmp_path / "state"
     config_dir = tmp_path / "config"
     monkeypatch.setenv("LINEAR_SYNC_STATE_DIR", str(state_dir))
@@ -890,11 +890,77 @@ def test_pre_tool_guard_blocks_desktop_file_change_without_active_state(tmp_path
 
     decisions = [
         linear_sync.pre_tool_guard_decision({"tool_name": name}, root=repo)
-        for name in ("fileChange", "FileChange", "file_change", "MultiEdit")
+        for name in (
+            "apply_patch",
+            "Edit",
+            "MultiEdit",
+            "Write",
+        )
     ]
 
     assert all(decision.blocked for decision in decisions)
     assert all("No Linear team/project is saved for this repo" in decision.message for decision in decisions)
+
+
+def test_changed_paths_from_apply_patch_command_includes_added_files():
+    paths = linear_sync.changed_paths_from_payload(
+        {
+            "tool_name": "apply_patch",
+            "tool_input": {
+                "command": """*** Begin Patch
+*** Add File: src/new_module.py
++print("hello")
+*** Update File: src/existing.py
+@@
+-old
++new
+*** Delete File: obsolete.py
+*** End Patch
+""",
+            },
+        }
+    )
+
+    assert paths == ["obsolete.py", "src/existing.py", "src/new_module.py"]
+
+
+def test_handle_post_tool_use_queues_apply_patch_added_file(tmp_path, monkeypatch):
+    state_dir = tmp_path / "state"
+    config_dir = tmp_path / "config"
+    monkeypatch.setenv("LINEAR_SYNC_STATE_DIR", str(state_dir))
+    monkeypatch.setenv("LINEAR_SYNC_CONFIG_DIR", str(config_dir))
+    repo = init_git_repo(tmp_path / "repo", branch="arya/cor-55-work")
+    linear_sync.save_linear_user_profile(linear_name="Arya G")
+    linear_sync.write_active_issue(
+        {
+            "issue_key": "COR-55",
+            "issue_title": "Track new files",
+            "issue_url": "https://linear.app/coreedge/issue/COR-55/track-new-files",
+            "branch": "arya/cor-55-work",
+            "repo": str(repo),
+            "pr_url": "https://github.com/e3-solutions/codex-plugins/pull/55",
+            "pr_number": 55,
+            "linear_linked_at": "2026-07-01T00:00:00+00:00",
+        },
+        root=repo,
+    )
+
+    queued = linear_sync.handle_post_tool_use(
+        {
+            "tool_name": "apply_patch",
+            "tool_input": {
+                "command": """*** Begin Patch
+*** Add File: src/new_module.py
++print("hello")
+*** End Patch
+""",
+            },
+        },
+        root=repo,
+    )
+
+    assert queued is not None
+    assert queued["changed_files"] == ["src/new_module.py"]
 
 
 def test_pre_tool_guard_allows_unbound_repo_read_only_commands(tmp_path, monkeypatch):
@@ -919,7 +985,7 @@ def test_pre_tool_guard_allows_unbound_repo_read_only_commands(tmp_path, monkeyp
         assert decision.blocked is False, command
 
 
-def test_pre_tool_guard_blocks_unknown_bash_without_active_state(tmp_path, monkeypatch):
+def test_pre_tool_guard_allows_unknown_non_write_bash_without_active_state(tmp_path, monkeypatch):
     monkeypatch.setenv("LINEAR_SYNC_STATE_DIR", str(tmp_path))
     bind_linear_repo(tmp_path, tmp_path, monkeypatch)
     commands = [
@@ -934,8 +1000,26 @@ def test_pre_tool_guard_blocks_unknown_bash_without_active_state(tmp_path, monke
             {"tool_name": "Bash", "command": command},
             root=tmp_path,
         )
+        assert decision.blocked is False, command
+
+
+def test_pre_tool_guard_blocks_write_like_bash_without_active_state(tmp_path, monkeypatch):
+    monkeypatch.setenv("LINEAR_SYNC_STATE_DIR", str(tmp_path))
+    bind_linear_repo(tmp_path, tmp_path, monkeypatch)
+    linear_sync.save_linear_user_profile(linear_name="Arya G")
+    commands = [
+        "python - <<'PY'\nfrom pathlib import Path\nPath('app.py').write_text('hi')\nPY",
+        "sed -i '' 's/a/b/' app.py",
+        "rm app.py",
+    ]
+
+    for command in commands:
+        decision = linear_sync.pre_tool_guard_decision(
+            {"tool_name": "Bash", "command": command},
+            root=tmp_path,
+        )
         assert decision.blocked is True, command
-        assert "pre-kickoff read-only allowlist" in decision.message
+        assert "appears to write files or mutate repo state" in decision.message
 
 
 def test_pre_tool_guard_blocks_unbound_repo_without_active_state(tmp_path, monkeypatch):
@@ -1666,8 +1750,8 @@ def test_setup_plan_is_global_by_default_and_does_not_install_repo_hook(tmp_path
     assert "--disable-linear-sync" in notes
     assert "SessionStart" in notes
     assert "LINEAR_SYNC_AUTO_UPDATE=0" in notes
-    assert "read-only allowlist" in notes
-    assert "unknown scripts, tests, builds, writes, and branch creation" in notes
+    assert "write-like Bash commands" in notes
+    assert "branch creation wait for active Linear state" in notes
     assert "install_git_hook.py" not in commands
     assert plan["per_repo_setup_required"] is False
 
@@ -1693,7 +1777,7 @@ def test_setup_script_exists_and_exposes_dry_run():
     assert "--dry-run" in text
     assert "--with-git-hook" in text
     assert "codex mcp login linear" in text
-    assert "Before Linear kickoff, Bash is read-only allowlisted" in text
+    assert "Before Linear kickoff, file edits, write-like Bash commands, and branch creation wait" in text
     assert "No per-repo setup is needed" in text
 
 
@@ -1713,7 +1797,7 @@ def test_setup_summary_prints_team_next_steps(capsys):
     assert "list Linear users/projects" in output
     assert "--disable-linear-sync" in output
     assert "LINEAR_SYNC_AUTO_UPDATE=0" in output
-    assert "Before Linear kickoff, Bash is read-only allowlisted" in output
+    assert "Before Linear kickoff, file edits, write-like Bash commands, and branch creation wait" in output
     assert "No per-repo setup is needed" in output
 
 
@@ -1933,8 +2017,8 @@ def test_readmes_register_linear_mcp_before_linear_login():
         assert "saves it in `~/.codex/linear-sync/repos.json`" in text
         assert "update_plugin.py --force" in text
         assert "LINEAR_SYNC_AUTO_UPDATE=0" in text
-        assert "Bash uses a read-only allowlist" in text
-        assert "Unknown scripts, tests, builds, file writes, and branch creation wait" in text
+        assert "file edits, write-like Bash commands, and branch creation wait" in text
+        assert "Read-only and non-mutating Bash commands can run before kickoff" in text
 
 
 def test_setup_run_step_does_not_treat_auth_failure_as_idempotent_success(monkeypatch):

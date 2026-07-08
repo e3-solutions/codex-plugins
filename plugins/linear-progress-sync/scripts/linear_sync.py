@@ -955,7 +955,7 @@ def setup_plan(
             "First use in a repo lists Linear teams/projects, asks which project to save, and stores it in ~/.codex/linear-sync/repos.json.",
             "Repos that should not use Linear sync can be opted out with linear_start.py configure-repo --disable-linear-sync.",
             "Installed plugins check for updates on SessionStart at most every six hours; set LINEAR_SYNC_AUTO_UPDATE=0 to disable.",
-            "Before kickoff, Bash is a read-only allowlist; unknown scripts, tests, builds, writes, and branch creation wait for active Linear state.",
+            "Before kickoff, file edits, write-like Bash commands, and branch creation wait for active Linear state.",
             "Per-repo Git hook setup is optional and only needed to sync commits made outside Codex.",
             "Start a new Codex thread after installing or updating the plugin so hooks and skills reload.",
         ],
@@ -1802,14 +1802,7 @@ def pre_tool_guard_decision(payload: JsonDict, *, root: str | Path | None = None
     tool = tool_name(payload)
     normalized_tool = tool.lower()
     is_linear_write = linear_tool_is_write(normalized_tool)
-    requires_active_state = normalized_tool in {
-        "apply_patch",
-        "edit",
-        "multiedit",
-        "write",
-        "filechange",
-        "file_change",
-    }
+    requires_active_state = tool_requires_active_state(payload, normalized_tool)
     user_profile_required = not linear_user_profile_configured()
     guard_enabled = linear_guard_enabled(root=root)
     guard_disabled = linear_guard_disabled(root=root)
@@ -1830,6 +1823,8 @@ def pre_tool_guard_decision(payload: JsonDict, *, root: str | Path | None = None
             )
         if bash_command_is_read_only(command):
             return PreToolGuardDecision(False)
+        if not bash_command_is_write_like(command):
+            return PreToolGuardDecision(False)
         if user_profile_required:
             return PreToolGuardDecision(True, linear_user_profile_required_message(root=root))
         if not guard_enabled:
@@ -1839,12 +1834,10 @@ def pre_tool_guard_decision(payload: JsonDict, *, root: str | Path | None = None
             return PreToolGuardDecision(
                 True,
                 linear_kickoff_required_message(
-                    f"{problem}; Bash command is not on the pre-kickoff read-only allowlist",
+                    f"{problem}; Bash command appears to write files or mutate repo state",
                     root=root,
                 ),
             )
-        if not bash_command_is_write_like(command):
-            return PreToolGuardDecision(False)
         requires_active_state = True
 
     if requires_active_state:
@@ -1865,6 +1858,18 @@ def pre_tool_guard_decision(payload: JsonDict, *, root: str | Path | None = None
             return PreToolGuardDecision(True, attribution_problem)
 
     return PreToolGuardDecision(False)
+
+
+def tool_requires_active_state(payload: JsonDict, normalized_tool: str | None = None) -> bool:
+    tool = normalized_tool if normalized_tool is not None else tool_name(payload).lower()
+    if tool in {
+        "apply_patch",
+        "edit",
+        "multiedit",
+        "write",
+    }:
+        return True
+    return False
 
 
 def linear_guard_enabled(*, root: str | Path | None = None) -> bool:
@@ -2148,14 +2153,7 @@ def handle_post_tool_use(payload: JsonDict, *, root: str | Path | None = None) -
             queued = enqueue_event("post_commit", event, root=root)
             spawn_drain(root=root)
             return queued
-    if tool in {"apply_patch", "Edit", "MultiEdit", "Write", "fileChange", "FileChange"} or tool.lower() in {
-        "apply_patch",
-        "edit",
-        "multiedit",
-        "write",
-        "filechange",
-        "file_change",
-    }:
+    if tool_requires_active_state(payload, tool.lower()):
         paths = changed_paths_from_payload(payload)
         meaningful = [path for path in paths if meaningful_file(path)]
         if meaningful:
@@ -2842,7 +2840,25 @@ def changed_paths_from_payload(payload: JsonDict) -> list[str]:
         value = payload.get(key)
         if isinstance(value, list):
             paths.extend(str(item) for item in value)
+    if tool_name(payload).lower() == "apply_patch":
+        paths.extend(paths_from_apply_patch_command(tool_command(payload)))
     return sorted({normalize_repo_path(path) for path in paths if path})
+
+
+def paths_from_apply_patch_command(command: str) -> list[str]:
+    paths: list[str] = []
+    for raw_line in command.splitlines():
+        line = raw_line.strip()
+        for prefix in (
+            "*** Add File: ",
+            "*** Update File: ",
+            "*** Delete File: ",
+            "*** Move to: ",
+        ):
+            if line.startswith(prefix):
+                paths.append(line[len(prefix) :].strip())
+                break
+    return paths
 
 
 def normalize_repo_path(path: str) -> str:
