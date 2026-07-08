@@ -71,7 +71,7 @@ Set up the plugin, GitHub CLI check, and Linear MCP once:
 python3 plugins/linear-progress-sync/scripts/setup.py
 ```
 
-Installed plugin caches check for updates on every SessionStart. The updater syncs coreedge-local marketplace plugins marked `INSTALLED_BY_DEFAULT`. Disable this with:
+Installed plugin caches check for updates on every SessionStart. The updater downloads the current `main.zip` archive, reads the plugin manifest from that archive, syncs coreedge-local marketplace plugins marked `INSTALLED_BY_DEFAULT`, and refreshes global Codex hooks for hook plugins. Disable this with:
 
 ```bash
 LINEAR_SYNC_AUTO_UPDATE=0
@@ -84,6 +84,17 @@ python3 ~/.codex/plugins/cache/coreedge-local/linear-progress-sync/0.2.6/scripts
 ```
 
 If Codex asks to review hooks after setup, trust the Linear Progress Sync hooks once. Automatic kickoff depends on those hooks running.
+
+To roll out a new default plugin, skill, command, hook, or extension after teammates have run setup once:
+
+1. Add or update the plugin under `plugins/<name>/`.
+2. Set a new version in `plugins/<name>/.codex-plugin/plugin.json`.
+3. Add the plugin to `.agents/plugins/marketplace.json`.
+4. Set its marketplace policy to `INSTALLED_BY_DEFAULT`.
+5. Bump `plugins/linear-progress-sync/.codex-plugin/plugin.json` and `plugins/linear-progress-sync/update-manifest.json`.
+6. Merge to `main`.
+
+Do not tell teammates to reinstall from the marketplace for normal default plugin updates. They get newer default plugins on the next new Codex thread or session through the installed SessionStart hook.
 
 Authenticate Linear after setup registers the MCP server when needed:
 
