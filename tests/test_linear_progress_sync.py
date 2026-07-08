@@ -890,11 +890,64 @@ def test_pre_tool_guard_blocks_desktop_file_change_without_active_state(tmp_path
 
     decisions = [
         linear_sync.pre_tool_guard_decision({"tool_name": name}, root=repo)
-        for name in ("fileChange", "FileChange", "file_change", "MultiEdit")
+        for name in (
+            "fileChange",
+            "FileChange",
+            "file_change",
+            "MultiEdit",
+            "create_file",
+            "fileCreate",
+            "FileCreate",
+        )
     ]
 
     assert all(decision.blocked for decision in decisions)
     assert all("No Linear team/project is saved for this repo" in decision.message for decision in decisions)
+
+
+def test_pre_tool_guard_blocks_create_operation_with_path_without_active_state(tmp_path, monkeypatch):
+    state_dir = tmp_path / "state"
+    config_dir = tmp_path / "config"
+    monkeypatch.setenv("LINEAR_SYNC_STATE_DIR", str(state_dir))
+    monkeypatch.setenv("LINEAR_SYNC_CONFIG_DIR", str(config_dir))
+    repo = init_git_repo(tmp_path / "repo", branch="arya/no-linear-binding")
+    linear_sync.save_linear_user_profile(linear_name="Arya G")
+
+    decision = linear_sync.pre_tool_guard_decision(
+        {
+            "tool_name": "desktop_file",
+            "tool_input": {
+                "operation": "create",
+                "file_path": "new_module.py",
+            },
+        },
+        root=repo,
+    )
+
+    assert decision.blocked is True
+    assert "No Linear team/project is saved for this repo" in decision.message
+
+
+def test_pre_tool_guard_allows_generic_create_without_file_path(tmp_path, monkeypatch):
+    state_dir = tmp_path / "state"
+    config_dir = tmp_path / "config"
+    monkeypatch.setenv("LINEAR_SYNC_STATE_DIR", str(state_dir))
+    monkeypatch.setenv("LINEAR_SYNC_CONFIG_DIR", str(config_dir))
+    repo = init_git_repo(tmp_path / "repo", branch="arya/no-linear-binding")
+    linear_sync.save_linear_user_profile(linear_name="Arya G")
+
+    decision = linear_sync.pre_tool_guard_decision(
+        {
+            "tool_name": "Create",
+            "tool_input": {
+                "operation": "create",
+                "title": "Non-file resource",
+            },
+        },
+        root=repo,
+    )
+
+    assert decision.blocked is False
 
 
 def test_pre_tool_guard_allows_unbound_repo_read_only_commands(tmp_path, monkeypatch):

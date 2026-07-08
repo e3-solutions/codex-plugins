@@ -1802,14 +1802,7 @@ def pre_tool_guard_decision(payload: JsonDict, *, root: str | Path | None = None
     tool = tool_name(payload)
     normalized_tool = tool.lower()
     is_linear_write = linear_tool_is_write(normalized_tool)
-    requires_active_state = normalized_tool in {
-        "apply_patch",
-        "edit",
-        "multiedit",
-        "write",
-        "filechange",
-        "file_change",
-    }
+    requires_active_state = tool_requires_active_state(payload, normalized_tool)
     user_profile_required = not linear_user_profile_configured()
     guard_enabled = linear_guard_enabled(root=root)
     guard_disabled = linear_guard_disabled(root=root)
@@ -1865,6 +1858,30 @@ def pre_tool_guard_decision(payload: JsonDict, *, root: str | Path | None = None
             return PreToolGuardDecision(True, attribution_problem)
 
     return PreToolGuardDecision(False)
+
+
+def tool_requires_active_state(payload: JsonDict, normalized_tool: str | None = None) -> bool:
+    tool = normalized_tool if normalized_tool is not None else tool_name(payload).lower()
+    if tool in {
+        "apply_patch",
+        "create_file",
+        "edit",
+        "filechange",
+        "file_change",
+        "filecreate",
+        "file_create",
+        "multiedit",
+        "write",
+    }:
+        return True
+    operation = (
+        payload.get("operation")
+        or nested(payload, "tool_input", "operation")
+        or nested(payload, "input", "operation")
+    )
+    if isinstance(operation, str) and operation.strip().lower() in {"add", "create", "new", "write"}:
+        return bool(changed_paths_from_payload(payload))
+    return False
 
 
 def linear_guard_enabled(*, root: str | Path | None = None) -> bool:
@@ -2148,14 +2165,7 @@ def handle_post_tool_use(payload: JsonDict, *, root: str | Path | None = None) -
             queued = enqueue_event("post_commit", event, root=root)
             spawn_drain(root=root)
             return queued
-    if tool in {"apply_patch", "Edit", "MultiEdit", "Write", "fileChange", "FileChange"} or tool.lower() in {
-        "apply_patch",
-        "edit",
-        "multiedit",
-        "write",
-        "filechange",
-        "file_change",
-    }:
+    if tool_requires_active_state(payload, tool.lower()):
         paths = changed_paths_from_payload(payload)
         meaningful = [path for path in paths if meaningful_file(path)]
         if meaningful:
