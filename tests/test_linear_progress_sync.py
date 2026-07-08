@@ -687,6 +687,38 @@ def test_pre_tool_guard_allows_linear_writes_with_attribution_footer(tmp_path, m
                     "title": "Implement tracking",
                     "team": "Engineering",
                     "assignee": "Arya G",
+                    "description": "Issue created\n\nCodex bot: Arya G at 2026-07-03T18:42:10+00:00",
+                },
+            },
+            "use the What / Why / How template",
+        ),
+        (
+            {
+                "tool_name": "mcp__linear.save_issue",
+                "tool_input": {
+                    "title": "Implement tracking",
+                    "team": "Engineering",
+                    "assignee": "Arya G",
+                    "description": (
+                        "Why\n"
+                        "Recent kickoff work lacked consistent Linear context.\n\n"
+                        "What\n"
+                        "Users can see implementation progress.\n\n"
+                        "How\n"
+                        "Create linked Linear state.\n\n"
+                        "Codex bot: Arya G at 2026-07-03T18:42:10+00:00"
+                    ),
+                },
+            },
+            "use the What / Why / How template",
+        ),
+        (
+            {
+                "tool_name": "mcp__linear.save_issue",
+                "tool_input": {
+                    "title": "Implement tracking",
+                    "team": "Engineering",
+                    "assignee": "Arya G",
                 },
             },
             "include an attributed description",
@@ -719,7 +751,15 @@ def test_pre_tool_guard_allows_issue_creation_with_assignee_and_attribution(tmp_
                 "title": "Implement tracking",
                 "team": "Engineering",
                 "assignee": "Arya G",
-                "description": "Issue created\n\nCodex bot: Arya G at 2026-07-03T18:42:10+00:00",
+                "description": (
+                    "What\n"
+                    "Users can see implementation progress tied to the right business request.\n\n"
+                    "Why\n"
+                    "Recent kickoff work lacked consistent Linear context, which made status hard to audit.\n\n"
+                    "How\n"
+                    "Create the Linear issue, linked branch, draft PR, and active sync state before file edits.\n\n"
+                    "Codex bot: Arya G at 2026-07-03T18:42:10+00:00"
+                ),
             },
         },
         root=repo,
@@ -1878,18 +1918,19 @@ def test_plugin_exposes_linear_start_command_and_pre_tool_guard_hook():
     assert "mcp__linear.save_issue" in command_text
     assert "mcp__linear.save_comment" in command_text
     assert "assignee: <stored Linear user name>" in command_text
+    assert "What\n     <Expected outcome, deliverable, or acceptance criteria in non-technical business terms.>" in command_text
+    assert "Why\n     <Problem, business need, or user pain, including evidence.>" in command_text
+    assert "How\n     <Brief technical implementation approach or steps.>" in command_text
     assert "Codex bot: <stored Linear user name> at <ISO-8601 UTC timestamp>" in command_text
     assert "short Linear aliases like `list_teams` or `list_projects`" in command_text
     assert "do not stop after listing projects" in command_text
     assert "do not answer with a code patch or say you are blocked" in command_text
-    assert len(skill_text.splitlines()) <= 40
-    assert "The command docs own the full sequence" in skill_text
-    assert "Do not answer with a patch" in skill_text
-    assert "ask for a Linear issue key" in skill_text
-    assert "--disable-linear-sync" in skill_text
-    assert "Codex bot: <stored Linear user name> at <ISO-8601 UTC timestamp>" in skill_text
-    assert "Before the first Codex file edit" in skill_text
-    assert "General Bash commands are allowed before kickoff" in skill_text
+    assert len(skill_text.splitlines()) <= 18
+    assert "Small contract only" in skill_text
+    assert "Before Codex file edits" in skill_text
+    assert "general Bash is allowed" in skill_text
+    assert "do not patch, ask for an issue key, test writes, or stop after issue creation" in skill_text
+    assert "What / Why / How issue creation" in skill_text
     assert "creating a branch" not in skill_text
     assert "Before the first write or branch creation" not in skill_text
     assert "mcp__codex_apps__linear._list_comments" in sync_command_text

@@ -1916,6 +1916,25 @@ def linear_text_has_codex_footer(text: str, *, linear_name: str) -> bool:
     return re.search(pattern, text) is not None
 
 
+def linear_issue_text_has_template(text: str) -> bool:
+    expected_order = ("what", "why", "how")
+    sections: dict[str, list[str]] = {}
+    current_section: str | None = None
+    next_section_index = 0
+    for line in text.splitlines():
+        stripped = line.strip()
+        section = stripped.lower()
+        if section in {"what", "why", "how"}:
+            if next_section_index >= len(expected_order) or section != expected_order[next_section_index]:
+                return False
+            next_section_index += 1
+            current_section = section
+            sections.setdefault(section, [])
+        elif current_section and stripped and not stripped.startswith("Codex bot:"):
+            sections[current_section].append(stripped)
+    return all("\n".join(sections.get(section, [])).strip() for section in ("what", "why", "how"))
+
+
 def linear_write_attribution_problem(payload: JsonDict, normalized_tool: str) -> str | None:
     kind = linear_write_kind(normalized_tool)
     if not kind:
@@ -1932,11 +1951,13 @@ def linear_write_attribution_problem(payload: JsonDict, normalized_tool: str) ->
         assignee = linear_write_field(payload, "assignee")
         assignee_ok = isinstance(assignee, str) and assignee.strip() == linear_name
         attribution_ok = bool(texts) and all(linear_text_has_codex_footer(text, linear_name=linear_name) for text in texts)
-        if not assignee_ok or not attribution_ok:
+        template_ok = bool(texts) and all(linear_issue_text_has_template(text) for text in texts)
+        if not assignee_ok or not attribution_ok or not template_ok:
             return linear_issue_create_required_message(
                 linear_name=linear_name,
                 needs_assignee=not assignee_ok,
                 needs_attribution=not attribution_ok,
+                needs_template=not template_ok,
             )
     if kind == "comment" and not texts:
         return linear_attribution_required_message(linear_name=linear_name)
@@ -1959,16 +1980,20 @@ def linear_issue_create_required_message(
     linear_name: str,
     needs_assignee: bool,
     needs_attribution: bool,
+    needs_template: bool,
 ) -> str:
     requirements: list[str] = []
     if needs_assignee:
         requirements.append(f"assign the new Linear issue to {linear_name}")
+    if needs_template:
+        requirements.append("use the What / Why / How template")
     if needs_attribution:
         requirements.append("include an attributed description ending with the Codex bot footer")
     joined = " and ".join(requirements)
     return (
         "LINEAR ISSUE CREATE REQUIRED. Do not create the Linear issue until the payload does this: "
-        f"{joined}. Use `assignee: {linear_name}` and end the description with "
+        f"{joined}. Use `assignee: {linear_name}`, describe the issue with `What`, `Why`, and `How` "
+        "sections, and end the description with "
         f"`Codex bot: {linear_name} at <ISO-8601 UTC timestamp>`."
     )
 

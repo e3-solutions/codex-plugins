@@ -59,7 +59,21 @@ Start Linear-linked implementation work before any code edits.
 
 3. Resolve the Linear issue.
    - If `issue` is present, read it with `mcp__codex_apps__linear._get_issue` or `mcp__codex_apps__linear._fetch` using the known issue identifier. If the direct Linear MCP namespace is exposed instead, use `mcp__linear.get_issue`.
-   - Otherwise create a new issue automatically from the user's implementation request with `mcp__codex_apps__linear._save_issue` using `team`, `project`, `title`, and `assignee: <stored Linear user name>` when appropriate. Do not ask the user for a Linear issue key.
+   - Otherwise create a new issue automatically from the user's implementation request with `mcp__codex_apps__linear._save_issue` using `team`, `project`, `title`, `assignee: <stored Linear user name>`, and this description format. Do not ask the user for a Linear issue key.
+
+     ```text
+     What
+     <Expected outcome, deliverable, or acceptance criteria in non-technical business terms.>
+
+     Why
+     <Problem, business need, or user pain, including evidence.>
+
+     How
+     <Brief technical implementation approach or steps.>
+
+     Codex bot: <stored Linear user name> at <ISO-8601 UTC timestamp>
+     ```
+
    - End any Linear issue body or kickoff comment Codex creates with `Codex bot: <stored Linear user name> at <ISO-8601 UTC timestamp>`.
    - Read the issue back with `mcp__codex_apps__linear._get_issue`/`mcp__codex_apps__linear._fetch` or `mcp__linear.get_issue` after create/update so the branch name, URL, title, team, and project are confirmed.
 
