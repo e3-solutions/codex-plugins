@@ -15,9 +15,9 @@ Before writing code, creating a branch, or opening implementation changes, check
 .codex/linear-sync/active.json
 ```
 
-Read-only inspection is allowed before kickoff. Before the first write or branch creation in any repo, Codex must have a saved Linear team/project binding or an existing active state.
+Read-only inspection is allowed before kickoff. Before the first Codex file edit in any repo, Codex must have a saved Linear team/project binding or an existing active state.
 
-Pre-kickoff Bash blocks write-like commands and branch creation, not every unknown command. Allow read-only and non-mutating commands before kickoff. Block file edits, commands that appear to write files or mutate repo state, and branch creation until active Linear state exists.
+Pre-kickoff enforcement is scoped to documented Codex file edit events. Block file edits through `apply_patch` until active Linear state exists. Allow general Bash commands before kickoff; do not treat shell command classification as the Linear guard's enforcement boundary.
 
 Linear kickoff enforcement only applies to repos whose `origin` remote is under the `e3-solutions` GitHub org. Repos with another GitHub org are out of scope and should be allowed without Linear kickoff.
 

@@ -117,7 +117,7 @@ def print_summary(result: dict) -> None:
         print("- Linear auth is manual; setup registers the MCP server but does not log you in.")
         print("- Repos can opt out with linear_start.py configure-repo --disable-linear-sync.")
         print("- Installed plugins check for updates on SessionStart; set LINEAR_SYNC_AUTO_UPDATE=0 to disable.")
-        print("- Before Linear kickoff, file edits, write-like Bash commands, and branch creation wait for active Linear state.")
+        print("- Before Linear kickoff, Codex file edits through apply_patch wait for active Linear state; general Bash commands are allowed.")
         print("- No per-repo setup is needed unless you want the optional outside-Codex Git commit hook.")
 
 

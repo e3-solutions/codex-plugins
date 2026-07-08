@@ -26,7 +26,7 @@ python3 plugins/linear-progress-sync/scripts/setup.py --dry-run
 
 ## Normal Use
 
-Start a coding task normally. Before the first edit or branch creation, Codex must create or confirm the Linear issue, create the Linear-named branch, push an empty kickoff commit, open a draft PR, link Linear and GitHub, and write local active state.
+Start a coding task normally. Before the first Codex file edit, Codex must create or confirm the Linear issue, create the Linear-named branch, push an empty kickoff commit, open a draft PR, link Linear and GitHub, and write local active state.
 
 Linear kickoff enforcement only applies to repos whose `origin` remote is under the `e3-solutions` GitHub org. Repos with another GitHub org are treated as out of scope and are allowed without Linear kickoff.
 
@@ -43,7 +43,7 @@ python3 plugins/linear-progress-sync/scripts/linear_start.py configure-repo \
   --reason "No Linear tracking"
 ```
 
-Before kickoff, file edits, write-like Bash commands, and branch creation wait until active Linear state exists. Read-only and non-mutating Bash commands can run before kickoff.
+Before kickoff, Codex file edits through `apply_patch` wait until active Linear state exists. General Bash commands are allowed before kickoff.
 
 After kickoff, Codex writes and standard Codex commits are synced back to the active Linear issue automatically.
 
