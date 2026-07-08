@@ -1,6 +1,13 @@
 # Linear Progress Sync
 
-Local Codex plugin for Linear-first development. Codex starts work from a Linear issue, creates the linked branch and draft PR before code, then keeps Linear updated from Codex commits.
+Local Codex plugin for Linear-first development in `e3-solutions` repos. Codex starts work from a Linear issue, creates the linked branch and draft PR before code, then keeps Linear updated from Codex commits.
+
+Current behavior:
+
+- Enforcement is scoped to git repos whose `origin` remote is under `e3-solutions/*`.
+- Repos with no `origin` remote, no git repo, or a non-E3 origin are out of scope and file edits are allowed without Linear kickoff.
+- Before kickoff in scoped repos, only file edits, write-like Bash commands, and branch creation are blocked. Read-only inspection and non-mutating commands are allowed.
+- Installed plugin caches auto-check for updates on every Codex `SessionStart`, install newer plugin versions, sync default marketplace plugins, and refresh global hook registrations.
 
 ## Setup
 
