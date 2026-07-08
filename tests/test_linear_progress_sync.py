@@ -774,6 +774,53 @@ def test_pre_tool_guard_blocks_unbound_repo_writes_until_linear_destination_is_s
     assert "linear_start.py kickoff" in branch_decision.message
 
 
+def test_pre_tool_guard_allows_non_e3_origin_without_linear_binding(tmp_path, monkeypatch):
+    state_dir = tmp_path / "state"
+    config_dir = tmp_path / "config"
+    monkeypatch.setenv("LINEAR_SYNC_STATE_DIR", str(state_dir))
+    monkeypatch.setenv("LINEAR_SYNC_CONFIG_DIR", str(config_dir))
+    repo = init_git_repo(tmp_path / "repo", branch="arya/external-work")
+    add_origin(repo, "https://github.com/other-org/example.git")
+    linear_sync.save_linear_user_profile(linear_name="Arya G")
+
+    write_decision = linear_sync.pre_tool_guard_decision({"tool_name": "apply_patch"}, root=repo)
+    bash_decision = linear_sync.pre_tool_guard_decision(
+        {"tool_name": "Bash", "command": "rm app.py"},
+        root=repo,
+    )
+    branch_decision = linear_sync.pre_tool_guard_decision(
+        {"tool_name": "Bash", "command": "git switch -c arya/normal-work"},
+        root=repo,
+    )
+    status = linear_sync.repo_binding_status(root=repo)
+
+    assert status["disabled"] is True
+    assert status["scope_disabled"] is True
+    assert status["configured"] is False
+    assert status["binding"]["reason"] == "outside e3-solutions GitHub org"
+    assert write_decision.blocked is False
+    assert bash_decision.blocked is False
+    assert branch_decision.blocked is False
+
+
+def test_pre_tool_guard_blocks_e3_origin_without_linear_binding(tmp_path, monkeypatch):
+    state_dir = tmp_path / "state"
+    config_dir = tmp_path / "config"
+    monkeypatch.setenv("LINEAR_SYNC_STATE_DIR", str(state_dir))
+    monkeypatch.setenv("LINEAR_SYNC_CONFIG_DIR", str(config_dir))
+    repo = init_git_repo(tmp_path / "repo", branch="arya/e3-work")
+    add_origin(repo, "git@github.com:e3-solutions/example.git")
+    linear_sync.save_linear_user_profile(linear_name="Arya G")
+
+    write_decision = linear_sync.pre_tool_guard_decision({"tool_name": "apply_patch"}, root=repo)
+    status = linear_sync.repo_binding_status(root=repo)
+
+    assert status["disabled"] is False
+    assert status["scope_disabled"] is False
+    assert write_decision.blocked is True
+    assert write_decision.message.startswith("LINEAR DESTINATION REQUIRED")
+
+
 def test_pre_tool_guard_allows_opted_out_repo_without_user_or_active_state(tmp_path, monkeypatch):
     state_dir = tmp_path / "state"
     config_dir = tmp_path / "config"
