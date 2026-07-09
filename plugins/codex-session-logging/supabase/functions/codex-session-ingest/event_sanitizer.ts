@@ -35,6 +35,8 @@ function sanitizeEventMetadata(
     "transcript_path",
     "model",
     "source",
+    "platform",
+    "permission_mode",
   ]);
 
   if (eventType === "environment_snapshot") {
@@ -45,12 +47,39 @@ function sanitizeEventMetadata(
     return metadata;
   }
 
-  if (eventType === "tool_call_started" || eventType === "tool_call_finished") {
+  if (
+    [
+      "tool_call_started",
+      "tool_call_finished",
+      "tool_call_failed",
+      "tool_permission_requested",
+      "tool_permission_denied",
+    ].includes(eventType)
+  ) {
     copyBooleanFields(source, metadata, ["success"]);
     copyStringFields(source, metadata, [
       "tool_name",
       "tool_phase",
       "tool_call_id",
+    ]);
+  }
+
+  if (
+    eventType.startsWith("thread_") ||
+    eventType === "tool_batch_finished"
+  ) {
+    copyBooleanFields(source, metadata, ["stop_hook_active"]);
+    copyNumberFields(source, metadata, [
+      "prompt_byte_size",
+      "tool_batch_size",
+    ]);
+    copyStringFields(source, metadata, [
+      "thread_event",
+      "prompt_sha256",
+      "stop_reason",
+      "error_type",
+      "compaction_trigger",
+      "session_end_reason",
     ]);
   }
 
@@ -198,6 +227,19 @@ function copyBooleanFields(
   for (const field of fields) {
     const value = source[field];
     if (typeof value === "boolean") {
+      target[field] = value;
+    }
+  }
+}
+
+function copyNumberFields(
+  source: JsonObject,
+  target: JsonObject,
+  fields: string[],
+): void {
+  for (const field of fields) {
+    const value = source[field];
+    if (typeof value === "number" && Number.isFinite(value)) {
       target[field] = value;
     }
   }

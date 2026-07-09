@@ -2208,9 +2208,12 @@ def test_install_codex_hooks_merges_existing_user_hooks(tmp_path):
     assert any("linear-progress-sync" in json.dumps(entry) for entry in installed["hooks"]["PostToolUse"])
     assert any("codex-session-logging" in json.dumps(entry) for entry in installed["hooks"]["SessionStart"])
     assert any("codex-session-logging" in json.dumps(entry) for entry in installed["hooks"]["UserPromptSubmit"])
-    assert json.dumps(installed).count("pre_tool_use.py") == 1
-    assert json.dumps(installed).count("post_tool_use.py") == 1
-    assert json.dumps(installed).count("user_prompt_submit.py") == 1
+    installed_text = json.dumps(installed)
+    assert installed_text.count("linear-progress-sync/*/scripts/pre_tool_use.py") == 1
+    assert installed_text.count("linear-progress-sync/*/scripts/post_tool_use.py") == 1
+    assert installed_text.count("codex-session-logging/*/scripts/pre_tool_use.py") == 1
+    assert installed_text.count("codex-session-logging/*/scripts/post_tool_use.py") == 1
+    assert installed_text.count("user_prompt_submit.py") == 1
 
 
 def test_install_codex_hooks_can_resolve_plugins_from_marketplace_cache_root(tmp_path):
