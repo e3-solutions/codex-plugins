@@ -252,6 +252,50 @@ Deno.test("sanitizeEventPayload keeps only allowlisted tool event fields", () =>
   assertNotIncludes(serialized, "arbitrary_secret");
 });
 
+Deno.test("sanitizeEventPayload keeps safe Claude thread metadata only", () => {
+  const sanitized = sanitizeEventPayload(
+    {
+      id: "a04fd832-7779-4665-9bec-2f10462c721b",
+      session_id: "claude-session",
+      seq: 2,
+      event_type: "thread_prompt_submitted",
+      hook_event_name: "UserPromptSubmit",
+      created_at: "2026-07-06T00:00:00.000Z",
+      metadata: {
+        cwd: "/repo",
+        platform: "claude-code",
+        permission_mode: "acceptEdits",
+        thread_event: "prompt_submitted",
+        prompt_sha256: "9f86d081884c7d659a2feaa0c55ad015",
+        prompt_byte_size: 44,
+        prompt: "secret prompt should not store",
+        tool_input: { command: "echo should-not-store" },
+        arbitrary_secret: "sk-should-not-store",
+      },
+    },
+    {
+      metadata: {
+        prompt: "event prompt should not store",
+        arbitrary_secret: "sk-should-not-store",
+      },
+    },
+  );
+  const serialized = JSON.stringify(sanitized);
+
+  assertEquals(sanitized.metadata, {
+    cwd: "/repo",
+    platform: "claude-code",
+    permission_mode: "acceptEdits",
+    prompt_byte_size: 44,
+    thread_event: "prompt_submitted",
+    prompt_sha256: "9f86d081884c7d659a2feaa0c55ad015",
+  });
+  assertNotIncludes(serialized, "secret prompt");
+  assertNotIncludes(serialized, "tool_input");
+  assertNotIncludes(serialized, "should-not-store");
+  assertNotIncludes(serialized, "arbitrary_secret");
+});
+
 Deno.test("sanitizeEventPayload strips secret-bearing setup snapshot fields", () => {
   const sanitized = sanitizeEventPayload(
     {

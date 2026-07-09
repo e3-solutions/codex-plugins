@@ -1,0 +1,426 @@
+from __future__ import annotations
+
+import importlib.util
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+import pytest
+
+
+ROOT = Path(__file__).resolve().parents[1]
+MODULE_PATH = ROOT / "plugins" / "claude-session-logging" / "scripts" / "session_logging.py"
+UPDATE_MODULE_PATH = ROOT / "plugins" / "claude-session-logging" / "scripts" / "update_plugin.py"
+
+
+@pytest.fixture(autouse=True)
+def disable_background_uploads_by_default(monkeypatch):
+    monkeypatch.setenv("CLAUDE_SESSION_LOG_AUTO_UPLOAD", "0")
+
+
+def load_session_logging():
+    spec = importlib.util.spec_from_file_location("claude_session_logging", MODULE_PATH)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def load_update_plugin():
+    spec = importlib.util.spec_from_file_location("claude_session_logging_updater", UPDATE_MODULE_PATH)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def init_git_repo(path: Path, remote: str) -> Path:
+    path.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=path, check=True)
+    subprocess.run(["git", "remote", "add", "origin", remote], cwd=path, check=True)
+    return path
+
+
+def read_jsonl(path: Path) -> list[dict]:
+    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+
+
+def test_session_start_tracks_claude_thread_metadata(tmp_path, monkeypatch):
+    monkeypatch.setenv("CLAUDE_SESSION_LOG_STATE_DIR", str(tmp_path / "state"))
+    session_logging = load_session_logging()
+    repo = init_git_repo(tmp_path / "repo", "https://github.com/e3-solutions/codex-plugins.git")
+
+    result = session_logging.capture_hook_event(
+        {
+            "hook_event_name": "SessionStart",
+            "session_id": "claude-session-123",
+            "cwd": str(repo),
+            "transcript_path": str(tmp_path / "transcript.jsonl"),
+            "source": "startup",
+            "permission_mode": "default",
+        }
+    )
+
+    detail = json.loads((tmp_path / "state" / result["local_content_path"]).read_text(encoding="utf-8"))
+    events = read_jsonl(tmp_path / "state" / "events.jsonl")
+
+    assert result["type"] == "event"
+    assert result["event_type"] == "thread_started"
+    assert result["session_id"] == "claude-session-123"
+    assert result["storage_path"] == "users/local/sessions/claude-session-123/events/000001-thread_started.json"
+    assert detail["metadata"] == {
+        "cwd": str(repo),
+        "permission_mode": "default",
+        "platform": "claude-code",
+        "source": "startup",
+        "thread_event": "started",
+        "transcript_path": str(tmp_path / "transcript.jsonl"),
+    }
+    assert events[0]["metadata"]["platform"] == "claude-code"
+
+
+def test_user_prompt_submit_tracks_turn_boundary_without_prompt_text(tmp_path, monkeypatch):
+    monkeypatch.setenv("CLAUDE_SESSION_LOG_STATE_DIR", str(tmp_path / "state"))
+    session_logging = load_session_logging()
+    repo = init_git_repo(tmp_path / "repo", "git@github.com:e3-solutions/codex-plugins.git")
+    prompt = "refactor auth using secret-token-should-not-store"
+
+    result = session_logging.capture_hook_event(
+        {
+            "hook_event_name": "UserPromptSubmit",
+            "session_id": "claude-session-123",
+            "cwd": str(repo),
+            "permission_mode": "acceptEdits",
+            "prompt": prompt,
+        }
+    )
+
+    detail = json.loads((tmp_path / "state" / result["local_content_path"]).read_text(encoding="utf-8"))
+    detail_text = json.dumps(detail, sort_keys=True)
+
+    assert result["event_type"] == "thread_prompt_submitted"
+    assert detail["metadata"]["thread_event"] == "prompt_submitted"
+    assert detail["metadata"]["prompt_byte_size"] == len(prompt.encode("utf-8"))
+    assert detail["metadata"]["prompt_sha256"] == session_logging.sha256_hex(prompt)
+    assert "secret-token-should-not-store" not in detail_text
+    assert "tool_input" not in detail_text
+
+
+def test_pre_tool_use_records_only_tool_metadata(tmp_path, monkeypatch):
+    monkeypatch.setenv("CLAUDE_SESSION_LOG_STATE_DIR", str(tmp_path / "state"))
+    session_logging = load_session_logging()
+    repo = init_git_repo(tmp_path / "repo", "https://github.com/e3-solutions/codex-plugins.git")
+
+    result = session_logging.capture_hook_event(
+        {
+            "hook_event_name": "PreToolUse",
+            "session_id": "claude-tools",
+            "cwd": str(repo),
+            "tool_name": "Bash",
+            "tool_call_id": "call-1",
+            "tool_input": {"command": "echo should-not-store"},
+        }
+    )
+
+    detail = json.loads((tmp_path / "state" / result["local_content_path"]).read_text(encoding="utf-8"))
+    detail_text = json.dumps(detail, sort_keys=True)
+
+    assert result["event_type"] == "tool_call_started"
+    assert detail["metadata"] == {
+        "cwd": str(repo),
+        "platform": "claude-code",
+        "tool_call_id": "call-1",
+        "tool_name": "Bash",
+        "tool_phase": "started",
+    }
+    assert "tool_input" not in detail_text
+    assert "should-not-store" not in detail_text
+
+
+def test_post_tool_use_failure_records_failure_without_output(tmp_path, monkeypatch):
+    monkeypatch.setenv("CLAUDE_SESSION_LOG_STATE_DIR", str(tmp_path / "state"))
+    session_logging = load_session_logging()
+    repo = init_git_repo(tmp_path / "repo", "https://github.com/e3-solutions/codex-plugins.git")
+
+    result = session_logging.capture_hook_event(
+        {
+            "hook_event_name": "PostToolUseFailure",
+            "session_id": "claude-tools",
+            "cwd": str(repo),
+            "tool": {"name": "Read"},
+            "error": "secret failure body should not store",
+        }
+    )
+
+    detail = json.loads((tmp_path / "state" / result["local_content_path"]).read_text(encoding="utf-8"))
+    detail_text = json.dumps(detail, sort_keys=True)
+
+    assert result["event_type"] == "tool_call_failed"
+    assert detail["metadata"] == {
+        "cwd": str(repo),
+        "platform": "claude-code",
+        "success": False,
+        "tool_name": "Read",
+        "tool_phase": "failed",
+    }
+    assert "secret failure body" not in detail_text
+
+
+def test_permission_denied_records_tool_metadata_without_inputs(tmp_path, monkeypatch):
+    monkeypatch.setenv("CLAUDE_SESSION_LOG_STATE_DIR", str(tmp_path / "state"))
+    session_logging = load_session_logging()
+    repo = init_git_repo(tmp_path / "repo", "https://github.com/e3-solutions/codex-plugins.git")
+
+    result = session_logging.capture_hook_event(
+        {
+            "hook_event_name": "PermissionDenied",
+            "session_id": "claude-tools",
+            "cwd": str(repo),
+            "tool_name": "Bash",
+            "tool_call_id": "call-denied",
+            "tool_input": {"command": "cat secret-file"},
+            "reason": "policy",
+        }
+    )
+
+    detail = json.loads((tmp_path / "state" / result["local_content_path"]).read_text(encoding="utf-8"))
+    detail_text = json.dumps(detail, sort_keys=True)
+
+    assert result["event_type"] == "tool_permission_denied"
+    assert detail["metadata"] == {
+        "cwd": str(repo),
+        "platform": "claude-code",
+        "tool_call_id": "call-denied",
+        "tool_name": "Bash",
+        "tool_phase": "permission_denied",
+    }
+    assert "tool_input" not in detail_text
+    assert "secret-file" not in detail_text
+
+
+def test_post_tool_batch_records_count_without_result_payloads(tmp_path, monkeypatch):
+    monkeypatch.setenv("CLAUDE_SESSION_LOG_STATE_DIR", str(tmp_path / "state"))
+    session_logging = load_session_logging()
+    repo = init_git_repo(tmp_path / "repo", "ssh://git@github.com/e3-solutions/codex-plugins.git")
+
+    result = session_logging.capture_hook_event(
+        {
+            "hook_event_name": "PostToolBatch",
+            "session_id": "claude-tools",
+            "cwd": str(repo),
+            "tool_results": [
+                {"tool_name": "Read", "content": "file secret should not store"},
+                {"tool_name": "Bash", "content": "output secret should not store"},
+            ],
+        }
+    )
+
+    detail = json.loads((tmp_path / "state" / result["local_content_path"]).read_text(encoding="utf-8"))
+    detail_text = json.dumps(detail, sort_keys=True)
+
+    assert result["event_type"] == "tool_batch_finished"
+    assert detail["metadata"]["tool_batch_size"] == 2
+    assert "file secret" not in detail_text
+    assert "output secret" not in detail_text
+
+
+def test_capture_skips_repos_outside_e3_solutions(tmp_path, monkeypatch):
+    monkeypatch.setenv("CLAUDE_SESSION_LOG_STATE_DIR", str(tmp_path / "state"))
+    session_logging = load_session_logging()
+    repo = init_git_repo(tmp_path / "repo", "https://github.com/example/codex-plugins.git")
+
+    result = session_logging.capture_hook_event(
+        {
+            "hook_event_name": "SessionStart",
+            "session_id": "claude-session-123",
+            "cwd": str(repo),
+            "source": "startup",
+        }
+    )
+
+    assert result is None
+    assert not (tmp_path / "state" / "events.jsonl").exists()
+
+
+def test_drain_posts_claude_event_payload_to_shared_ingest(tmp_path, monkeypatch):
+    monkeypatch.setenv("CLAUDE_SESSION_LOG_STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setenv("CLAUDE_SESSION_LOG_INGEST_URL", "https://logs.example.test/ingest")
+    session_logging = load_session_logging()
+    repo = init_git_repo(tmp_path / "repo", "https://github.com/e3-solutions/codex-plugins.git")
+
+    session_logging.capture_hook_event(
+        {
+            "hook_event_name": "PreToolUse",
+            "session_id": "claude-tools",
+            "cwd": str(repo),
+            "tool_name": "Bash",
+            "tool_input": {"command": "echo should-not-upload"},
+        }
+    )
+
+    requests = []
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def read(self):
+            raise AssertionError("successful uploads must not read the response body")
+
+    monkeypatch.setattr(session_logging.urllib.request, "urlopen", lambda request, timeout: requests.append(request) or Response())
+
+    result = session_logging.drain_queue()
+    body = json.loads(requests[0].data.decode("utf-8"))
+    body_text = json.dumps(body, sort_keys=True)
+
+    assert result["uploaded"] == 1
+    assert requests[0].full_url == "https://logs.example.test/ingest"
+    assert requests[0].headers["User-agent"] == "claude-session-logging/git"
+    assert body["plugin"] == {
+        "name": "claude-session-logging",
+        "version": "git",
+    }
+    assert body["record"]["type"] == "event"
+    assert body["event"]["metadata"]["platform"] == "claude-code"
+    assert body["client"]["repo_remote"] == "https://github.com/e3-solutions/codex-plugins.git"
+    assert "should-not-upload" not in body_text
+
+
+def test_claude_plugin_packaging_and_internal_marketplace_are_present():
+    plugin_root = ROOT / "plugins" / "claude-session-logging"
+    manifest_path = plugin_root / ".claude-plugin" / "plugin.json"
+    hooks_path = plugin_root / "hooks" / "hooks.json"
+    marketplace_path = ROOT / ".claude-plugin" / "marketplace.json"
+
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    hooks = json.loads(hooks_path.read_text(encoding="utf-8"))
+    marketplace = json.loads(marketplace_path.read_text(encoding="utf-8"))
+    hooks_text = json.dumps(hooks)
+
+    assert manifest["name"] == "claude-session-logging"
+    assert "version" not in manifest
+    assert "Codex" not in manifest["description"]
+    assert "SessionStart" in hooks["hooks"]
+    assert "UserPromptSubmit" in hooks["hooks"]
+    assert "PreToolUse" in hooks["hooks"]
+    assert "PostToolUse" in hooks["hooks"]
+    assert "PostToolUseFailure" in hooks["hooks"]
+    assert "PostToolBatch" in hooks["hooks"]
+    assert "Stop" in hooks["hooks"]
+    assert "StopFailure" in hooks["hooks"]
+    assert "SessionEnd" in hooks["hooks"]
+    assert "PermissionRequest" in hooks["hooks"]
+    assert "PermissionDenied" in hooks["hooks"]
+    assert "MessageDisplay" not in hooks["hooks"]
+    for event_entries in hooks["hooks"].values():
+        for entry in event_entries:
+            for hook in entry["hooks"]:
+                assert hook["command"] == "python3"
+                assert "args" in hook
+                assert hook["args"][0].startswith("${CLAUDE_PLUGIN_ROOT}/scripts/")
+    assert "${CLAUDE_PLUGIN_ROOT}/scripts/session_start.py" in hooks_text
+    assert "${CLAUDE_PLUGIN_ROOT}/scripts/pre_tool_use.py" in hooks_text
+    assert "${CLAUDE_PLUGIN_ROOT}/scripts/permission_request.py" in hooks_text
+    assert "${CLAUDE_PLUGIN_ROOT}/scripts/permission_denied.py" in hooks_text
+    assert marketplace["name"] == "coreedge-internal"
+    plugin_entry = next(plugin for plugin in marketplace["plugins"] if plugin["name"] == "claude-session-logging")
+    assert plugin_entry["source"] == "./plugins/claude-session-logging"
+    assert plugin_entry["category"] == "productivity"
+
+
+def test_auto_update_spawns_background_process(tmp_path, monkeypatch):
+    update_plugin = load_update_plugin()
+    calls = []
+
+    def fake_popen(args, **kwargs):
+        calls.append((args, kwargs))
+        return object()
+
+    monkeypatch.setattr(update_plugin.subprocess, "Popen", fake_popen)
+    state_path = tmp_path / "marketplace-update.json"
+
+    result = update_plugin.maybe_spawn_auto_update(state_path=state_path)
+
+    assert result == {"spawned": True}
+    args, kwargs = calls[0]
+    assert args[0] == sys.executable
+    assert args[1] == str(UPDATE_MODULE_PATH)
+    assert args[2:] == ["--state-path", str(state_path)]
+    assert kwargs["stdin"] == subprocess.DEVNULL
+    assert kwargs["stdout"] == subprocess.DEVNULL
+    assert kwargs["stderr"] == subprocess.DEVNULL
+    assert kwargs["start_new_session"] is True
+
+
+def test_auto_update_respects_opt_out(tmp_path, monkeypatch):
+    update_plugin = load_update_plugin()
+    monkeypatch.setenv("CLAUDE_SESSION_LOG_AUTO_UPDATE", "0")
+    monkeypatch.setattr(update_plugin.subprocess, "Popen", lambda *args, **kwargs: pytest.fail("must not spawn"))
+
+    assert update_plugin.maybe_spawn_auto_update(state_path=tmp_path / "marketplace-update.json") == {
+        "spawned": False,
+        "reason": "disabled",
+    }
+
+
+def test_auto_update_refreshes_marketplace_then_updates_plugin(tmp_path, monkeypatch):
+    update_plugin = load_update_plugin()
+    commands = []
+
+    def fake_run(args, **kwargs):
+        commands.append((args, kwargs))
+        return subprocess.CompletedProcess(args, 0)
+
+    monkeypatch.setattr(update_plugin.subprocess, "run", fake_run)
+    state_path = tmp_path / "marketplace-update.json"
+
+    result = update_plugin.run_update(state_path=state_path)
+
+    assert result == {
+        "updated": True,
+        "marketplace_exit_code": 0,
+        "plugin_exit_code": 0,
+        "plugin_command": "update",
+    }
+    assert [args for args, _kwargs in commands] == [
+        ["claude", "plugin", "marketplace", "update", "coreedge-internal"],
+        ["claude", "plugin", "update", "--help"],
+        ["claude", "plugin", "update", "claude-session-logging@coreedge-internal"],
+    ]
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    assert state["marketplace_exit_code"] == 0
+    assert state["plugin_exit_code"] == 0
+    assert state["plugin_command"] == "update"
+
+
+def test_auto_update_falls_back_to_install_for_older_claude_code(tmp_path, monkeypatch):
+    update_plugin = load_update_plugin()
+    commands = []
+
+    def fake_run(args, **kwargs):
+        commands.append(args)
+        return subprocess.CompletedProcess(args, 1 if args[2:4] == ["update", "--help"] else 0)
+
+    monkeypatch.setattr(update_plugin.subprocess, "run", fake_run)
+
+    result = update_plugin.run_update(state_path=tmp_path / "marketplace-update.json")
+
+    assert result["updated"] is True
+    assert commands[-1] == ["claude", "plugin", "install", "claude-session-logging@coreedge-internal"]
+
+
+def test_auto_update_is_throttled(tmp_path, monkeypatch):
+    update_plugin = load_update_plugin()
+    state_path = tmp_path / "marketplace-update.json"
+    update_plugin.write_state(state_path, {"last_checked_at_epoch": 100.0})
+    monkeypatch.setattr(update_plugin.time, "time", lambda: 101.0)
+    monkeypatch.setattr(update_plugin.subprocess, "run", lambda *args, **kwargs: pytest.fail("must not run"))
+
+    assert update_plugin.run_update(state_path=state_path) == {"updated": False, "reason": "not_due"}

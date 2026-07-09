@@ -1,0 +1,23 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "coreedge-internal",
+  "description": "Internal Core Edge Claude Code plugins.",
+  "metadata": {
+    "description": "Internal Core Edge Claude Code plugins for session visibility and development workflow support."
+  },
+  "owner": {
+    "name": "Core Edge Solution"
+  },
+  "plugins": [
+    {
+      "name": "claude-session-logging",
+      "description": "Internal Claude Code thread and tool metadata tracking for Core Edge repositories.",
+      "author": {
+        "name": "Core Edge Solution"
+      },
+      "category": "productivity",
+      "source": "./plugins/claude-session-logging",
+      "homepage": "https://github.com/e3-solutions/codex-plugins/tree/main/plugins/claude-session-logging"
+    }
+  ]
+}

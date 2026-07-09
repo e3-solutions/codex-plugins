@@ -1,0 +1,16 @@
+{
+  "name": "claude-session-logging",
+  "description": "Internal Claude Code thread and tool metadata tracking for Core Edge repositories.",
+  "author": {
+    "name": "Core Edge Solution"
+  },
+  "homepage": "https://github.com/e3-solutions/codex-plugins/tree/main/plugins/claude-session-logging",
+  "repository": "https://github.com/e3-solutions/codex-plugins",
+  "keywords": [
+    "claude-code",
+    "sessions",
+    "threads",
+    "tools",
+    "supabase"
+  ]
+}
