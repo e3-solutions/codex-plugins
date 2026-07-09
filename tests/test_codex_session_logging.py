@@ -542,6 +542,39 @@ def test_drain_posts_event_payload_to_ingest_endpoint(tmp_path, monkeypatch):
     assert "should-not-upload" not in body_text
 
 
+def test_drain_does_not_wait_for_success_response_body(tmp_path, monkeypatch):
+    monkeypatch.setenv("CODEX_SESSION_LOG_STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setenv("CODEX_SESSION_LOG_INGEST_URL", "https://logs.example.test/ingest")
+    session_logging = load_session_logging()
+    repo = init_git_repo(tmp_path / "repo", "https://github.com/e3-solutions/codex-plugins.git")
+
+    session_logging.capture_hook_event(
+        {
+            "hook_event_name": "UserPromptSubmit",
+            "session_id": "session-no-read",
+            "cwd": str(repo),
+            "prompt": "Do not wait for the response body.",
+        }
+    )
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def read(self):
+            raise AssertionError("successful uploads must not read the response body")
+
+    monkeypatch.setattr(session_logging.urllib.request, "urlopen", lambda request, timeout: Response())
+
+    result = session_logging.drain_queue()
+
+    assert result["uploaded"] == 1
+    assert result["remaining"] == 0
+
+
 def test_drain_dead_letters_permanent_ingest_rejection(tmp_path, monkeypatch):
     monkeypatch.setenv("CODEX_SESSION_LOG_STATE_DIR", str(tmp_path / "state"))
     monkeypatch.setenv("CODEX_SESSION_LOG_INGEST_URL", "https://logs.example.test/ingest")

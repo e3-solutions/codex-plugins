@@ -21,9 +21,9 @@ python3 plugins/linear-progress-sync/scripts/setup.py
 codex mcp login linear
 ```
 
-Then restart Codex or start a new Codex thread. If Codex asks to review hooks, trust the Linear Progress Sync hooks once.
+Then restart Codex or start a new Codex thread. If Codex asks to review hooks, trust the Linear Progress Sync and Codex Session Logging hooks once.
 
-`setup.py` checks GitHub CLI auth, installs the plugin, installs global Codex hooks into `~/.codex/hooks.json`, and registers Linear MCP. It does not log you in to Linear, so `codex mcp login linear` is still required.
+`setup.py` checks GitHub CLI auth, installs Linear Progress Sync and Codex Session Logging, installs global Codex hooks into `~/.codex/hooks.json`, and registers Linear MCP. It does not log you in to Linear, so `codex mcp login linear` is still required.
 
 Preview setup without changing Codex config:
 
@@ -59,7 +59,7 @@ Installed plugin caches check for updates during every `SessionStart`. The updat
 To force a manual update check:
 
 ```bash
-python3 ~/.codex/plugins/cache/coreedge-local/linear-progress-sync/0.2.6/scripts/update_plugin.py --force
+python3 ~/.codex/plugins/cache/coreedge-local/linear-progress-sync/0.2.7/scripts/update_plugin.py --force
 ```
 
 ## Rolling Out Updates

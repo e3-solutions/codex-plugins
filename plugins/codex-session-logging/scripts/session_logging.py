@@ -36,7 +36,7 @@ DEFAULT_INGEST_URL = f"{DEFAULT_SUPABASE_URL}/functions/v1/codex-session-ingest"
 DEFAULT_BUCKET = "codex-sessions"
 ALLOWED_GITHUB_ORG = "e3-solutions"
 EXCERPT_BYTES = 4096
-PLUGIN_VERSION = "0.1.1"
+PLUGIN_VERSION = "0.1.2"
 PERMANENT_HTTP_STATUSES = {400, 413, 415, 422}
 
 
@@ -957,6 +957,7 @@ class IngestUploader:
     def post(self, payload: JsonDict) -> None:
         headers = {
             "content-type": "application/json",
+            "connection": "close",
             "user-agent": f"codex-session-logging/{PLUGIN_VERSION}",
         }
         if self.token:
@@ -971,8 +972,8 @@ class IngestUploader:
     def request(self, url: str, *, method: str, data: bytes, headers: dict[str, str]) -> bytes:
         request = urllib.request.Request(url, data=data, headers=headers, method=method)
         try:
-            with urllib.request.urlopen(request, timeout=30) as response:
-                return response.read()
+            with urllib.request.urlopen(request, timeout=30):
+                return b""
         except urllib.error.HTTPError as exc:
             body = exc.read().decode("utf-8", errors="replace")
             message = f"Codex session ingest failed {exc.code}: {body}"
