@@ -80,10 +80,10 @@ LINEAR_SYNC_AUTO_UPDATE=0
 Force a manual update check when needed:
 
 ```bash
-python3 ~/.codex/plugins/cache/coreedge-local/linear-progress-sync/0.2.6/scripts/update_plugin.py --force
+python3 ~/.codex/plugins/cache/coreedge-local/linear-progress-sync/0.2.7/scripts/update_plugin.py --force
 ```
 
-If Codex asks to review hooks after setup, trust the Linear Progress Sync hooks once. Automatic kickoff depends on those hooks running.
+If Codex asks to review hooks after setup, trust the Linear Progress Sync and Codex Session Logging hooks once. Automatic kickoff and session capture depend on those hooks running.
 
 To roll out a new default plugin, skill, command, hook, or extension after teammates have run setup once:
 

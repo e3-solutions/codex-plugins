@@ -545,15 +545,88 @@ def linear_plugin_root(plugin_repo_root: str | Path) -> Path:
 
 
 def linear_hooks_config_path(plugin_repo_root: str | Path) -> Path:
-    plugin_root = linear_plugin_root(plugin_repo_root)
-    for candidate in (plugin_root / "hooks" / "hooks.json", plugin_root / "hooks.json"):
+    return plugin_hooks_config_path(plugin_repo_root, "linear-progress-sync")
+
+
+def plugin_root(plugin_repo_root: str | Path, plugin_name: str) -> Path:
+    root = Path(plugin_repo_root).expanduser().resolve()
+    direct_root = matching_plugin_root(root, plugin_name)
+    if direct_root is not None:
+        return direct_root
+    candidates = [
+        root / plugin_name,
+        root / "plugins" / plugin_name,
+        root.parent / plugin_name,
+        root.parent.parent / plugin_name,
+    ]
+    for candidate in candidates:
+        resolved = matching_plugin_root(candidate, plugin_name)
+        if resolved is not None:
+            return resolved
+    return root / "plugins" / plugin_name
+
+
+def matching_plugin_root(candidate: Path, plugin_name: str) -> Path | None:
+    if plugin_manifest_matches(candidate, plugin_name):
+        return candidate
+    versioned_roots: list[Path] = []
+    try:
+        children = list(candidate.iterdir())
+    except OSError:
+        return None
+    for child in children:
+        if child.is_dir() and plugin_manifest_matches(child, plugin_name):
+            versioned_roots.append(child)
+    if not versioned_roots:
+        return None
+    return max(versioned_roots, key=plugin_version_sort_key)
+
+
+def plugin_manifest_matches(candidate: Path, plugin_name: str) -> bool:
+    manifest = candidate / ".codex-plugin" / "plugin.json"
+    if not manifest.exists():
+        return False
+    try:
+        metadata = read_json_object(manifest)
+    except ValueError:
+        return False
+    return metadata.get("name") == plugin_name
+
+
+def plugin_version_sort_key(candidate: Path) -> tuple[int, ...]:
+    try:
+        metadata = read_json_object(candidate / ".codex-plugin" / "plugin.json")
+    except ValueError:
+        return (0,)
+    version = metadata.get("version")
+    if not isinstance(version, str):
+        return (0,)
+    parts: list[int] = []
+    for piece in version.replace("-", ".").split("."):
+        digits = ""
+        for char in piece:
+            if char.isdigit():
+                digits += char
+            else:
+                break
+        parts.append(int(digits or 0))
+    return tuple(parts or [0])
+
+
+def plugin_hooks_config_path(plugin_repo_root: str | Path, plugin_name: str) -> Path:
+    root = plugin_root(plugin_repo_root, plugin_name)
+    for candidate in (root / "hooks" / "hooks.json", root / "hooks.json"):
         if candidate.exists():
             return candidate
-    raise FileNotFoundError(f"missing Linear hook config under {plugin_root}")
+    raise FileNotFoundError(f"missing {plugin_name} hook config under {root}")
 
 
 def read_linear_hooks_config(plugin_repo_root: str | Path) -> JsonDict:
-    path = linear_hooks_config_path(plugin_repo_root)
+    return read_plugin_hooks_config(plugin_repo_root, "linear-progress-sync")
+
+
+def read_plugin_hooks_config(plugin_repo_root: str | Path, plugin_name: str) -> JsonDict:
+    path = plugin_hooks_config_path(plugin_repo_root, plugin_name)
     config = read_json_object(path)
     hooks = config.get("hooks")
     if not isinstance(hooks, dict):
@@ -562,36 +635,56 @@ def read_linear_hooks_config(plugin_repo_root: str | Path) -> JsonDict:
 
 
 def hook_entry_mentions_linear_sync(entry: Any) -> bool:
+    return hook_entry_mentions_plugin(entry, "linear-progress-sync")
+
+
+def hook_entry_mentions_plugin(entry: Any, plugin_name: str) -> bool:
     try:
         text = json.dumps(entry, sort_keys=True)
     except TypeError:
         text = str(entry)
-    return "linear-progress-sync" in text
+    return plugin_name in text
 
 
 def merge_linear_hooks(existing: JsonDict, linear_config: JsonDict) -> JsonDict:
+    return merge_plugin_hooks(existing, plugin_name="linear-progress-sync", plugin_config=linear_config)
+
+
+def merge_plugin_hooks(existing: JsonDict, *, plugin_name: str, plugin_config: JsonDict) -> JsonDict:
     merged = json.loads(json.dumps(existing)) if existing else {}
     merged_hooks = merged.setdefault("hooks", {})
     if not isinstance(merged_hooks, dict):
         raise ValueError("existing hooks.json field `hooks` must be an object")
 
-    linear_hooks = linear_config.get("hooks")
-    if not isinstance(linear_hooks, dict):
-        raise ValueError("Linear hook config missing hooks object")
+    incoming_hooks = plugin_config.get("hooks")
+    if not isinstance(incoming_hooks, dict):
+        raise ValueError(f"{plugin_name} hook config missing hooks object")
 
-    for event in LINEAR_HOOK_EVENTS:
-        incoming = linear_hooks.get(event)
-        if incoming is None:
-            continue
-        if not isinstance(incoming, list):
-            raise ValueError(f"Linear hook event {event} must be a list")
+    for event in sorted(set(merged_hooks) | set(incoming_hooks)):
+        incoming = incoming_hooks.get(event)
         current = merged_hooks.get(event, [])
         if current is None:
             current = []
         if not isinstance(current, list):
             raise ValueError(f"existing hooks event {event} must be a list")
-        kept = [entry for entry in current if not hook_entry_mentions_linear_sync(entry)]
-        merged_hooks[event] = kept + json.loads(json.dumps(incoming))
+        if incoming is None:
+            replacement = [
+                entry for entry in current
+                if not hook_entry_mentions_plugin(entry, plugin_name)
+            ]
+            if replacement:
+                merged_hooks[event] = replacement
+            else:
+                merged_hooks.pop(event, None)
+            continue
+        if not isinstance(incoming, list):
+            raise ValueError(f"{plugin_name} hook event {event} must be a list")
+        kept = [entry for entry in current if not hook_entry_mentions_plugin(entry, plugin_name)]
+        replacement = kept + json.loads(json.dumps(incoming))
+        if replacement:
+            merged_hooks[event] = replacement
+        else:
+            merged_hooks.pop(event, None)
 
     return merged
 
@@ -604,11 +697,25 @@ def install_codex_hooks(
 ) -> JsonDict:
     hooks_path = codex_hooks_path(home=codex_home_path)
     existing = read_json_object(hooks_path)
-    linear_config = read_linear_hooks_config(plugin_repo_root)
-    merged = merge_linear_hooks(existing, linear_config)
+    merged = existing
+    plugins: list[JsonDict] = []
+    for plugin_name in ("linear-progress-sync", "codex-session-logging"):
+        plugin_config = read_plugin_hooks_config(plugin_repo_root, plugin_name)
+        hooks = plugin_config.get("hooks")
+        if not isinstance(hooks, dict):
+            raise ValueError(f"{plugin_name} hook config missing hooks object")
+        merged = merge_plugin_hooks(merged, plugin_name=plugin_name, plugin_config=plugin_config)
+        plugins.append(
+            {
+                "name": plugin_name,
+                "source": str(plugin_hooks_config_path(plugin_repo_root, plugin_name)),
+                "events": list(hooks),
+            }
+        )
     changed = merged != existing
     if changed and not dry_run:
         write_json_atomic(hooks_path, merged)
+    linear_config = read_linear_hooks_config(plugin_repo_root)
     return {
         "ok": True,
         "changed": changed,
@@ -616,6 +723,7 @@ def install_codex_hooks(
         "path": str(hooks_path),
         "source": str(linear_hooks_config_path(plugin_repo_root)),
         "events": [event for event in LINEAR_HOOK_EVENTS if event in (linear_config.get("hooks") or {})],
+        "plugins": plugins,
     }
 
 
@@ -947,6 +1055,7 @@ def setup_plan(
         shlex.join(["gh", "auth", "status"]),
         shlex.join(["codex", "plugin", "marketplace", "add", str(plugin_root)]),
         shlex.join(["codex", "plugin", "add", "linear-progress-sync@coreedge-local"]),
+        shlex.join(["codex", "plugin", "add", "codex-session-logging@coreedge-local"]),
         shlex.join(
             [
                 sys.executable,
@@ -970,7 +1079,7 @@ def setup_plan(
             "Default setup is user-level: plugin marketplace, plugin install, global Codex hooks, GitHub auth check, and Linear MCP registration.",
             "GitHub auth is a manual prerequisite: run gh auth login when needed.",
             "Linear auth is manual after setup registers the MCP server: run codex mcp login linear after setup when needed.",
-            "If Codex asks to review hooks, trust the Linear Progress Sync hooks once so automatic kickoff can run.",
+            "If Codex asks to review hooks, trust the Linear Progress Sync and Codex Session Logging hooks once so kickoff and session capture can run.",
             "First use lists Linear users, asks which user to save, and stores it in ~/.codex/linear-sync/user.json for all repos.",
             "First use in a repo lists Linear teams/projects, asks which project to save, and stores it in ~/.codex/linear-sync/repos.json.",
             "Repos that should not use Linear sync can be opted out with linear_start.py configure-repo --disable-linear-sync.",

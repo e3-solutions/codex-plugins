@@ -316,12 +316,25 @@ def install_plugin_dir(source: Path, *, cache_parent: Path, version: str) -> Pat
     temp_target = temp_parent / version
     try:
         shutil.copytree(source, temp_target)
+        touch_tree(temp_target)
         if target.exists():
             shutil.rmtree(target)
         shutil.move(str(temp_target), str(target))
     finally:
         shutil.rmtree(temp_parent, ignore_errors=True)
     return target
+
+
+def touch_tree(root: Path) -> None:
+    for path in root.rglob("*"):
+        try:
+            os.utime(path, None)
+        except OSError:
+            continue
+    try:
+        os.utime(root, None)
+    except OSError:
+        pass
 
 
 def marketplace_cache_root(

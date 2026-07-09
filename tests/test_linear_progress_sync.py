@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.util
 import hashlib
 import json
+import os
 import subprocess
 import sys
 import zipfile
@@ -42,9 +43,10 @@ def write_minimal_plugin(
     *,
     version: str,
     name: str = "linear-progress-sync",
+    directory_name: str | None = None,
     hook_events: tuple[str, ...] | None = None,
 ) -> Path:
-    plugin = path / name
+    plugin = path / (directory_name or name)
     (plugin / ".codex-plugin").mkdir(parents=True)
     (plugin / "scripts").mkdir()
     (plugin / "hooks").mkdir()
@@ -1879,11 +1881,13 @@ def test_setup_plan_is_global_by_default_and_does_not_install_repo_hook(tmp_path
     assert "gh auth status" in commands
     assert "codex plugin marketplace add" in commands
     assert "codex plugin add linear-progress-sync@coreedge-local" in commands
+    assert "codex plugin add codex-session-logging@coreedge-local" in commands
     assert "install_codex_hooks.py" in commands
     assert "codex mcp add linear --url https://mcp.linear.app/mcp" in commands
     assert "codex mcp login linear" not in commands
     assert "codex mcp login linear after setup" in notes
     assert "review hooks" in notes
+    assert "Codex Session Logging hooks" in notes
     assert "First use lists Linear users" in notes
     assert "First use in a repo lists Linear teams/projects" in notes
     assert "--disable-linear-sync" in notes
@@ -1932,7 +1936,7 @@ def test_setup_summary_prints_team_next_steps(capsys):
     output = capsys.readouterr().out
 
     assert "Run: codex mcp login linear" in output
-    assert "trust the Linear Progress Sync hooks once" in output
+    assert "trust the Linear Progress Sync and Codex Session Logging hooks once" in output
     assert "list Linear users/projects" in output
     assert "--disable-linear-sync" in output
     assert "LINEAR_SYNC_AUTO_UPDATE=0" in output
@@ -2027,6 +2031,25 @@ def test_update_plugin_syncs_default_marketplace_plugins_and_hooks_when_bootstra
     assert "internal-experiment" not in hooks_text
     assert hooks_text.count("codex-session-logging") == 2
     assert hooks_text.count("linear-progress-sync") == 2
+
+
+def test_install_plugin_refreshes_installed_file_mtimes_for_hook_selection(tmp_path):
+    update_plugin = load_update_plugin()
+    source = write_minimal_plugin(
+        tmp_path / "source",
+        name="codex-session-logging",
+        version="0.1.0",
+        hook_events=("SessionStart",),
+    )
+    old_timestamp = 1_700_000_000
+    for path in source.rglob("*"):
+        os.utime(path, (old_timestamp, old_timestamp))
+
+    result = update_plugin.install_plugin_if_needed(source, cache_root=tmp_path / "cache")
+    installed_script = Path(result["path"]) / "scripts" / "session_start.py"
+
+    assert result["installed"] is True
+    assert installed_script.stat().st_mtime > old_timestamp
 
 
 def test_update_plugin_rejects_archive_with_wrong_sha(tmp_path, monkeypatch):
@@ -2183,8 +2206,78 @@ def test_install_codex_hooks_merges_existing_user_hooks(tmp_path):
     assert installed["hooks"]["SessionStart"][0]["hooks"][0]["command"] == "/tmp/notify.sh"
     assert any("linear-progress-sync" in json.dumps(entry) for entry in installed["hooks"]["PreToolUse"])
     assert any("linear-progress-sync" in json.dumps(entry) for entry in installed["hooks"]["PostToolUse"])
+    assert any("codex-session-logging" in json.dumps(entry) for entry in installed["hooks"]["SessionStart"])
+    assert any("codex-session-logging" in json.dumps(entry) for entry in installed["hooks"]["UserPromptSubmit"])
     assert json.dumps(installed).count("pre_tool_use.py") == 1
     assert json.dumps(installed).count("post_tool_use.py") == 1
+    assert json.dumps(installed).count("user_prompt_submit.py") == 1
+
+
+def test_install_codex_hooks_can_resolve_plugins_from_marketplace_cache_root(tmp_path):
+    marketplace_root = tmp_path / "coreedge-local"
+    write_minimal_plugin(
+        marketplace_root,
+        name="linear-progress-sync",
+        version="0.2.7",
+        hook_events=("SessionStart",),
+    )
+    write_minimal_plugin(
+        marketplace_root,
+        name="codex-session-logging",
+        version="0.1.2",
+        hook_events=("UserPromptSubmit",),
+    )
+
+    result = linear_sync.install_codex_hooks(
+        plugin_repo_root=marketplace_root,
+        codex_home_path=tmp_path / "codex-home",
+    )
+
+    assert result["changed"] is True
+    assert {plugin["name"] for plugin in result["plugins"]} == {
+        "linear-progress-sync",
+        "codex-session-logging",
+    }
+
+
+def test_install_codex_hooks_can_resolve_plugins_from_versioned_cache_root(tmp_path):
+    marketplace_root = tmp_path / "coreedge-local"
+    write_minimal_plugin(
+        marketplace_root / "linear-progress-sync",
+        name="linear-progress-sync",
+        directory_name="0.2.6",
+        version="0.2.6",
+        hook_events=("SessionStart",),
+    )
+    write_minimal_plugin(
+        marketplace_root / "linear-progress-sync",
+        name="linear-progress-sync",
+        directory_name="0.2.7",
+        version="0.2.7",
+        hook_events=("SessionStart",),
+    )
+    write_minimal_plugin(
+        marketplace_root / "codex-session-logging",
+        name="codex-session-logging",
+        directory_name="0.1.2",
+        version="0.1.2",
+        hook_events=("UserPromptSubmit",),
+    )
+
+    result = linear_sync.install_codex_hooks(
+        plugin_repo_root=marketplace_root,
+        codex_home_path=tmp_path / "codex-home",
+    )
+
+    assert result["changed"] is True
+    assert any(
+        plugin["source"].endswith("linear-progress-sync/0.2.7/hooks/hooks.json")
+        for plugin in result["plugins"]
+    )
+    assert any(
+        plugin["source"].endswith("codex-session-logging/0.1.2/hooks/hooks.json")
+        for plugin in result["plugins"]
+    )
 
 
 def test_readmes_register_linear_mcp_before_linear_login():
@@ -2195,7 +2288,7 @@ def test_readmes_register_linear_mcp_before_linear_login():
             "codex mcp login linear"
         )
         assert "Run this once per teammate, not once per repo" in text
-        assert "trust the Linear Progress Sync hooks once" in text
+        assert "trust the Linear Progress Sync and Codex Session Logging hooks once" in text
         assert "saves it in `~/.codex/linear-sync/repos.json`" in text
         assert "update_plugin.py --force" in text
         assert "LINEAR_SYNC_AUTO_UPDATE=0" in text
