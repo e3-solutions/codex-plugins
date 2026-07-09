@@ -2,6 +2,12 @@
 
 Local Codex plugin for Linear-first development in `e3-solutions` repos. Codex starts work from a Linear issue, creates the linked branch and draft PR before code, then keeps Linear updated from Codex commits.
 
+## Agent Install Contract
+
+This repository is a Codex plugin marketplace, not a single plugin source. Do not install the GitHub URL or repository root directly with `codex plugin add`.
+
+Agents installing this for a teammate must clone the repo and run `setup.py`, because setup registers the marketplace, installs both required plugins, merges global hooks, and registers Linear MCP.
+
 Current behavior:
 
 - Enforcement is scoped to git repos whose `origin` remote is under `e3-solutions/*`.
@@ -59,7 +65,7 @@ Installed plugin caches check for updates during every `SessionStart`. The updat
 To force a manual update check:
 
 ```bash
-python3 ~/.codex/plugins/cache/coreedge-local/linear-progress-sync/0.2.7/scripts/update_plugin.py --force
+python3 ~/.codex/plugins/cache/coreedge-local/linear-progress-sync/0.2.8/scripts/update_plugin.py --force
 ```
 
 ## Rolling Out Updates
