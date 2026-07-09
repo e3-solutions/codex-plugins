@@ -2218,7 +2218,7 @@ def test_install_codex_hooks_can_resolve_plugins_from_marketplace_cache_root(tmp
     write_minimal_plugin(
         marketplace_root,
         name="linear-progress-sync",
-        version="0.2.7",
+        version="0.2.8",
         hook_events=("SessionStart",),
     )
     write_minimal_plugin(
@@ -2252,8 +2252,8 @@ def test_install_codex_hooks_can_resolve_plugins_from_versioned_cache_root(tmp_p
     write_minimal_plugin(
         marketplace_root / "linear-progress-sync",
         name="linear-progress-sync",
-        directory_name="0.2.7",
-        version="0.2.7",
+        directory_name="0.2.8",
+        version="0.2.8",
         hook_events=("SessionStart",),
     )
     write_minimal_plugin(
@@ -2271,7 +2271,7 @@ def test_install_codex_hooks_can_resolve_plugins_from_versioned_cache_root(tmp_p
 
     assert result["changed"] is True
     assert any(
-        plugin["source"].endswith("linear-progress-sync/0.2.7/hooks/hooks.json")
+        plugin["source"].endswith("linear-progress-sync/0.2.8/hooks/hooks.json")
         for plugin in result["plugins"]
     )
     assert any(
@@ -2292,8 +2292,25 @@ def test_readmes_register_linear_mcp_before_linear_login():
         assert "saves it in `~/.codex/linear-sync/repos.json`" in text
         assert "update_plugin.py --force" in text
         assert "LINEAR_SYNC_AUTO_UPDATE=0" in text
+        assert "not a single plugin source" in text
+        assert "Do not install the GitHub URL or repository root directly with `codex plugin add`" in text
         assert "file edits, write-like Bash commands, and branch creation wait" in text
         assert "Read-only and non-mutating Bash commands can run before kickoff" in text
+
+
+def test_agent_install_contract_and_marketplace_defaults_are_explicit():
+    agent_text = (ROOT / "AGENTS.md").read_text(encoding="utf-8")
+    assert "not a single plugin source" in agent_text
+    assert "do not run `codex plugin add` with the GitHub URL" in agent_text
+    assert "python3 plugins/linear-progress-sync/scripts/setup.py" in agent_text
+
+    marketplace = json.loads((ROOT / ".agents/plugins/marketplace.json").read_text(encoding="utf-8"))
+    policies = {
+        plugin["name"]: plugin["policy"]["installation"]
+        for plugin in marketplace["plugins"]
+    }
+    assert policies["linear-progress-sync"] == "INSTALLED_BY_DEFAULT"
+    assert policies["codex-session-logging"] == "INSTALLED_BY_DEFAULT"
 
 
 def test_setup_run_step_does_not_treat_auth_failure_as_idempotent_success(monkeypatch):

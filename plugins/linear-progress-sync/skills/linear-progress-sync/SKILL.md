@@ -68,8 +68,14 @@ gh auth login
 Set up the plugin, GitHub CLI check, and Linear MCP once:
 
 ```bash
+git clone https://github.com/e3-solutions/codex-plugins
+cd codex-plugins
+gh auth login
 python3 plugins/linear-progress-sync/scripts/setup.py
+codex mcp login linear
 ```
+
+This repository is a Codex plugin marketplace, not a single plugin source. Do not tell teammates or agents to run `codex plugin add` with the GitHub URL or repository root directly; that can skip marketplace registration, default plugin installation, hook merging, and Linear MCP registration.
 
 Installed plugin caches check for updates on every SessionStart. The updater downloads the current `main.zip` archive, reads the plugin manifest from that archive, syncs coreedge-local marketplace plugins marked `INSTALLED_BY_DEFAULT`, and refreshes global Codex hooks for hook plugins. Disable this with:
 
@@ -80,7 +86,7 @@ LINEAR_SYNC_AUTO_UPDATE=0
 Force a manual update check when needed:
 
 ```bash
-python3 ~/.codex/plugins/cache/coreedge-local/linear-progress-sync/0.2.7/scripts/update_plugin.py --force
+python3 ~/.codex/plugins/cache/coreedge-local/linear-progress-sync/0.2.8/scripts/update_plugin.py --force
 ```
 
 If Codex asks to review hooks after setup, trust the Linear Progress Sync and Codex Session Logging hooks once. Automatic kickoff and session capture depend on those hooks running.
