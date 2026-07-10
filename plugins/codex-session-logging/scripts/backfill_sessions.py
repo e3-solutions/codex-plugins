@@ -1,0 +1,733 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import fcntl
+import hashlib
+import json
+import os
+import time
+import uuid
+from collections import defaultdict
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Callable, Iterator
+
+from session_logging import (
+    ALLOWED_GITHUB_ORG,
+    EXCERPT_BYTES,
+    IngestUploader,
+    PLUGIN_VERSION,
+    append_jsonl,
+    auto_upload_enabled,
+    build_ingest_payload,
+    bucket_name,
+    client_context,
+    drain_queue,
+    enqueue_record,
+    ensure_state_dir,
+    git_origin_remote,
+    now_iso,
+    pending_queue_paths,
+    processing_queue_dir,
+    read_json_file,
+    remote_belongs_to_org,
+    safe_segment,
+    sha256_hex,
+    write_json_atomic,
+)
+
+JsonDict = dict[str, Any]
+BACKFILL_VERSION = 1
+BACKFILL_ENABLED_ENV = "CODEX_SESSION_LOG_BACKFILL"
+BACKFILL_MAX_FILES_ENV = "CODEX_SESSION_LOG_BACKFILL_MAX_FILES"
+BACKFILL_DRAIN_WAIT_ENV = "CODEX_SESSION_LOG_BACKFILL_DRAIN_WAIT_SECONDS"
+BACKFILL_HEARTBEAT_ENV = "CODEX_SESSION_LOG_BACKFILL_HEARTBEAT_SECONDS"
+DEFAULT_MAX_FILES = 1000
+DEFAULT_DRAIN_WAIT_SECONDS = 7200
+DEFAULT_HEARTBEAT_SECONDS = 30
+USAGE_VERSION = 1
+
+
+def main(argv: list[str] | None = None) -> None:
+    parser = argparse.ArgumentParser(description="Backfill historical Codex transcripts.")
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--force", action="store_true")
+    parser.add_argument("--max-files", type=int, default=max_files_per_run())
+    args = parser.parse_args(argv)
+    print(json.dumps(run_backfill(dry_run=args.dry_run, force=args.force, max_files=args.max_files), sort_keys=True))
+
+
+def backfill_enabled() -> bool:
+    value = os.environ.get(BACKFILL_ENABLED_ENV, "1").strip().lower()
+    return value not in {"0", "false", "no", "off"}
+
+
+def max_files_per_run() -> int:
+    try:
+        return max(1, int(os.environ.get(BACKFILL_MAX_FILES_ENV, DEFAULT_MAX_FILES)))
+    except ValueError:
+        return DEFAULT_MAX_FILES
+
+
+def heartbeat_seconds() -> float:
+    try:
+        return max(0.0, float(os.environ.get(BACKFILL_HEARTBEAT_ENV, DEFAULT_HEARTBEAT_SECONDS)))
+    except ValueError:
+        return float(DEFAULT_HEARTBEAT_SECONDS)
+
+
+def codex_home() -> Path:
+    configured = os.environ.get("CODEX_HOME")
+    return Path(configured).expanduser().resolve() if configured else Path.home() / ".codex"
+
+
+def transcript_paths() -> list[Path]:
+    root = codex_home() / "sessions"
+    return sorted(root.glob("**/*.jsonl")) if root.exists() else []
+
+
+def backfill_dir(base: Path) -> Path:
+    return base / "backfills" / f"v{BACKFILL_VERSION}"
+
+
+def state_path(base: Path) -> Path:
+    return backfill_dir(base) / "state.json"
+
+
+def read_state(base: Path) -> JsonDict:
+    try:
+        loaded = json.loads(state_path(base).read_text(encoding="utf-8"))
+    except (FileNotFoundError, OSError, json.JSONDecodeError):
+        return {"version": BACKFILL_VERSION, "files": {}}
+    return loaded if isinstance(loaded, dict) else {"version": BACKFILL_VERSION, "files": {}}
+
+
+def file_fingerprint(path: Path) -> str:
+    stat = path.stat()
+    return f"{stat.st_size}:{stat.st_mtime_ns}"
+
+
+def run_backfill(*, dry_run: bool = False, force: bool = False, max_files: int = DEFAULT_MAX_FILES) -> JsonDict:
+    if not backfill_enabled():
+        return {"version": BACKFILL_VERSION, "status": "disabled"}
+    base = ensure_state_dir()
+    directory = backfill_dir(base)
+    directory.mkdir(parents=True, exist_ok=True)
+    lock_path = directory / "worker.lock"
+    with lock_path.open("a", encoding="utf-8") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return {"version": BACKFILL_VERSION, "status": "already_running"}
+
+        state = read_state(base)
+        previous_completed_at = string_value(state.get("completed_at"))
+        files = state.setdefault("files", {})
+        totals = {"discovered": 0, "processed": 0, "queued": 0, "skipped_non_e3": 0, "failed": 0}
+        paths = transcript_paths()
+        repo_by_cwd = known_repositories(paths)
+        totals["discovered"] = len(paths)
+        state.update({
+            "version": BACKFILL_VERSION,
+            "status": "running",
+            "started_at": state.get("started_at") or now_iso(),
+            "totals": totals,
+            "remaining_files": len(paths),
+        })
+        if not dry_run:
+            write_json_atomic(state_path(base), state)
+
+        reporting_remote = string_value(state.get("reporting_remote"))
+        last_heartbeat = float("-inf")
+
+        def emit_heartbeat(
+            drain_progress: JsonDict | None = None,
+            *,
+            force_report: bool = False,
+        ) -> None:
+            nonlocal last_heartbeat
+            if dry_run or not auto_upload_enabled() or not reporting_remote:
+                return
+            current = time.monotonic()
+            if not force_report and current - last_heartbeat < heartbeat_seconds():
+                return
+            state["status"] = "running"
+            state["completed_at"] = None
+            state["updated_at"] = now_iso()
+            if drain_progress is not None:
+                state["last_drain"] = drain_progress
+            write_json_atomic(state_path(base), state)
+            report_status(state, base=base, repo_remote=reporting_remote)
+            last_heartbeat = current
+
+        emit_heartbeat(force_report=True)
+        for path in paths:
+            if totals["processed"] >= max(1, max_files):
+                break
+            key = str(path)
+            try:
+                fingerprint = file_fingerprint(path)
+            except OSError:
+                totals["failed"] += 1
+                continue
+            previous = files.get(key) if isinstance(files.get(key), dict) else {}
+            same_completed_file = (
+                previous.get("fingerprint") == fingerprint
+                and previous.get("status") in {"complete", "skipped_non_e3"}
+            )
+            if (
+                not force
+                and same_completed_file
+                and previous.get("usage_version") == USAGE_VERSION
+            ):
+                emit_heartbeat()
+                continue
+            try:
+                result = import_transcript(
+                    path,
+                    base=base,
+                    dry_run=dry_run,
+                    repo_by_cwd=repo_by_cwd,
+                    include_messages=force or not same_completed_file,
+                )
+            except Exception as exc:  # noqa: BLE001 - one corrupt transcript must not stop the migration.
+                totals["failed"] += 1
+                files[key] = {"fingerprint": fingerprint, "status": "failed", "error": str(exc), "updated_at": now_iso()}
+                if not dry_run:
+                    append_jsonl(
+                        directory / "failures.jsonl",
+                        {"path": key, "error": str(exc), "created_at": now_iso()},
+                    )
+            else:
+                totals["processed"] += 1
+                totals["queued"] += int(result.get("newly_queued", result.get("queued", 0)))
+                if result.get("status") == "skipped_non_e3":
+                    totals["skipped_non_e3"] += 1
+                remote = result.get("repo_remote")
+                if isinstance(remote, str):
+                    reporting_remote = remote
+                    state["reporting_remote"] = remote
+                files[key] = {"fingerprint": fingerprint, **result, "updated_at": now_iso()}
+            if not dry_run:
+                state["totals"] = totals
+                state["updated_at"] = now_iso()
+                write_json_atomic(state_path(base), state)
+            emit_heartbeat()
+
+        remaining = sum(
+            1
+            for path in paths
+            if not isinstance(files.get(str(path)), dict)
+            or files[str(path)].get("fingerprint") != file_fingerprint(path)
+            or files[str(path)].get("status") not in {"complete", "skipped_non_e3"}
+            or files[str(path)].get("usage_version") != USAGE_VERSION
+        )
+        aggregate_totals = {
+            "discovered": len(paths),
+            "processed": sum(
+                1 for value in files.values() if isinstance(value, dict) and value.get("status") in {"complete", "skipped_non_e3"}
+            ),
+            "queued": sum(
+                int(value.get("queued", 0)) for value in files.values() if isinstance(value, dict)
+            ),
+            "skipped_non_e3": sum(
+                1 for value in files.values() if isinstance(value, dict) and value.get("status") == "skipped_non_e3"
+            ),
+            "failed": sum(
+                1 for value in files.values() if isinstance(value, dict) and value.get("status") == "failed"
+            ),
+        }
+        scan_complete = remaining == 0
+        state["status"] = "complete" if dry_run and scan_complete else "partial"
+        state["completed_at"] = now_iso() if dry_run and scan_complete else None
+        state["updated_at"] = now_iso()
+        state["totals"] = aggregate_totals
+        state["remaining_files"] = remaining
+        if not dry_run:
+            write_json_atomic(state_path(base), state)
+            if not auto_upload_enabled():
+                state["status"] = "partial"
+                state["completed_at"] = None
+                state["last_drain"] = {
+                    "disabled": True,
+                    "remaining": queue_inflight_count(base),
+                }
+                state["updated_at"] = now_iso()
+                write_json_atomic(state_path(base), state)
+            else:
+                emit_heartbeat(force_report=True)
+                drain_result = drain_when_available(base, progress_callback=emit_heartbeat)
+                drain_result["historical_dead_lettered"] = historical_dead_letter_count(base)
+                state["last_drain"] = drain_result
+                drain_problem = any(
+                    int(drain_result.get(key, 0)) > 0
+                    for key in ("failed", "dead_lettered", "historical_dead_lettered", "remaining")
+                ) or bool(drain_result.get("locked"))
+                if drain_problem or not scan_complete:
+                    state["status"] = "partial"
+                    state["completed_at"] = None
+                else:
+                    state["status"] = "complete"
+                    state["completed_at"] = (
+                        previous_completed_at
+                        if totals["processed"] == 0 and previous_completed_at
+                        else now_iso()
+                    )
+                state["updated_at"] = now_iso()
+                write_json_atomic(state_path(base), state)
+                if reporting_remote:
+                    report_status(state, base=base, repo_remote=reporting_remote)
+        return {"version": BACKFILL_VERSION, **totals, "remaining": remaining, "status": state["status"]}
+
+
+def import_transcript(
+    path: Path,
+    *,
+    base: Path,
+    dry_run: bool,
+    repo_by_cwd: dict[str, str] | None = None,
+    include_messages: bool = True,
+) -> JsonDict:
+    meta = read_session_meta(path)
+    cwd = string_value(meta.get("cwd"))
+    git = meta.get("git") if isinstance(meta.get("git"), dict) else {}
+    remote = (
+        string_value(git.get("repository_url"))
+        or ((repo_by_cwd or {}).get(cwd) if cwd else None)
+        or (git_origin_remote(cwd) if cwd else None)
+    )
+    if not remote_belongs_to_org(remote, ALLOWED_GITHUB_ORG):
+        return {
+            "status": "skipped_non_e3",
+            "queued": 0,
+            "newly_queued": 0,
+            "usage_version": USAGE_VERSION,
+        }
+
+    session_id = string_value(meta.get("session_id")) or string_value(meta.get("id")) or session_id_from_filename(path)
+    thread_id = sha256_hex(str(path.resolve()))
+    fallback_created_at = string_value(meta.get("timestamp")) or datetime.fromtimestamp(
+        path.stat().st_mtime,
+        tz=timezone.utc,
+    ).isoformat()
+    record_count = 0
+    newly_queued = 0
+    metadata: JsonDict = {
+        "cwd": cwd,
+        "repo_remote": remote,
+        "transcript_path": str(path.resolve()),
+        "source": "historical_transcript",
+        "backfill_version": BACKFILL_VERSION,
+        "source_line": None,
+    }
+    branch = string_value(git.get("branch"))
+    commit = string_value(git.get("commit_hash"))
+    if branch:
+        metadata["git_branch"] = branch
+    if commit:
+        metadata["git_commit"] = commit
+
+    final_usage: JsonDict | None = None
+    skipped_user_lines = response_user_lines_to_skip(path)
+    for line_number, envelope in iter_transcript(path):
+        usage = historical_token_usage(envelope, fallback_created_at=fallback_created_at)
+        if usage is not None:
+            final_usage = {**usage, "source_line": line_number}
+        parsed = historical_message(
+            envelope,
+            skip_response_user=line_number in skipped_user_lines,
+            fallback_created_at=fallback_created_at,
+        )
+        if parsed is None:
+            continue
+        record_count += 1
+        if not include_messages:
+            continue
+        role, content, turn_id, created_at = parsed
+        seq = historical_sequence(path, line_number)
+        record_id = deterministic_uuid(f"backfill-v{BACKFILL_VERSION}:{path.resolve()}:{line_number}:message")
+        content_bytes = content.encode("utf-8")
+        storage_path = f"users/local/sessions/{safe_segment(session_id)}/messages/{seq}-{role}.json"
+        message_metadata = {**metadata, "source_line": line_number}
+        detail: JsonDict = {
+            "id": record_id,
+            "session_id": session_id,
+            "thread_id": thread_id,
+            "turn_id": turn_id,
+            "seq": seq,
+            "role": role,
+            "content": content,
+            "content_sha256": hashlib.sha256(content_bytes).hexdigest(),
+            "content_byte_size": len(content_bytes),
+            "hook_event_name": "HistoricalBackfill",
+            "created_at": created_at,
+            "metadata": message_metadata,
+        }
+        record: JsonDict = {
+            key: value
+            for key, value in detail.items()
+            if key not in {"content"}
+        }
+        record.update({
+            "type": "message",
+            "storage_bucket": bucket_name(),
+            "storage_path": storage_path,
+            "local_content_path": storage_path,
+            "content_excerpt": content_bytes[:EXCERPT_BYTES].decode("utf-8", errors="replace"),
+            "uploaded_at": None,
+        })
+        newly_queued += 1
+        if not dry_run:
+            write_json_atomic(base / storage_path, detail)
+            enqueue_record(base, record)
+
+    if final_usage is not None:
+        record_count += 1
+        newly_queued += 1
+        usage_id = deterministic_uuid(f"backfill-usage-v{USAGE_VERSION}:{path.resolve()}")
+        usage_path = f"users/local/sessions/{safe_segment(session_id)}/usage.json"
+        usage_metadata = {**metadata, "source_line": final_usage.pop("source_line")}
+        usage_detail: JsonDict = {
+            "id": usage_id,
+            "session_id": session_id,
+            "thread_id": thread_id,
+            **final_usage,
+            "metadata": usage_metadata,
+        }
+        usage_record: JsonDict = {
+            "id": usage_id,
+            "type": "usage",
+            "session_id": session_id,
+            "thread_id": thread_id,
+            "created_at": final_usage["created_at"],
+            "metadata": usage_metadata,
+            "local_content_path": usage_path,
+            "uploaded_at": None,
+        }
+        if not dry_run:
+            write_json_atomic(base / usage_path, usage_detail)
+            enqueue_record(base, usage_record)
+
+    return {
+        "status": "complete",
+        "queued": record_count,
+        "newly_queued": newly_queued,
+        "usage_version": USAGE_VERSION,
+        "repo_remote": remote,
+        "session_id": session_id,
+    }
+
+
+def iter_transcript(path: Path) -> Iterator[tuple[int, JsonDict]]:
+    with path.open(encoding="utf-8") as handle:
+        for line_number, line in enumerate(handle):
+            if not line.strip():
+                continue
+            try:
+                loaded = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(loaded, dict):
+                continue
+            yield line_number, loaded
+
+
+def response_user_lines_to_skip(path: Path, *, max_line_distance: int = 10) -> set[int]:
+    segment = 0
+    saw_task_boundary = False
+    response_lines_by_segment: dict[int, list[int]] = defaultdict(list)
+    canonical_segments: set[int] = set()
+    for line_number, envelope in iter_transcript(path):
+        payload = envelope.get("payload")
+        if (
+            envelope.get("type") == "event_msg"
+            and isinstance(payload, dict)
+            and payload.get("type") == "task_started"
+        ):
+            segment += 1
+            saw_task_boundary = True
+        if response_user_text(envelope):
+            response_lines_by_segment[segment].append(line_number)
+        if event_user_text(envelope):
+            canonical_segments.add(segment)
+    if saw_task_boundary:
+        return {
+            line_number
+            for canonical_segment in canonical_segments
+            for line_number in response_lines_by_segment[canonical_segment]
+        }
+
+    pending_response_lines: dict[str, list[int]] = defaultdict(list)
+    duplicates: set[int] = set()
+    for line_number, envelope in iter_transcript(path):
+        response_text = response_user_text(envelope)
+        if response_text:
+            pending_response_lines[response_text].append(line_number)
+            continue
+        event_text = event_user_text(envelope)
+        if not event_text:
+            continue
+        candidates = pending_response_lines.get(event_text, [])
+        while candidates and line_number - candidates[0] > max_line_distance:
+            candidates.pop(0)
+        if candidates:
+            duplicates.add(candidates.pop())
+    return duplicates
+
+
+def response_user_text(envelope: JsonDict) -> str:
+    payload = envelope.get("payload")
+    if (
+        envelope.get("type") != "response_item"
+        or not isinstance(payload, dict)
+        or payload.get("type") != "message"
+        or payload.get("role") != "user"
+    ):
+        return ""
+    return message_text(payload.get("content"))
+
+
+def event_user_text(envelope: JsonDict) -> str:
+    payload = envelope.get("payload")
+    if (
+        envelope.get("type") != "event_msg"
+        or not isinstance(payload, dict)
+        or payload.get("type") != "user_message"
+    ):
+        return ""
+    return string_value(payload.get("message")) or ""
+
+
+def known_repositories(paths: list[Path]) -> dict[str, str]:
+    candidates: dict[str, set[str]] = {}
+    for path in paths:
+        try:
+            meta = read_session_meta(path)
+        except OSError:
+            continue
+        cwd = string_value(meta.get("cwd"))
+        git = meta.get("git") if isinstance(meta.get("git"), dict) else {}
+        remote = string_value(git.get("repository_url"))
+        if cwd and remote:
+            candidates.setdefault(cwd, set()).add(remote)
+    return {
+        cwd: next(iter(remotes))
+        for cwd, remotes in candidates.items()
+        if len(remotes) == 1
+        and remote_belongs_to_org(next(iter(remotes)), ALLOWED_GITHUB_ORG)
+    }
+
+
+def read_session_meta(path: Path) -> JsonDict:
+    with path.open(encoding="utf-8") as handle:
+        for line in handle:
+            if not line.strip():
+                continue
+            try:
+                loaded = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if (
+                isinstance(loaded, dict)
+                and loaded.get("type") == "session_meta"
+                and isinstance(loaded.get("payload"), dict)
+            ):
+                return loaded["payload"]
+    return {}
+
+
+def historical_token_usage(
+    envelope: JsonDict,
+    *,
+    fallback_created_at: str | None = None,
+) -> JsonDict | None:
+    payload = envelope.get("payload")
+    if (
+        envelope.get("type") != "event_msg"
+        or not isinstance(payload, dict)
+        or payload.get("type") != "token_count"
+    ):
+        return None
+    info = payload.get("info")
+    if not isinstance(info, dict):
+        return None
+    total = info.get("total_token_usage")
+    if not isinstance(total, dict):
+        return None
+
+    input_tokens = non_negative_int(total.get("input_tokens"))
+    output_tokens = non_negative_int(total.get("output_tokens"))
+    total_tokens = non_negative_int(total.get("total_tokens"))
+    if input_tokens is None or output_tokens is None or total_tokens is None:
+        return None
+
+    usage: JsonDict = {
+        "input_tokens": input_tokens,
+        "cached_input_tokens": non_negative_int(total.get("cached_input_tokens")) or 0,
+        "output_tokens": output_tokens,
+        "reasoning_output_tokens": non_negative_int(total.get("reasoning_output_tokens")) or 0,
+        "total_tokens": total_tokens,
+        "created_at": string_value(envelope.get("timestamp")) or fallback_created_at or now_iso(),
+    }
+    model_context_window = non_negative_int(info.get("model_context_window"))
+    if model_context_window is not None:
+        usage["model_context_window"] = model_context_window
+    return usage
+
+
+def historical_message(
+    envelope: JsonDict,
+    *,
+    skip_response_user: bool = False,
+    fallback_created_at: str | None = None,
+) -> tuple[str, str, str | None, str] | None:
+    if envelope.get("type") == "event_msg":
+        payload = envelope.get("payload")
+        if not isinstance(payload, dict) or payload.get("type") != "user_message":
+            return None
+        content = string_value(payload.get("message"))
+        if not content:
+            return None
+        timestamp = string_value(envelope.get("timestamp")) or fallback_created_at or now_iso()
+        return "user", content, string_value(payload.get("turn_id")), timestamp
+    if envelope.get("type") != "response_item":
+        return None
+    payload = envelope.get("payload")
+    if not isinstance(payload, dict) or payload.get("type") != "message":
+        return None
+    role = payload.get("role")
+    if role not in {"user", "assistant"}:
+        return None
+    if role == "user" and skip_response_user:
+        return None
+    phase = string_value(payload.get("phase"))
+    if role == "assistant" and phase and phase != "final_answer":
+        return None
+    content = message_text(payload.get("content"))
+    if not content:
+        return None
+    timestamp = string_value(envelope.get("timestamp")) or fallback_created_at or now_iso()
+    return role, content, string_value(payload.get("turn_id")), timestamp
+
+
+def message_text(content: object) -> str:
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return ""
+    parts: list[str] = []
+    for item in content:
+        if isinstance(item, str):
+            parts.append(item)
+        elif isinstance(item, dict) and item.get("type") in {"input_text", "output_text", "text"}:
+            text = item.get("text")
+            if isinstance(text, str):
+                parts.append(text)
+    return "\n".join(parts)
+
+
+def deterministic_uuid(value: str) -> str:
+    digest = bytearray(hashlib.sha256(value.encode("utf-8")).digest()[:16])
+    digest[6] = (digest[6] & 0x0F) | 0x50
+    digest[8] = (digest[8] & 0x3F) | 0x80
+    return str(uuid.UUID(bytes=bytes(digest)))
+
+
+def historical_sequence(path: Path, line_number: int) -> int:
+    digest = hashlib.sha256(
+        f"backfill-v{BACKFILL_VERSION}:{path.resolve()}:{line_number}".encode("utf-8")
+    ).digest()
+    return -(int.from_bytes(digest[:8], "big") % 2_000_000_000 + 1)
+
+
+def session_id_from_filename(path: Path) -> str:
+    stem = path.stem
+    candidate = stem.rsplit("-", 5)[-5:]
+    joined = "-".join(candidate)
+    try:
+        return str(uuid.UUID(joined))
+    except ValueError:
+        return sha256_hex(str(path.resolve()))[:32]
+
+
+def string_value(value: object) -> str | None:
+    return value.strip() if isinstance(value, str) and value.strip() else None
+
+
+def non_negative_int(value: object) -> int | None:
+    return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
+
+
+def drain_wait_seconds() -> float:
+    try:
+        return max(0.0, float(os.environ.get(BACKFILL_DRAIN_WAIT_ENV, DEFAULT_DRAIN_WAIT_SECONDS)))
+    except ValueError:
+        return float(DEFAULT_DRAIN_WAIT_SECONDS)
+
+
+def queue_inflight_count(base: Path) -> int:
+    return len(pending_queue_paths(base)) + len(list(processing_queue_dir(base).glob("*.json")))
+
+
+def drain_when_available(
+    base: Path,
+    *,
+    progress_callback: Callable[[JsonDict], None] | None = None,
+) -> JsonDict:
+    deadline = time.monotonic() + drain_wait_seconds()
+    while True:
+        result = drain_queue(progress_callback=progress_callback)
+        result["remaining"] = queue_inflight_count(base)
+        if progress_callback:
+            progress_callback(result)
+        if not result.get("locked") or time.monotonic() >= deadline:
+            return result
+        time.sleep(1)
+
+
+def historical_dead_letter_count(base: Path) -> int:
+    count = 0
+    for path in (base / "queue" / "dead-letter").glob("*.json"):
+        try:
+            record = read_json_file(path)
+        except (OSError, ValueError, json.JSONDecodeError):
+            continue
+        metadata = record.get("metadata")
+        if isinstance(metadata, dict) and metadata.get("source") == "historical_transcript":
+            count += 1
+    return count
+
+
+def report_status(state: JsonDict, *, base: Path, repo_remote: str) -> None:
+    record = {
+        "created_at": now_iso(),
+        "metadata": {"cwd": str(codex_home()), "repo_remote": repo_remote},
+    }
+    payload = {
+        "version": 1,
+        "kind": "backfill_status",
+        "plugin": {"name": "codex-session-logging"},
+        "client": client_context(record, base=base),
+        "backfill": {
+            "version": BACKFILL_VERSION,
+            "status": state.get("status"),
+            "started_at": state.get("started_at"),
+            "completed_at": state.get("completed_at"),
+            "updated_at": state.get("updated_at"),
+            "remaining_files": state.get("remaining_files"),
+            "totals": state.get("totals", {}),
+            "metadata": {
+                "plugin_version": PLUGIN_VERSION,
+                "last_drain": state.get("last_drain", {}),
+            },
+        },
+    }
+    try:
+        IngestUploader.from_env().post(payload)
+    except Exception as exc:  # noqa: BLE001 - status telemetry must not fail the backfill.
+        append_jsonl(backfill_dir(base) / "status_errors.jsonl", {"created_at": now_iso(), "error": str(exc)})
+
+
+if __name__ == "__main__":
+    main()

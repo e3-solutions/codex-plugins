@@ -15,9 +15,10 @@ import sys
 import urllib.error
 import urllib.request
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 try:
     import tomllib
@@ -31,12 +32,13 @@ SUPABASE_BUCKET_ENV = "CODEX_SESSION_LOG_BUCKET"
 INGEST_URL_ENV = "CODEX_SESSION_LOG_INGEST_URL"
 INGEST_TOKEN_ENV = "CODEX_SESSION_LOG_INGEST_TOKEN"
 AUTO_UPLOAD_ENV = "CODEX_SESSION_LOG_AUTO_UPLOAD"
+UPLOAD_WORKERS_ENV = "CODEX_SESSION_LOG_UPLOAD_WORKERS"
 DEFAULT_SUPABASE_URL = "https://pmdfllwuctzkdjiehezq.supabase.co"
 DEFAULT_INGEST_URL = f"{DEFAULT_SUPABASE_URL}/functions/v1/codex-session-ingest"
 DEFAULT_BUCKET = "codex-sessions"
 ALLOWED_GITHUB_ORG = "e3-solutions"
 EXCERPT_BYTES = 4096
-PLUGIN_VERSION = "0.1.3"
+PLUGIN_VERSION = "0.2.1"
 PERMANENT_HTTP_STATUSES = {400, 413, 415, 422}
 
 
@@ -686,7 +688,7 @@ def drain_lock(base: Path):
             fcntl.flock(handle, fcntl.LOCK_UN)
 
 
-def drain_queue() -> JsonDict:
+def drain_queue(progress_callback: Callable[[JsonDict], None] | None = None) -> JsonDict:
     base = ensure_state_dir()
     with drain_lock(base) as acquired:
         if not acquired:
@@ -705,47 +707,82 @@ def drain_queue() -> JsonDict:
         dead_lettered = 0
         failed_record_names: set[str] = set()
         uploader: IngestUploader | None = None
-        while True:
-            queue_paths = [path for path in pending_queue_paths(base) if path.name not in failed_record_names]
-            if not queue_paths:
-                break
-            if uploader is None:
-                uploader = IngestUploader.from_env()
-            for queue_path in queue_paths:
-                claimed_path = claim_queue_path(queue_path, base)
-                if claimed_path is None:
-                    continue
-                record: JsonDict | None = None
-                try:
-                    record = read_json_file(claimed_path)
-                    uploader.upload_message(record, base=base)
-                except PermanentUploadError as exc:
-                    dead_lettered += 1
-                    if record is None:
-                        target = dead_letter_queue_dir(base) / claimed_path.name
-                        target.parent.mkdir(parents=True, exist_ok=True)
-                        claimed_path.replace(target)
-                        continue
-                    dead_letter_record(base, record, claimed_path, exc)
-                except Exception as exc:  # noqa: BLE001 - hook uploader must preserve queue on any failure.
-                    failed += 1
-                    failed_record_names.add(claimed_path.name)
-                    if record is None:
-                        claimed_path.replace(pending_queue_dir(base) / claimed_path.name)
-                        continue
-                    record["last_upload_error"] = str(exc)
-                    record["last_upload_failed_at"] = now_iso()
-                    enqueue_record(base, record)
-                    claimed_path.unlink(missing_ok=True)
-                else:
-                    uploaded += 1
-                    claimed_path.unlink(missing_ok=True)
+        with ThreadPoolExecutor(max_workers=upload_worker_count()) as executor:
+            while True:
+                queue_paths = [path for path in pending_queue_paths(base) if path.name not in failed_record_names]
+                if not queue_paths:
+                    break
+                if uploader is None:
+                    uploader = IngestUploader.from_env()
+                claimed_paths = [
+                    claimed
+                    for path in queue_paths
+                    if (claimed := claim_queue_path(path, base)) is not None
+                ]
+                for status, record_name in executor.map(
+                    lambda path: upload_claimed_record(path, uploader=uploader, base=base),
+                    claimed_paths,
+                ):
+                    if status == "uploaded":
+                        uploaded += 1
+                    elif status == "dead_lettered":
+                        dead_lettered += 1
+                    else:
+                        failed += 1
+                        failed_record_names.add(record_name)
+                    if progress_callback:
+                        progress_callback({
+                            "uploaded": uploaded,
+                            "failed": failed,
+                            "dead_lettered": dead_lettered,
+                            "remaining": len(pending_queue_paths(base))
+                            + len(list(processing_queue_dir(base).glob("*.json"))),
+                        })
         return {
             "uploaded": uploaded,
             "failed": failed,
             "dead_lettered": dead_lettered,
             "remaining": len(pending_queue_paths(base)),
         }
+
+
+def upload_worker_count() -> int:
+    try:
+        return min(32, max(1, int(os.environ.get(UPLOAD_WORKERS_ENV, "4"))))
+    except ValueError:
+        return 4
+
+
+def upload_claimed_record(
+    claimed_path: Path,
+    *,
+    uploader: "IngestUploader",
+    base: Path,
+) -> tuple[str, str]:
+    record: JsonDict | None = None
+    try:
+        record = read_json_file(claimed_path)
+        uploader.upload_message(record, base=base)
+    except PermanentUploadError as exc:
+        if record is None:
+            target = dead_letter_queue_dir(base) / claimed_path.name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            claimed_path.replace(target)
+        else:
+            dead_letter_record(base, record, claimed_path, exc)
+        return "dead_lettered", claimed_path.name
+    except Exception as exc:  # noqa: BLE001 - uploader must preserve queue on any failure.
+        if record is None:
+            claimed_path.replace(pending_queue_dir(base) / claimed_path.name)
+        else:
+            record["last_upload_error"] = str(exc)
+            record["last_upload_failed_at"] = now_iso()
+            enqueue_record(base, record)
+            claimed_path.unlink(missing_ok=True)
+        return "failed", claimed_path.name
+    (dead_letter_queue_dir(base) / claimed_path.name).unlink(missing_ok=True)
+    claimed_path.unlink(missing_ok=True)
+    return "uploaded", claimed_path.name
 
 
 def dead_letter_record(base: Path, record: JsonDict, source_path: Path, exc: Exception) -> None:
@@ -828,6 +865,8 @@ def build_ingest_payload(record: JsonDict, *, base: Path) -> JsonDict:
     }
     if record.get("type") == "event":
         payload["event"] = detail
+    elif record.get("type") == "usage":
+        payload["usage"] = detail
     else:
         payload["message"] = detail
     return payload
@@ -836,16 +875,18 @@ def build_ingest_payload(record: JsonDict, *, base: Path) -> JsonDict:
 def client_context(record: JsonDict, *, base: Path) -> JsonDict:
     metadata = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
     cwd = metadata.get("cwd") if isinstance(metadata.get("cwd"), str) else None
-    git_email = git_config_value(cwd, "user.email") if cwd else None
+    git_email = git_config_value(cwd, "user.email")
     hostname = local_hostname()
     username = local_username()
     installation_id = local_installation_id(base)
     context: JsonDict = {
         "cwd": cwd,
-        "repo_remote": git_origin_remote(cwd) if cwd else None,
+        "repo_remote": metadata.get("repo_remote")
+        or (git_origin_remote(cwd) if cwd else None),
         "git_email": git_email,
-        "git_user_name": git_config_value(cwd, "user.name") if cwd else None,
-        "git_branch": current_git_branch(cwd) if cwd else None,
+        "git_user_name": git_config_value(cwd, "user.name"),
+        "git_branch": metadata.get("git_branch")
+        or (current_git_branch(cwd) if cwd else None),
         "linear_user_name": saved_linear_user_name(),
         "hostname": hostname,
         "local_username": username,
@@ -871,15 +912,28 @@ def local_installation_id(base: Path) -> str:
     if existing:
         return existing
 
-    value = str(uuid.uuid4())
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_name(f"{path.name}.{uuid.uuid4().hex}.tmp")
-        tmp.write_text(f"{value}\n", encoding="utf-8")
-        tmp.replace(path)
+        lock_path = path.with_suffix(".lock")
+        with lock_path.open("a", encoding="utf-8") as handle:
+            fcntl.flock(handle, fcntl.LOCK_EX)
+            try:
+                try:
+                    existing = path.read_text(encoding="utf-8").strip()
+                except (FileNotFoundError, OSError):
+                    existing = ""
+                if existing:
+                    return existing
+
+                value = str(uuid.uuid4())
+                tmp = path.with_name(f"{path.name}.{uuid.uuid4().hex}.tmp")
+                tmp.write_text(f"{value}\n", encoding="utf-8")
+                tmp.replace(path)
+                return value
+            finally:
+                fcntl.flock(handle, fcntl.LOCK_UN)
     except OSError:
-        return value
-    return value
+        return str(uuid.uuid4())
 
 
 def client_identity_key(
@@ -917,18 +971,22 @@ def saved_linear_user_name() -> str | None:
     return stripped or None
 
 
-def git_config_value(cwd: str, key: str) -> str | None:
-    result = subprocess.run(
-        ["git", "-C", cwd, "config", "--get", key],
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
-        check=False,
-    )
-    if result.returncode != 0:
-        return None
-    value = result.stdout.strip()
-    return value or None
+def git_config_value(cwd: str | None, key: str) -> str | None:
+    commands = []
+    if cwd:
+        commands.append(["git", "-C", cwd, "config", "--get", key])
+    commands.append(["git", "config", "--global", "--get", key])
+    for command in commands:
+        result = subprocess.run(
+            command,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return result.stdout.strip()
+    return None
 
 
 def current_git_branch(cwd: str) -> str | None:

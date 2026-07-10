@@ -6,6 +6,8 @@ import json
 import os
 import subprocess
 import sys
+import threading
+import time
 import urllib.error
 from pathlib import Path
 
@@ -481,6 +483,71 @@ def test_drain_uploads_records_enqueued_during_upload_before_returning(tmp_path,
     assert queued == []
 
 
+def test_drain_uploads_multiple_records_concurrently(tmp_path, monkeypatch):
+    monkeypatch.setenv("CODEX_SESSION_LOG_STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setenv("CODEX_SESSION_LOG_UPLOAD_WORKERS", "4")
+    session_logging = load_session_logging()
+    repo = init_git_repo(tmp_path / "repo", "https://github.com/e3-solutions/codex-plugins.git")
+    for turn in range(4):
+        session_logging.capture_hook_event(
+            {
+                "hook_event_name": "UserPromptSubmit",
+                "session_id": "parallel-upload",
+                "turn_id": f"turn-{turn}",
+                "cwd": str(repo),
+                "prompt": f"Prompt {turn}",
+            }
+        )
+
+    class ConcurrentUploader:
+        def __init__(self):
+            self.active = 0
+            self.max_active = 0
+            self.lock = threading.Lock()
+
+        def upload_message(self, record, *, base):
+            with self.lock:
+                self.active += 1
+                self.max_active = max(self.max_active, self.active)
+            time.sleep(0.05)
+            with self.lock:
+                self.active -= 1
+
+    uploader = ConcurrentUploader()
+    monkeypatch.setattr(session_logging.IngestUploader, "from_env", classmethod(lambda cls: uploader))
+    progress = []
+
+    result = session_logging.drain_queue(progress_callback=progress.append)
+
+    assert result["uploaded"] == 4
+    assert result["remaining"] == 0
+    assert uploader.max_active > 1
+    assert progress[-1]["uploaded"] == 4
+    assert progress[-1]["remaining"] == 0
+
+
+def test_concurrent_upload_workers_share_one_installation_id(tmp_path, monkeypatch):
+    session_logging = load_session_logging()
+    base = tmp_path / "state"
+    original_uuid4 = session_logging.uuid.uuid4
+
+    def slow_uuid4():
+        time.sleep(0.02)
+        return original_uuid4()
+
+    monkeypatch.setattr(session_logging.uuid, "uuid4", slow_uuid4)
+
+    with session_logging.ThreadPoolExecutor(max_workers=8) as executor:
+        installation_ids = list(
+            executor.map(lambda _: session_logging.local_installation_id(base), range(8))
+        )
+
+    assert len(set(installation_ids)) == 1
+    assert (
+        base / "installation_id"
+    ).read_text(encoding="utf-8").strip() == installation_ids[0]
+
+
 def test_drain_posts_full_message_to_ingest_endpoint_without_local_supabase_secret(tmp_path, monkeypatch):
     monkeypatch.setenv("CODEX_SESSION_LOG_STATE_DIR", str(tmp_path / "state"))
     monkeypatch.setenv("CODEX_SESSION_LOG_INGEST_URL", "https://logs.example.test/ingest")
@@ -651,6 +718,39 @@ def test_drain_dead_letters_permanent_ingest_rejection(tmp_path, monkeypatch):
     assert dead_lettered["id"] == captured["id"]
     assert dead_lettered["dead_letter_reason"] == "permanent_upload_failure"
     assert "client.repo_remote" in dead_lettered["last_upload_error"]
+
+
+def test_successful_retry_removes_matching_stale_dead_letter(tmp_path, monkeypatch):
+    monkeypatch.setenv("CODEX_SESSION_LOG_STATE_DIR", str(tmp_path / "state"))
+    session_logging = load_session_logging()
+    repo = init_git_repo(tmp_path / "repo", "https://github.com/e3-solutions/codex-plugins.git")
+    captured = session_logging.capture_hook_event(
+        {
+            "hook_event_name": "UserPromptSubmit",
+            "session_id": "session-retry",
+            "cwd": str(repo),
+            "prompt": "Retry this record.",
+        }
+    )
+    pending_path = tmp_path / "state" / "queue" / "pending" / f"{captured['id']}.json"
+    dead_letter_path = tmp_path / "state" / "queue" / "dead-letter" / pending_path.name
+    dead_letter_path.parent.mkdir(parents=True)
+    dead_letter_path.write_text(pending_path.read_text(encoding="utf-8"), encoding="utf-8")
+
+    class SuccessfulUploader:
+        def upload_message(self, record, *, base):
+            return None
+
+    monkeypatch.setattr(
+        session_logging.IngestUploader,
+        "from_env",
+        classmethod(lambda cls: SuccessfulUploader()),
+    )
+
+    result = session_logging.drain_queue()
+
+    assert result["uploaded"] == 1
+    assert not dead_letter_path.exists()
 
 
 def test_drain_dead_letters_record_missing_repo_context_without_network(tmp_path, monkeypatch):
@@ -888,3 +988,22 @@ def test_plugin_packaging_and_supabase_migration_are_present():
     assert "upsertEvent" in function_source
     assert "unknown_user_email" not in function_source
     assert "verify_jwt = false" in config_path.read_text(encoding="utf-8")
+
+
+def test_git_identity_falls_back_to_global_config_for_deleted_checkout(monkeypatch):
+    session_logging = load_session_logging()
+    commands = []
+
+    def fake_run(command, **kwargs):
+        commands.append(command)
+        if "--global" in command:
+            return subprocess.CompletedProcess(command, 0, stdout="developer@e3.solutions\n")
+        return subprocess.CompletedProcess(command, 128, stdout="")
+
+    monkeypatch.setattr(session_logging.subprocess, "run", fake_run)
+
+    assert session_logging.git_config_value("/deleted/repo", "user.email") == "developer@e3.solutions"
+    assert commands == [
+        ["git", "-C", "/deleted/repo", "config", "--get", "user.email"],
+        ["git", "config", "--global", "--get", "user.email"],
+    ]
