@@ -815,6 +815,14 @@ def test_plugin_packaging_and_supabase_migration_are_present():
         / "migrations"
         / "20260710005921_add_thread_identity.sql"
     )
+    trigger_hardening_migration_path = (
+        ROOT
+        / "plugins"
+        / "codex-session-logging"
+        / "supabase"
+        / "migrations"
+        / "20260710175808_set_thread_trigger_search_path.sql"
+    )
     function_path = (
         ROOT
         / "plugins"
@@ -832,6 +840,7 @@ def test_plugin_packaging_and_supabase_migration_are_present():
     marketplace = json.loads(marketplace_path.read_text(encoding="utf-8"))
     migration = migration_path.read_text(encoding="utf-8")
     thread_migration = thread_migration_path.read_text(encoding="utf-8")
+    trigger_hardening_migration = trigger_hardening_migration_path.read_text(encoding="utf-8")
     all_migrations = "\n".join(
         path.read_text(encoding="utf-8")
         for path in sorted((ROOT / "plugins/codex-session-logging/supabase/migrations").glob("*.sql"))
@@ -878,6 +887,8 @@ def test_plugin_packaging_and_supabase_migration_are_present():
     assert "digest(new.id, 'sha256')" in thread_migration
     assert "alter column thread_id set not null" in thread_migration
     assert "codex_sessions_user_thread_created_idx" in thread_migration
+    assert "set search_path = pg_catalog, extensions" in trigger_hardening_migration
+    assert "extensions.digest(new.id, 'sha256')" in trigger_hardening_migration
     assert function_path.exists()
     function_source = function_path.read_text(encoding="utf-8")
     identity_source = client_identity_path.read_text(encoding="utf-8")
