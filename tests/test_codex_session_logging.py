@@ -873,6 +873,10 @@ def test_plugin_packaging_and_supabase_migration_are_present():
     assert "from public.codex_session_events" in thread_migration
     assert "from public.codex_session_messages" in thread_migration
     assert "digest(session_transcripts.transcript_path, 'sha256')" in thread_migration
+    assert "create or replace function public.fill_codex_session_thread_id()" in thread_migration
+    assert "before insert or update of thread_id on public.codex_sessions" in thread_migration
+    assert "digest(new.id, 'sha256')" in thread_migration
+    assert "alter column thread_id set not null" in thread_migration
     assert "codex_sessions_user_thread_created_idx" in thread_migration
     assert function_path.exists()
     function_source = function_path.read_text(encoding="utf-8")

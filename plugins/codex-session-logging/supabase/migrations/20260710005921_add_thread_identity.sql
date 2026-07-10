@@ -1,6 +1,24 @@
 alter table public.codex_sessions
   add column if not exists thread_id text;
 
+create or replace function public.fill_codex_session_thread_id()
+returns trigger
+language plpgsql
+as $$
+begin
+  if new.thread_id is null then
+    new.thread_id = encode(digest(new.id, 'sha256'), 'hex');
+  end if;
+  return new;
+end;
+$$;
+
+drop trigger if exists fill_codex_session_thread_id on public.codex_sessions;
+create trigger fill_codex_session_thread_id
+before insert or update of thread_id on public.codex_sessions
+for each row
+execute function public.fill_codex_session_thread_id();
+
 with session_transcripts as (
   select distinct on (session_id)
     session_id,

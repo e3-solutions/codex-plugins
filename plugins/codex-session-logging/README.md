@@ -22,11 +22,12 @@ Default URL:
 https://pmdfllwuctzkdjiehezq.supabase.co
 ```
 
-Apply the SQL files in `supabase/migrations` in order.
+Apply the SQL files in `supabase/migrations` before deploying the ingest Edge Function. The thread identity migration includes a compatibility trigger, so the previously deployed function continues to create sessions during this rollout. Deploying the function first is unsupported because it queries the new `thread_id` column.
 
-Deploy the ingest Edge Function from `supabase/functions/codex-session-ingest`. The function owns the Supabase admin key server-side and uses the developer's git email as the initial user key when available. If `CODEX_SESSION_LOG_USER_EMAIL_MAP` contains the email, that mapped Supabase Auth user id is used; otherwise the function derives a stable UUID from the email. When git email is not configured, the plugin sends a persistent local installation id so sessions still track without per-user setup.
+Deploy the ingest Edge Function from `supabase/functions/codex-session-ingest` after the migration. The function owns the Supabase admin key server-side and uses the developer's git email as the initial user key when available. If `CODEX_SESSION_LOG_USER_EMAIL_MAP` contains the email, that mapped Supabase Auth user id is used; otherwise the function derives a stable UUID from the email. When git email is not configured, the plugin sends a persistent local installation id so sessions still track without per-user setup.
 
 ```bash
+supabase db push --project-ref pmdfllwuctzkdjiehezq
 supabase functions deploy codex-session-ingest --project-ref pmdfllwuctzkdjiehezq
 supabase secrets set \
   --project-ref pmdfllwuctzkdjiehezq \
