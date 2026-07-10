@@ -79,6 +79,8 @@ This repository is a Codex plugin marketplace, not a single plugin source. Do no
 
 Installed plugin caches check for updates on every SessionStart. The updater downloads the current `main.zip` archive, reads the plugin manifest from that archive, syncs coreedge-local marketplace plugins marked `INSTALLED_BY_DEFAULT`, and removes legacy global copies of native plugin hooks. Disable this with:
 
+For existing `0.2.8` installations, the first SessionStart installs `0.2.9`; the following SessionStart runs the new cleanup. Fresh setup removes legacy global copies immediately.
+
 ```bash
 LINEAR_SYNC_AUTO_UPDATE=0
 ```

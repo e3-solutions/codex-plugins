@@ -62,6 +62,8 @@ After kickoff, Codex writes and standard Codex commits are synced back to the ac
 
 Installed plugin caches check for updates during every `SessionStart`. The updater downloads the current `main.zip` archive, reads the plugin manifest from that archive, installs newer bootstrap versions into `~/.codex/plugins/cache/coreedge-local/linear-progress-sync/<version>/`, syncs coreedge-local marketplace plugins marked `INSTALLED_BY_DEFAULT`, and removes legacy global copies of native plugin hooks. Set `LINEAR_SYNC_AUTO_UPDATE=0` to disable automatic checks.
 
+For existing `0.2.8` installations, the first SessionStart installs `0.2.9`; the following SessionStart runs the new cleanup and removes the legacy global hook copies. Fresh setup runs the cleanup immediately.
+
 To force a manual update check:
 
 ```bash
@@ -81,7 +83,7 @@ To roll out a new default plugin or extension:
 5. Bump `plugins/linear-progress-sync/.codex-plugin/plugin.json` and `plugins/linear-progress-sync/update-manifest.json`.
 6. Merge to `main`.
 
-On the next new Codex thread or session, the installed `linear-progress-sync` hook checks the fresh `main.zip` archive, installs newer default plugins, and removes legacy Core Edge entries from `~/.codex/hooks.json` so native plugin hooks run once.
+After an updater release, the first new Codex thread or session installs the newer plugin. The following SessionStart runs that installed updater and removes legacy Core Edge entries from `~/.codex/hooks.json` so native plugin hooks run once.
 
 ## Optional
 

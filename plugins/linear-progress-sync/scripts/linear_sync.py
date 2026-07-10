@@ -647,6 +647,60 @@ def hook_entry_mentions_plugin(entry: Any, plugin_name: str) -> bool:
     return plugin_name in text
 
 
+def hook_entry_command_signature(entry: Any) -> tuple[str, ...]:
+    commands: list[str] = []
+
+    def collect(value: Any) -> None:
+        if isinstance(value, dict):
+            command = value.get("command")
+            if isinstance(command, str):
+                commands.append(command)
+            for key, item in value.items():
+                if key != "command":
+                    collect(item)
+        elif isinstance(value, list):
+            for item in value:
+                collect(item)
+
+    collect(entry)
+    return tuple(commands)
+
+
+def remove_plugin_hooks(existing: JsonDict, *, plugin_name: str, plugin_config: JsonDict) -> JsonDict:
+    incoming_hooks = plugin_config.get("hooks")
+    if not isinstance(incoming_hooks, dict):
+        raise ValueError(f"{plugin_name} hook config missing hooks object")
+
+    signatures = {
+        signature
+        for entries in incoming_hooks.values()
+        if isinstance(entries, list)
+        for entry in entries
+        if (signature := hook_entry_command_signature(entry))
+    }
+    merged = json.loads(json.dumps(existing)) if existing else {}
+    merged_hooks = merged.get("hooks")
+    if merged_hooks is None:
+        return merged
+    if not isinstance(merged_hooks, dict):
+        raise ValueError("existing hooks.json field `hooks` must be an object")
+
+    for event, current in list(merged_hooks.items()):
+        if current is None:
+            current = []
+        if not isinstance(current, list):
+            raise ValueError(f"existing hooks event {event} must be a list")
+        replacement = [
+            entry for entry in current
+            if hook_entry_command_signature(entry) not in signatures
+        ]
+        if replacement:
+            merged_hooks[event] = replacement
+        else:
+            merged_hooks.pop(event, None)
+    return merged
+
+
 def merge_linear_hooks(existing: JsonDict, linear_config: JsonDict) -> JsonDict:
     return merge_plugin_hooks(existing, plugin_name="linear-progress-sync", plugin_config=linear_config)
 
@@ -707,7 +761,7 @@ def install_codex_hooks(
             raise ValueError(f"{plugin_name} hook config missing hooks object")
         # Codex registers plugin hooks natively. Remove only legacy copies from
         # the global hook file so lifecycle events are not handled twice.
-        merged = merge_plugin_hooks(merged, plugin_name=plugin_name, plugin_config={"hooks": {}})
+        merged = remove_plugin_hooks(merged, plugin_name=plugin_name, plugin_config=plugin_config)
         plugins.append(
             {
                 "name": plugin_name,

@@ -21,6 +21,7 @@ from linear_sync import (
     codex_hooks_path,
     global_config_dir,
     read_json_object,
+    remove_plugin_hooks,
     write_json_atomic,
 )
 
@@ -446,7 +447,7 @@ def refresh_plugins_hooks(plugin_roots: list[Path]) -> JsonDict:
         if name in NATIVE_HOOK_PLUGINS:
             # Codex loads these hooks from their plugin manifests. Keeping a
             # second copy in ~/.codex/hooks.json duplicates every lifecycle event.
-            merged = merge_plugin_hooks(merged, name=name, plugin_config={"hooks": {}})
+            merged = remove_plugin_hooks(merged, plugin_name=name, plugin_config=plugin_config)
             registration = "plugin-native"
         else:
             merged = merge_plugin_hooks(merged, name=name, plugin_config=plugin_config)
