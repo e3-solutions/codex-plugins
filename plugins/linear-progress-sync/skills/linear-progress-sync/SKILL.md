@@ -75,9 +75,11 @@ python3 plugins/linear-progress-sync/scripts/setup.py
 codex mcp login linear
 ```
 
-This repository is a Codex plugin marketplace, not a single plugin source. Do not tell teammates or agents to run `codex plugin add` with the GitHub URL or repository root directly; that can skip marketplace registration, default plugin installation, hook merging, and Linear MCP registration.
+This repository is a Codex plugin marketplace, not a single plugin source. Do not tell teammates or agents to run `codex plugin add` with the GitHub URL or repository root directly; that can skip marketplace registration, default plugin installation, legacy hook cleanup, and Linear MCP registration.
 
-Installed plugin caches check for updates on every SessionStart. The updater downloads the current `main.zip` archive, reads the plugin manifest from that archive, syncs coreedge-local marketplace plugins marked `INSTALLED_BY_DEFAULT`, and refreshes global Codex hooks for hook plugins. Disable this with:
+Installed plugin caches check for updates on every SessionStart. The updater downloads the current `main.zip` archive, reads the plugin manifest from that archive, syncs coreedge-local marketplace plugins marked `INSTALLED_BY_DEFAULT`, and removes legacy global copies of native plugin hooks. Disable this with:
+
+For existing `0.2.8` installations, the first SessionStart installs `0.2.9`; the following SessionStart runs the new cleanup. Fresh setup removes legacy global copies immediately.
 
 ```bash
 LINEAR_SYNC_AUTO_UPDATE=0
@@ -86,7 +88,7 @@ LINEAR_SYNC_AUTO_UPDATE=0
 Force a manual update check when needed:
 
 ```bash
-python3 ~/.codex/plugins/cache/coreedge-local/linear-progress-sync/0.2.8/scripts/update_plugin.py --force
+python3 ~/.codex/plugins/cache/coreedge-local/linear-progress-sync/0.2.9/scripts/update_plugin.py --force
 ```
 
 If Codex asks to review hooks after setup, trust the Linear Progress Sync and Codex Session Logging hooks once. Automatic kickoff and session capture depend on those hooks running.

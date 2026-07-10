@@ -1981,7 +1981,36 @@ def test_update_plugin_installs_newer_manifest_archive(tmp_path, monkeypatch):
 def test_update_plugin_syncs_default_marketplace_plugins_and_hooks_when_bootstrap_current(tmp_path, monkeypatch):
     update_plugin = load_update_plugin()
     monkeypatch.setenv("LINEAR_SYNC_CONFIG_DIR", str(tmp_path / "config"))
-    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex-home"))
+    codex_home = tmp_path / "codex-home"
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    hooks_path = codex_home / "hooks.json"
+    hooks_path.parent.mkdir(parents=True)
+    hooks_path.write_text(
+        json.dumps(
+            {
+                "hooks": {
+                    "SessionStart": [
+                        {"hooks": [{"type": "command", "command": "/tmp/notify.sh"}]},
+                        {
+                            "hooks": [{
+                                "type": "command",
+                                "command": "python3 ~/.codex/plugins/cache/coreedge-local/linear-progress-sync/0.2.2/scripts/linear_sync.py",
+                            }]
+                        },
+                        {
+                            "hooks": [{
+                                "type": "command",
+                                "command": "python3 ~/.codex/plugins/cache/coreedge-local/codex-session-logging/0.1.0/scripts/session_start.py",
+                            }]
+                        },
+                    ],
+                }
+            },
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
     cache_root = tmp_path / "cache" / "coreedge-local"
     cache_parent = cache_root / "linear-progress-sync"
     current = write_minimal_plugin(
@@ -2018,7 +2047,7 @@ def test_update_plugin_syncs_default_marketplace_plugins_and_hooks_when_bootstra
         force=True,
     )
 
-    hooks = json.loads((tmp_path / "codex-home" / "hooks.json").read_text(encoding="utf-8"))
+    hooks = json.loads(hooks_path.read_text(encoding="utf-8"))
     hooks_text = json.dumps(hooks, sort_keys=True)
     assert result["updated"] is True
     assert {plugin["name"] for plugin in result["installed_plugins"]} == {"codex-session-logging"}
@@ -2026,11 +2055,38 @@ def test_update_plugin_syncs_default_marketplace_plugins_and_hooks_when_bootstra
     assert second["installed_plugins"] == []
     assert (cache_root / "codex-session-logging" / "0.1.0" / ".codex-plugin" / "plugin.json").exists()
     assert not (cache_root / "internal-experiment").exists()
-    assert "linear-progress-sync" in hooks_text
-    assert "codex-session-logging" in hooks_text
+    assert "/tmp/notify.sh" in hooks_text
+    assert "linear-progress-sync" not in hooks_text
+    assert "codex-session-logging" not in hooks_text
     assert "internal-experiment" not in hooks_text
-    assert hooks_text.count("codex-session-logging") == 2
-    assert hooks_text.count("linear-progress-sync") == 2
+    assert {plugin["registration"] for plugin in result["hooks"]} == {"plugin-native"}
+
+
+def test_legacy_updater_merge_requires_followup_native_cleanup():
+    update_plugin = load_update_plugin()
+    plugin_config = linear_sync.read_plugin_hooks_config(ROOT, "codex-session-logging")
+    existing = {
+        "hooks": {
+            "SessionStart": [
+                {"hooks": [{"type": "command", "command": "/tmp/user-hook.sh"}]},
+            ]
+        }
+    }
+
+    first_session = update_plugin.merge_plugin_hooks(
+        existing,
+        name="codex-session-logging",
+        plugin_config=plugin_config,
+    )
+    following_session = linear_sync.remove_plugin_hooks(
+        first_session,
+        plugin_name="codex-session-logging",
+        plugin_config=plugin_config,
+    )
+
+    assert "codex-session-logging" in json.dumps(first_session)
+    assert "codex-session-logging" not in json.dumps(following_session)
+    assert "/tmp/user-hook.sh" in json.dumps(following_session)
 
 
 def test_install_plugin_refreshes_installed_file_mtimes_for_hook_selection(tmp_path):
@@ -2175,19 +2231,26 @@ def test_maybe_spawn_auto_update_passes_state_path(tmp_path, monkeypatch):
     assert kwargs["stdin"] == subprocess.DEVNULL
 
 
-def test_install_codex_hooks_merges_existing_user_hooks(tmp_path):
+def test_install_codex_hooks_removes_legacy_plugin_hooks_and_preserves_user_hooks(tmp_path):
     codex_home = tmp_path / "codex-home"
     hooks_path = codex_home / "hooks.json"
     hooks_path.parent.mkdir(parents=True)
+    linear_config = linear_sync.read_plugin_hooks_config(ROOT, "linear-progress-sync")
+    logging_config = linear_sync.read_plugin_hooks_config(ROOT, "codex-session-logging")
     hooks_path.write_text(
         json.dumps(
             {
                 "hooks": {
                     "SessionStart": [
                         {"hooks": [{"type": "command", "command": "/tmp/notify.sh"}]},
+                        {"hooks": [{"type": "command", "command": "/tmp/codex-session-logging-monitor"}]},
+                        linear_config["hooks"]["SessionStart"][0],
+                        logging_config["hooks"]["SessionStart"][0],
                     ],
                     "Stop": [
                         {"hooks": [{"type": "command", "command": "/tmp/notify.sh"}]},
+                        linear_config["hooks"]["Stop"][0],
+                        logging_config["hooks"]["Stop"][0],
                     ],
                 }
             },
@@ -2204,16 +2267,11 @@ def test_install_codex_hooks_merges_existing_user_hooks(tmp_path):
     assert result["changed"] is True
     assert second["changed"] is False
     assert installed["hooks"]["SessionStart"][0]["hooks"][0]["command"] == "/tmp/notify.sh"
-    assert any("linear-progress-sync" in json.dumps(entry) for entry in installed["hooks"]["PreToolUse"])
-    assert any("linear-progress-sync" in json.dumps(entry) for entry in installed["hooks"]["PostToolUse"])
-    assert any("codex-session-logging" in json.dumps(entry) for entry in installed["hooks"]["SessionStart"])
-    assert any("codex-session-logging" in json.dumps(entry) for entry in installed["hooks"]["UserPromptSubmit"])
     installed_text = json.dumps(installed)
-    assert installed_text.count("linear-progress-sync/*/scripts/pre_tool_use.py") == 1
-    assert installed_text.count("linear-progress-sync/*/scripts/post_tool_use.py") == 1
-    assert installed_text.count("codex-session-logging/*/scripts/pre_tool_use.py") == 1
-    assert installed_text.count("codex-session-logging/*/scripts/post_tool_use.py") == 1
-    assert installed_text.count("user_prompt_submit.py") == 1
+    assert "/tmp/codex-session-logging-monitor" in installed_text
+    assert "plugins/cache/*/linear-progress-sync/*/scripts" not in installed_text
+    assert "plugins/cache/*/codex-session-logging/*/scripts" not in installed_text
+    assert {plugin["registration"] for plugin in result["plugins"]} == {"plugin-native"}
 
 
 def test_install_codex_hooks_can_resolve_plugins_from_marketplace_cache_root(tmp_path):
@@ -2236,7 +2294,7 @@ def test_install_codex_hooks_can_resolve_plugins_from_marketplace_cache_root(tmp
         codex_home_path=tmp_path / "codex-home",
     )
 
-    assert result["changed"] is True
+    assert result["changed"] is False
     assert {plugin["name"] for plugin in result["plugins"]} == {
         "linear-progress-sync",
         "codex-session-logging",
@@ -2272,7 +2330,7 @@ def test_install_codex_hooks_can_resolve_plugins_from_versioned_cache_root(tmp_p
         codex_home_path=tmp_path / "codex-home",
     )
 
-    assert result["changed"] is True
+    assert result["changed"] is False
     assert any(
         plugin["source"].endswith("linear-progress-sync/0.2.8/hooks/hooks.json")
         for plugin in result["plugins"]
@@ -2294,6 +2352,8 @@ def test_readmes_register_linear_mcp_before_linear_login():
         assert "trust the Linear Progress Sync and Codex Session Logging hooks once" in text
         assert "saves it in `~/.codex/linear-sync/repos.json`" in text
         assert "update_plugin.py --force" in text
+        assert "first SessionStart installs `0.2.9`" in text
+        assert "following SessionStart" in text
         assert "LINEAR_SYNC_AUTO_UPDATE=0" in text
         assert "not a single plugin source" in text
         assert "Do not install the GitHub URL or repository root directly with `codex plugin add`" in text
