@@ -8,6 +8,8 @@ Capture is scoped to repositories whose `origin` remote belongs to the `e3-solut
 
 Tool logging records only the tool name, phase, optional tool call id, and success flag when exposed by Codex. Tool arguments, shell commands, and tool outputs are not uploaded. Setup snapshots include sanitized Codex config names such as enabled plugins, installed skill names/sources, MCP server names/transport, marketplaces, app connection ids/tool names, and non-secret model/runtime settings.
 
+Each runtime `session_id` is retained for event correlation. When Codex provides a `transcript_path`, the plugin also records a SHA-256 `thread_id` derived from that path so resumed runtime sessions can be grouped as one conversation without storing another copy of the path. Legacy records without a transcript reference remain separate runtime sessions and cannot be grouped reliably after the fact.
+
 ## Supabase
 
 Project: `codex-session-logging`

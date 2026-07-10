@@ -36,7 +36,7 @@ DEFAULT_INGEST_URL = f"{DEFAULT_SUPABASE_URL}/functions/v1/codex-session-ingest"
 DEFAULT_BUCKET = "codex-sessions"
 ALLOWED_GITHUB_ORG = "e3-solutions"
 EXCERPT_BYTES = 4096
-PLUGIN_VERSION = "0.1.2"
+PLUGIN_VERSION = "0.1.3"
 PERMANENT_HTTP_STATUSES = {400, 413, 415, 422}
 
 
@@ -93,6 +93,7 @@ def capture_hook_event(payload: JsonDict, *, event_name: str | None = None) -> J
 def capture_message_event(payload: JsonDict, *, hook_event: str, role: str, content: str) -> JsonDict:
     base = ensure_state_dir()
     session_id = safe_segment(first_string(payload, "session_id", "sessionId") or "unknown-session")
+    thread_id = thread_id_from_payload(payload)
     turn_id = first_string(payload, "turn_id", "turnId")
     seq = next_sequence(base, session_id)
     user_key = "local"
@@ -115,6 +116,8 @@ def capture_message_event(payload: JsonDict, *, hook_event: str, role: str, cont
         "created_at": created_at,
         "metadata": metadata,
     }
+    if thread_id:
+        message["thread_id"] = thread_id
     write_json_atomic(base / local_content_path, message)
     append_jsonl(base / f"users/{user_key}/sessions/{session_id}/raw.jsonl", {"payload": payload, "captured_at": created_at})
 
@@ -136,6 +139,8 @@ def capture_message_event(payload: JsonDict, *, hook_event: str, role: str, cont
         "created_at": created_at,
         "uploaded_at": None,
     }
+    if thread_id:
+        event["thread_id"] = thread_id
     append_jsonl(base / "events.jsonl", event)
     enqueue_record(base, event)
     try_auto_drain()
@@ -151,6 +156,7 @@ def capture_metadata_event(
 ) -> JsonDict:
     base = ensure_state_dir()
     session_id = safe_segment(first_string(payload, "session_id", "sessionId") or "unknown-session")
+    thread_id = thread_id_from_payload(payload)
     turn_id = first_string(payload, "turn_id", "turnId")
     seq = next_sequence(base, session_id)
     created_at = now_iso()
@@ -168,6 +174,8 @@ def capture_metadata_event(
         "created_at": created_at,
         "metadata": metadata,
     }
+    if thread_id:
+        detail["thread_id"] = thread_id
     write_json_atomic(base / storage_path, detail)
 
     event = {
@@ -185,6 +193,8 @@ def capture_metadata_event(
         "created_at": created_at,
         "uploaded_at": None,
     }
+    if thread_id:
+        event["thread_id"] = thread_id
     append_jsonl(base / "events.jsonl", event)
     enqueue_record(base, event)
     try_auto_drain()
@@ -224,6 +234,15 @@ def metadata_from_payload(payload: JsonDict) -> JsonDict:
         if isinstance(value, str) and value:
             metadata[key] = value
     return metadata
+
+
+def thread_id_from_payload(payload: JsonDict) -> str | None:
+    transcript_path = first_string(payload, "transcript_path", "transcriptPath")
+    return sha256_hex(transcript_path) if transcript_path else None
+
+
+def sha256_hex(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
 def tool_event_metadata(payload: JsonDict, *, phase: str) -> JsonDict:

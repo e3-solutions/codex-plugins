@@ -76,11 +76,13 @@ def test_user_prompt_submit_spools_full_prompt_and_indexes_metadata(tmp_path, mo
 
     assert result["role"] == "user"
     assert result["session_id"] == "session-123"
+    assert result["thread_id"] == session_logging.sha256_hex(str(tmp_path / "transcript.jsonl"))
     assert result["turn_id"] == "turn-1"
     assert result["content_byte_size"] == len("Please add session logging.\nInclude exact prompts.".encode("utf-8"))
     assert result["storage_path"] == "users/local/sessions/session-123/messages/000001-user.json"
     assert message["content"] == "Please add session logging.\nInclude exact prompts."
     assert message["role"] == "user"
+    assert message["thread_id"] == result["thread_id"]
     assert events[0]["content_excerpt"] == "Please add session logging.\nInclude exact prompts."
     assert "content" not in events[0]
     assert events[0]["metadata"]["transcript_path"].endswith("transcript.jsonl")
@@ -121,6 +123,36 @@ def test_stop_spools_assistant_message_with_next_sequence(tmp_path, monkeypatch)
     assert message["content"] == "I added a logging plugin and tests."
     assert events[1]["role"] == "assistant"
     assert events[1]["content_sha256"] == result["content_sha256"]
+
+
+def test_transcript_path_groups_runtime_sessions_into_one_thread(tmp_path, monkeypatch):
+    monkeypatch.setenv("CODEX_SESSION_LOG_STATE_DIR", str(tmp_path / "state"))
+    session_logging = load_session_logging()
+    repo = init_git_repo(tmp_path / "repo", "https://github.com/e3-solutions/codex-plugins.git")
+    transcript_path = str(tmp_path / "thread.jsonl")
+
+    first = session_logging.capture_hook_event(
+        {
+            "hook_event_name": "UserPromptSubmit",
+            "session_id": "runtime-session-1",
+            "cwd": str(repo),
+            "prompt": "First turn.",
+            "transcript_path": transcript_path,
+        }
+    )
+    second = session_logging.capture_hook_event(
+        {
+            "hook_event_name": "UserPromptSubmit",
+            "session_id": "runtime-session-2",
+            "cwd": str(repo),
+            "prompt": "Second turn.",
+            "transcript_path": transcript_path,
+        }
+    )
+
+    assert first["session_id"] != second["session_id"]
+    assert first["thread_id"] == second["thread_id"]
+    assert first["thread_id"] == session_logging.sha256_hex(transcript_path)
 
 
 def test_capture_skips_repos_outside_e3_solutions(tmp_path, monkeypatch):
@@ -226,7 +258,9 @@ SECRET_TOKEN = "sk-do-not-store"
 
     assert result["type"] == "event"
     assert result["event_type"] == "environment_snapshot"
+    assert "thread_id" not in result
     assert detail["event_type"] == "environment_snapshot"
+    assert "thread_id" not in detail
     assert detail["metadata"]["codex_setup"]["plugins"] == [
         {"enabled": True, "name": "codex-session-logging@coreedge-local"},
         {"enabled": True, "name": "github@openai-curated"},
@@ -773,6 +807,14 @@ def test_plugin_packaging_and_supabase_migration_are_present():
         / "migrations"
         / "001_codex_session_logging.sql"
     )
+    thread_migration_path = (
+        ROOT
+        / "plugins"
+        / "codex-session-logging"
+        / "supabase"
+        / "migrations"
+        / "20260710005921_add_thread_identity.sql"
+    )
     function_path = (
         ROOT
         / "plugins"
@@ -789,6 +831,7 @@ def test_plugin_packaging_and_supabase_migration_are_present():
     hooks = json.loads(hooks_path.read_text(encoding="utf-8"))
     marketplace = json.loads(marketplace_path.read_text(encoding="utf-8"))
     migration = migration_path.read_text(encoding="utf-8")
+    thread_migration = thread_migration_path.read_text(encoding="utf-8")
     all_migrations = "\n".join(
         path.read_text(encoding="utf-8")
         for path in sorted((ROOT / "plugins/codex-session-logging/supabase/migrations").glob("*.sql"))
@@ -826,6 +869,11 @@ def test_plugin_packaging_and_supabase_migration_are_present():
     assert "grant select, insert, update on public.codex_sessions to authenticated" not in all_migrations
     assert "codex-sessions" in migration
     assert "storage.objects" in migration
+    assert "add column if not exists thread_id text" in thread_migration
+    assert "from public.codex_session_events" in thread_migration
+    assert "from public.codex_session_messages" in thread_migration
+    assert "digest(session_transcripts.transcript_path, 'sha256')" in thread_migration
+    assert "codex_sessions_user_thread_created_idx" in thread_migration
     assert function_path.exists()
     function_source = function_path.read_text(encoding="utf-8")
     identity_source = client_identity_path.read_text(encoding="utf-8")
