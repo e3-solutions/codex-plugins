@@ -94,7 +94,7 @@ def test_backfill_queues_e3_messages_with_stable_ids_and_original_timestamps(tmp
     second = backfill.run_backfill(max_files=10)
 
     assert first["queued"] == 2
-    assert first["status"] == "complete"
+    assert first["status"] == "partial"
     assert second["processed"] == 0
     assert len(queue) == 2
     assert {record["role"] for record in records} == {"user", "assistant"}
@@ -106,6 +106,27 @@ def test_backfill_queues_e3_messages_with_stable_ids_and_original_timestamps(tmp
     payload = backfill.build_ingest_payload(records[0], base=tmp_path / "state")
     assert payload["client"]["repo_remote"] == "git@github.com:e3-solutions/old-repo.git"
     assert payload["message"]["content"] in {"Historical prompt", "Historical answer"}
+
+
+def test_auto_upload_disabled_does_not_report_status(tmp_path, monkeypatch):
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex"))
+    monkeypatch.setenv("CODEX_SESSION_LOG_STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setenv("CODEX_SESSION_LOG_AUTO_UPLOAD", "0")
+    transcript = tmp_path / "codex" / "sessions" / "rollout.jsonl"
+    write_transcript(transcript, remote="https://github.com/e3-solutions/repo.git")
+    backfill = load_backfill()
+    monkeypatch.setattr(
+        backfill,
+        "report_status",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("must not report")),
+    )
+
+    result = backfill.run_backfill(max_files=10)
+    state = backfill.read_state(tmp_path / "state")
+
+    assert result["status"] == "partial"
+    assert state["completed_at"] is None
+    assert state["last_drain"]["disabled"] is True
 
 
 def test_legacy_response_user_is_used_when_canonical_user_event_is_absent():
@@ -137,6 +158,62 @@ def test_historical_sequences_do_not_collide_across_resumed_transcript_files(tmp
     assert first < 0
     assert second < 0
     assert first != second
+
+
+def test_mixed_format_only_skips_response_users_in_canonical_turn(tmp_path):
+    backfill = load_backfill()
+    transcript = tmp_path / "mixed.jsonl"
+    rows = [
+        {
+            "type": "response_item",
+            "payload": {"type": "message", "role": "user", "content": "Legacy prompt"},
+        },
+        {"type": "event_msg", "payload": {"type": "task_started"}},
+        {
+            "type": "response_item",
+            "payload": {"type": "message", "role": "user", "content": "Injected context"},
+        },
+        {
+            "type": "response_item",
+            "payload": {"type": "message", "role": "user", "content": "Modern prompt"},
+        },
+        {"type": "event_msg", "payload": {"type": "user_message", "message": "Modern prompt"}},
+    ]
+    transcript.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+
+    skipped = backfill.response_user_lines_to_skip(transcript)
+
+    assert 0 not in skipped
+    assert skipped == {2, 3}
+
+
+def test_locked_drain_is_reconciled_before_reporting_complete(tmp_path, monkeypatch):
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex"))
+    monkeypatch.setenv("CODEX_SESSION_LOG_STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setenv("CODEX_SESSION_LOG_AUTO_UPLOAD", "1")
+    transcript = tmp_path / "codex" / "sessions" / "rollout.jsonl"
+    write_transcript(transcript, remote="https://github.com/e3-solutions/repo.git")
+    backfill = load_backfill()
+    drain_calls = []
+    reports = []
+
+    def fake_drain():
+        drain_calls.append(True)
+        if len(drain_calls) == 1:
+            return {"uploaded": 0, "failed": 0, "dead_lettered": 0, "remaining": 0, "locked": True}
+        for path in (tmp_path / "state" / "queue" / "pending").glob("*.json"):
+            path.unlink()
+        return {"uploaded": 2, "failed": 0, "dead_lettered": 0, "remaining": 0}
+
+    monkeypatch.setattr(backfill, "drain_queue", fake_drain)
+    monkeypatch.setattr(backfill.time, "sleep", lambda seconds: None)
+    monkeypatch.setattr(backfill, "report_status", lambda state, **kwargs: reports.append(state.copy()))
+
+    result = backfill.run_backfill(max_files=10)
+
+    assert len(drain_calls) == 2
+    assert result["status"] == "complete"
+    assert reports[0]["status"] == "complete"
 
 
 def test_backfill_skips_non_e3_transcripts_without_queuing_content(tmp_path, monkeypatch):

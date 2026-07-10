@@ -6,7 +6,9 @@ import fcntl
 import hashlib
 import json
 import os
+import time
 import uuid
+from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator
@@ -26,6 +28,9 @@ from session_logging import (
     ensure_state_dir,
     git_origin_remote,
     now_iso,
+    pending_queue_paths,
+    processing_queue_dir,
+    read_json_file,
     remote_belongs_to_org,
     safe_segment,
     sha256_hex,
@@ -36,7 +41,9 @@ JsonDict = dict[str, Any]
 BACKFILL_VERSION = 1
 BACKFILL_ENABLED_ENV = "CODEX_SESSION_LOG_BACKFILL"
 BACKFILL_MAX_FILES_ENV = "CODEX_SESSION_LOG_BACKFILL_MAX_FILES"
+BACKFILL_DRAIN_WAIT_ENV = "CODEX_SESSION_LOG_BACKFILL_DRAIN_WAIT_SECONDS"
 DEFAULT_MAX_FILES = 1000
+DEFAULT_DRAIN_WAIT_SECONDS = 7200
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -185,20 +192,30 @@ def run_backfill(*, dry_run: bool = False, force: bool = False, max_files: int =
         state["remaining_files"] = remaining
         if not dry_run:
             write_json_atomic(state_path(base), state)
-            if auto_upload_enabled():
-                drain_result = drain_queue()
+            if not auto_upload_enabled():
+                state["status"] = "partial"
+                state["completed_at"] = None
+                state["last_drain"] = {
+                    "disabled": True,
+                    "remaining": queue_inflight_count(base),
+                }
+                state["updated_at"] = now_iso()
+                write_json_atomic(state_path(base), state)
+            else:
+                drain_result = drain_when_available(base)
+                drain_result["historical_dead_lettered"] = historical_dead_letter_count(base)
                 state["last_drain"] = drain_result
                 drain_problem = any(
                     int(drain_result.get(key, 0)) > 0
-                    for key in ("failed", "dead_lettered", "remaining")
-                )
+                    for key in ("failed", "dead_lettered", "historical_dead_lettered", "remaining")
+                ) or bool(drain_result.get("locked"))
                 if drain_problem:
                     state["status"] = "partial"
                     state["completed_at"] = None
                 state["updated_at"] = now_iso()
                 write_json_atomic(state_path(base), state)
-            if reporting_remote:
-                report_status(state, base=base, repo_remote=reporting_remote)
+                if reporting_remote:
+                    report_status(state, base=base, repo_remote=reporting_remote)
         return {"version": BACKFILL_VERSION, **totals, "remaining": remaining, "status": state["status"]}
 
 
@@ -227,11 +244,11 @@ def import_transcript(
         tz=timezone.utc,
     ).isoformat()
     queued = 0
-    prefer_event_user = transcript_has_user_events(path)
+    skipped_user_lines = response_user_lines_to_skip(path)
     for line_number, envelope in iter_transcript(path):
         parsed = historical_message(
             envelope,
-            prefer_event_user=prefer_event_user,
+            skip_response_user=line_number in skipped_user_lines,
             fallback_created_at=fallback_created_at,
         )
         if parsed is None:
@@ -303,13 +320,70 @@ def iter_transcript(path: Path) -> Iterator[tuple[int, JsonDict]]:
             yield line_number, loaded
 
 
-def transcript_has_user_events(path: Path) -> bool:
-    return any(
-        envelope.get("type") == "event_msg"
-        and isinstance(envelope.get("payload"), dict)
-        and envelope["payload"].get("type") == "user_message"
-        for _, envelope in iter_transcript(path)
-    )
+def response_user_lines_to_skip(path: Path, *, max_line_distance: int = 10) -> set[int]:
+    segment = 0
+    saw_task_boundary = False
+    response_lines_by_segment: dict[int, list[int]] = defaultdict(list)
+    canonical_segments: set[int] = set()
+    for line_number, envelope in iter_transcript(path):
+        payload = envelope.get("payload")
+        if (
+            envelope.get("type") == "event_msg"
+            and isinstance(payload, dict)
+            and payload.get("type") == "task_started"
+        ):
+            segment += 1
+            saw_task_boundary = True
+        if response_user_text(envelope):
+            response_lines_by_segment[segment].append(line_number)
+        if event_user_text(envelope):
+            canonical_segments.add(segment)
+    if saw_task_boundary:
+        return {
+            line_number
+            for canonical_segment in canonical_segments
+            for line_number in response_lines_by_segment[canonical_segment]
+        }
+
+    pending_response_lines: dict[str, list[int]] = defaultdict(list)
+    duplicates: set[int] = set()
+    for line_number, envelope in iter_transcript(path):
+        response_text = response_user_text(envelope)
+        if response_text:
+            pending_response_lines[response_text].append(line_number)
+            continue
+        event_text = event_user_text(envelope)
+        if not event_text:
+            continue
+        candidates = pending_response_lines.get(event_text, [])
+        while candidates and line_number - candidates[0] > max_line_distance:
+            candidates.pop(0)
+        if candidates:
+            duplicates.add(candidates.pop())
+    return duplicates
+
+
+def response_user_text(envelope: JsonDict) -> str:
+    payload = envelope.get("payload")
+    if (
+        envelope.get("type") != "response_item"
+        or not isinstance(payload, dict)
+        or payload.get("type") != "message"
+        or payload.get("role") != "user"
+    ):
+        return ""
+    return message_text(payload.get("content"))
+
+
+def event_user_text(envelope: JsonDict) -> str:
+    payload = envelope.get("payload")
+    if (
+        envelope.get("type") != "event_msg"
+        or not isinstance(payload, dict)
+        or payload.get("type") != "user_message"
+    ):
+        return ""
+    return string_value(payload.get("message")) or ""
 
 
 def known_repositories(paths: list[Path]) -> dict[str, str]:
@@ -353,7 +427,7 @@ def read_session_meta(path: Path) -> JsonDict:
 def historical_message(
     envelope: JsonDict,
     *,
-    prefer_event_user: bool = False,
+    skip_response_user: bool = False,
     fallback_created_at: str | None = None,
 ) -> tuple[str, str, str | None, str] | None:
     if envelope.get("type") == "event_msg":
@@ -373,7 +447,7 @@ def historical_message(
     role = payload.get("role")
     if role not in {"user", "assistant"}:
         return None
-    if role == "user" and prefer_event_user:
+    if role == "user" and skip_response_user:
         return None
     phase = string_value(payload.get("phase"))
     if role == "assistant" and phase and phase != "final_answer":
@@ -427,6 +501,40 @@ def session_id_from_filename(path: Path) -> str:
 
 def string_value(value: object) -> str | None:
     return value.strip() if isinstance(value, str) and value.strip() else None
+
+
+def drain_wait_seconds() -> float:
+    try:
+        return max(0.0, float(os.environ.get(BACKFILL_DRAIN_WAIT_ENV, DEFAULT_DRAIN_WAIT_SECONDS)))
+    except ValueError:
+        return float(DEFAULT_DRAIN_WAIT_SECONDS)
+
+
+def queue_inflight_count(base: Path) -> int:
+    return len(pending_queue_paths(base)) + len(list(processing_queue_dir(base).glob("*.json")))
+
+
+def drain_when_available(base: Path) -> JsonDict:
+    deadline = time.monotonic() + drain_wait_seconds()
+    while True:
+        result = drain_queue()
+        result["remaining"] = queue_inflight_count(base)
+        if not result.get("locked") or time.monotonic() >= deadline:
+            return result
+        time.sleep(1)
+
+
+def historical_dead_letter_count(base: Path) -> int:
+    count = 0
+    for path in (base / "queue" / "dead-letter").glob("*.json"):
+        try:
+            record = read_json_file(path)
+        except (OSError, ValueError, json.JSONDecodeError):
+            continue
+        metadata = record.get("metadata")
+        if isinstance(metadata, dict) and metadata.get("source") == "historical_transcript":
+            count += 1
+    return count
 
 
 def report_status(state: JsonDict, *, base: Path, repo_remote: str) -> None:
