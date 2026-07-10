@@ -6,14 +6,14 @@ Local Codex plugin for Linear-first development in `e3-solutions` repos. Codex s
 
 This repository is a Codex plugin marketplace, not a single plugin source. Do not install the GitHub URL or repository root directly with `codex plugin add`.
 
-Agents installing this for a teammate must clone the repo and run `setup.py`, because setup registers the marketplace, installs both required plugins, merges global hooks, and registers Linear MCP.
+Agents installing this for a teammate must clone the repo and run `setup.py`, because setup registers the marketplace, installs both required plugins, removes legacy duplicate global hooks, and registers Linear MCP.
 
 Current behavior:
 
 - Enforcement is scoped to git repos whose `origin` remote is under `e3-solutions/*`.
 - Repos with no `origin` remote, no git repo, or a non-E3 origin are out of scope and file edits are allowed without Linear kickoff.
 - Before kickoff in scoped repos, only file edits, write-like Bash commands, and branch creation are blocked. Read-only inspection and non-mutating commands are allowed.
-- Installed plugin caches auto-check for updates on every Codex `SessionStart`, install newer plugin versions from the current `main` archive, sync default marketplace plugins, and refresh global hook registrations.
+- Installed plugin caches auto-check for updates on every Codex `SessionStart`, install newer plugin versions from the current `main` archive, sync default marketplace plugins, and remove legacy duplicate global hook registrations.
 
 ## Setup
 
@@ -29,7 +29,7 @@ codex mcp login linear
 
 Then restart Codex or start a new Codex thread. If Codex asks to review hooks, trust the Linear Progress Sync and Codex Session Logging hooks once.
 
-`setup.py` checks GitHub CLI auth, installs Linear Progress Sync and Codex Session Logging, installs global Codex hooks into `~/.codex/hooks.json`, and registers Linear MCP. It does not log you in to Linear, so `codex mcp login linear` is still required.
+`setup.py` checks GitHub CLI auth, installs Linear Progress Sync and Codex Session Logging, removes legacy Core Edge hook copies from `~/.codex/hooks.json`, and registers Linear MCP. It does not log you in to Linear, so `codex mcp login linear` is still required.
 
 Preview setup without changing Codex config:
 
@@ -60,12 +60,12 @@ Before kickoff, file edits, write-like Bash commands, and branch creation wait u
 
 After kickoff, Codex writes and standard Codex commits are synced back to the active Linear issue automatically.
 
-Installed plugin caches check for updates during every `SessionStart`. The updater downloads the current `main.zip` archive, reads the plugin manifest from that archive, installs newer bootstrap versions into `~/.codex/plugins/cache/coreedge-local/linear-progress-sync/<version>/`, syncs coreedge-local marketplace plugins marked `INSTALLED_BY_DEFAULT`, and refreshes global Codex hook registrations. Set `LINEAR_SYNC_AUTO_UPDATE=0` to disable automatic checks.
+Installed plugin caches check for updates during every `SessionStart`. The updater downloads the current `main.zip` archive, reads the plugin manifest from that archive, installs newer bootstrap versions into `~/.codex/plugins/cache/coreedge-local/linear-progress-sync/<version>/`, syncs coreedge-local marketplace plugins marked `INSTALLED_BY_DEFAULT`, and removes legacy global copies of native plugin hooks. Set `LINEAR_SYNC_AUTO_UPDATE=0` to disable automatic checks.
 
 To force a manual update check:
 
 ```bash
-python3 ~/.codex/plugins/cache/coreedge-local/linear-progress-sync/0.2.8/scripts/update_plugin.py --force
+python3 ~/.codex/plugins/cache/coreedge-local/linear-progress-sync/0.2.9/scripts/update_plugin.py --force
 ```
 
 ## Rolling Out Updates
@@ -81,7 +81,7 @@ To roll out a new default plugin or extension:
 5. Bump `plugins/linear-progress-sync/.codex-plugin/plugin.json` and `plugins/linear-progress-sync/update-manifest.json`.
 6. Merge to `main`.
 
-On the next new Codex thread or session, the installed `linear-progress-sync` hook checks the fresh `main.zip` archive, installs newer default plugins, and refreshes `~/.codex/hooks.json` for hook plugins.
+On the next new Codex thread or session, the installed `linear-progress-sync` hook checks the fresh `main.zip` archive, installs newer default plugins, and removes legacy Core Edge entries from `~/.codex/hooks.json` so native plugin hooks run once.
 
 ## Optional
 

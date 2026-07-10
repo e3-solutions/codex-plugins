@@ -16,7 +16,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from linear_sync import codex_hooks_path, global_config_dir, read_json_object, write_json_atomic
+from linear_sync import (
+    NATIVE_HOOK_PLUGINS,
+    codex_hooks_path,
+    global_config_dir,
+    read_json_object,
+    write_json_atomic,
+)
 
 
 JsonDict = dict[str, Any]
@@ -437,16 +443,26 @@ def refresh_plugins_hooks(plugin_roots: list[Path]) -> JsonDict:
         hooks = plugin_config.get("hooks")
         if not isinstance(hooks, dict):
             raise ValueError(f"{hooks_path} missing hooks object")
-        merged = merge_plugin_hooks(merged, name=name, plugin_config=plugin_config)
+        if name in NATIVE_HOOK_PLUGINS:
+            # Codex loads these hooks from their plugin manifests. Keeping a
+            # second copy in ~/.codex/hooks.json duplicates every lifecycle event.
+            merged = merge_plugin_hooks(merged, name=name, plugin_config={"hooks": {}})
+            registration = "plugin-native"
+        else:
+            merged = merge_plugin_hooks(merged, name=name, plugin_config=plugin_config)
+            registration = "global"
         plugins.append(
             {
                 "name": name,
                 "path": str(user_hooks_path),
                 "source": str(hooks_path),
                 "events": list(hooks),
+                "registration": registration,
             }
         )
 
+    if not merged.get("hooks") and "hooks" not in existing:
+        merged.pop("hooks", None)
     changed = merged != existing
     if changed:
         write_json_atomic(user_hooks_path, merged)

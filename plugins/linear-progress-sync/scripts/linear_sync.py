@@ -39,6 +39,7 @@ THROTTLE_SECONDS = 30 * 60
 ALLOWED_GITHUB_ORG = "e3-solutions"
 LINEAR_MCP_URL = "https://mcp.linear.app/mcp"
 LINEAR_HOOK_EVENTS = ("SessionStart", "PreToolUse", "PostToolUse", "Stop")
+NATIVE_HOOK_PLUGINS = ("linear-progress-sync", "codex-session-logging")
 IGNORED_FILE_PREFIXES = (
     ".codex/linear-sync/",
     ".git/",
@@ -699,19 +700,24 @@ def install_codex_hooks(
     existing = read_json_object(hooks_path)
     merged = existing
     plugins: list[JsonDict] = []
-    for plugin_name in ("linear-progress-sync", "codex-session-logging"):
+    for plugin_name in NATIVE_HOOK_PLUGINS:
         plugin_config = read_plugin_hooks_config(plugin_repo_root, plugin_name)
         hooks = plugin_config.get("hooks")
         if not isinstance(hooks, dict):
             raise ValueError(f"{plugin_name} hook config missing hooks object")
-        merged = merge_plugin_hooks(merged, plugin_name=plugin_name, plugin_config=plugin_config)
+        # Codex registers plugin hooks natively. Remove only legacy copies from
+        # the global hook file so lifecycle events are not handled twice.
+        merged = merge_plugin_hooks(merged, plugin_name=plugin_name, plugin_config={"hooks": {}})
         plugins.append(
             {
                 "name": plugin_name,
                 "source": str(plugin_hooks_config_path(plugin_repo_root, plugin_name)),
                 "events": list(hooks),
+                "registration": "plugin-native",
             }
         )
+    if not merged.get("hooks") and "hooks" not in existing:
+        merged.pop("hooks", None)
     changed = merged != existing
     if changed and not dry_run:
         write_json_atomic(hooks_path, merged)
@@ -1076,7 +1082,7 @@ def setup_plan(
         "per_repo_setup_required": False,
         "optional_git_hook": with_git_hook,
         "notes": [
-            "Default setup is user-level: plugin marketplace, plugin install, global Codex hooks, GitHub auth check, and Linear MCP registration.",
+            "Default setup is user-level: plugin marketplace, plugin install, legacy global hook cleanup, GitHub auth check, and Linear MCP registration.",
             "GitHub auth is a manual prerequisite: run gh auth login when needed.",
             "Linear auth is manual after setup registers the MCP server: run codex mcp login linear after setup when needed.",
             "If Codex asks to review hooks, trust the Linear Progress Sync and Codex Session Logging hooks once so kickoff and session capture can run.",
