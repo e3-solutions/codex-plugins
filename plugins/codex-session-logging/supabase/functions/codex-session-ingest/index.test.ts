@@ -208,6 +208,70 @@ Deno.test("handleRequest upserts session user identity rollup", async () => {
   }
 });
 
+Deno.test("handleRequest upserts historical backfill progress", async () => {
+  const requests: Array<{ url: string; body: JsonObject | null }> = [];
+  const originalFetch = globalThis.fetch;
+  const previousUrl = Deno.env.get("SUPABASE_URL");
+  const previousServiceRole = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
+
+  Deno.env.set("SUPABASE_URL", "https://project.supabase.co");
+  Deno.env.set("SUPABASE_SERVICE_ROLE_KEY", "service-role-key");
+  globalThis.fetch = async (input, init = {}) => {
+    const url = input instanceof Request ? input.url : input.toString();
+    const requestInit = init as { body?: BodyInit | null };
+    const body = typeof requestInit.body === "string"
+      ? JSON.parse(requestInit.body) as JsonObject
+      : null;
+    requests.push({ url, body });
+    return new Response("", { status: 201 });
+  };
+
+  try {
+    const response = await handleRequest(
+      new Request("https://example.test/codex-session-ingest", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          version: 1,
+          kind: "backfill_status",
+          client: {
+            repo_remote: "https://github.com/e3-solutions/codex-plugins.git",
+            installation_id: "install-1",
+          },
+          backfill: {
+            version: 1,
+            status: "partial",
+            started_at: "2026-07-10T00:00:00.000Z",
+            completed_at: null,
+            updated_at: "2026-07-10T01:00:00.000Z",
+            remaining_files: 4,
+            totals: {
+              discovered: 10,
+              processed: 6,
+              queued: 42,
+              skipped_non_e3: 2,
+              failed: 1,
+            },
+          },
+        }),
+      }),
+    );
+    const runUpsert = requests.find((request) =>
+      request.url.includes("/rest/v1/codex_session_backfill_runs?on_conflict=")
+    );
+
+    assertEquals(response.status, 200);
+    assertEquals(runUpsert?.body?.installation_id, "install-1");
+    assertEquals(runUpsert?.body?.backfill_version, 1);
+    assertEquals(runUpsert?.body?.records_queued, 42);
+    assertEquals(runUpsert?.body?.remaining_files, 4);
+  } finally {
+    globalThis.fetch = originalFetch;
+    restoreEnv("SUPABASE_URL", previousUrl);
+    restoreEnv("SUPABASE_SERVICE_ROLE_KEY", previousServiceRole);
+  }
+});
+
 Deno.test("sanitizeEventPayload keeps only allowlisted tool event fields", () => {
   const sanitized = sanitizeEventPayload(
     {

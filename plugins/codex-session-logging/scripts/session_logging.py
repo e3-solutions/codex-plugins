@@ -36,7 +36,7 @@ DEFAULT_INGEST_URL = f"{DEFAULT_SUPABASE_URL}/functions/v1/codex-session-ingest"
 DEFAULT_BUCKET = "codex-sessions"
 ALLOWED_GITHUB_ORG = "e3-solutions"
 EXCERPT_BYTES = 4096
-PLUGIN_VERSION = "0.1.3"
+PLUGIN_VERSION = "0.2.0"
 PERMANENT_HTTP_STATUSES = {400, 413, 415, 422}
 
 
@@ -836,16 +836,18 @@ def build_ingest_payload(record: JsonDict, *, base: Path) -> JsonDict:
 def client_context(record: JsonDict, *, base: Path) -> JsonDict:
     metadata = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
     cwd = metadata.get("cwd") if isinstance(metadata.get("cwd"), str) else None
-    git_email = git_config_value(cwd, "user.email") if cwd else None
+    git_email = git_config_value(cwd, "user.email")
     hostname = local_hostname()
     username = local_username()
     installation_id = local_installation_id(base)
     context: JsonDict = {
         "cwd": cwd,
-        "repo_remote": git_origin_remote(cwd) if cwd else None,
+        "repo_remote": metadata.get("repo_remote")
+        or (git_origin_remote(cwd) if cwd else None),
         "git_email": git_email,
-        "git_user_name": git_config_value(cwd, "user.name") if cwd else None,
-        "git_branch": current_git_branch(cwd) if cwd else None,
+        "git_user_name": git_config_value(cwd, "user.name"),
+        "git_branch": metadata.get("git_branch")
+        or (current_git_branch(cwd) if cwd else None),
         "linear_user_name": saved_linear_user_name(),
         "hostname": hostname,
         "local_username": username,
@@ -917,18 +919,22 @@ def saved_linear_user_name() -> str | None:
     return stripped or None
 
 
-def git_config_value(cwd: str, key: str) -> str | None:
-    result = subprocess.run(
-        ["git", "-C", cwd, "config", "--get", key],
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
-        check=False,
-    )
-    if result.returncode != 0:
-        return None
-    value = result.stdout.strip()
-    return value or None
+def git_config_value(cwd: str | None, key: str) -> str | None:
+    commands = []
+    if cwd:
+        commands.append(["git", "-C", cwd, "config", "--get", key])
+    commands.append(["git", "config", "--global", "--get", key])
+    for command in commands:
+        result = subprocess.run(
+            command,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return result.stdout.strip()
+    return None
 
 
 def current_git_branch(cwd: str) -> str | None:

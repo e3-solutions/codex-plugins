@@ -888,3 +888,22 @@ def test_plugin_packaging_and_supabase_migration_are_present():
     assert "upsertEvent" in function_source
     assert "unknown_user_email" not in function_source
     assert "verify_jwt = false" in config_path.read_text(encoding="utf-8")
+
+
+def test_git_identity_falls_back_to_global_config_for_deleted_checkout(monkeypatch):
+    session_logging = load_session_logging()
+    commands = []
+
+    def fake_run(command, **kwargs):
+        commands.append(command)
+        if "--global" in command:
+            return subprocess.CompletedProcess(command, 0, stdout="developer@e3.solutions\n")
+        return subprocess.CompletedProcess(command, 128, stdout="")
+
+    monkeypatch.setattr(session_logging.subprocess, "run", fake_run)
+
+    assert session_logging.git_config_value("/deleted/repo", "user.email") == "developer@e3.solutions"
+    assert commands == [
+        ["git", "-C", "/deleted/repo", "config", "--get", "user.email"],
+        ["git", "config", "--global", "--get", "user.email"],
+    ]
