@@ -902,15 +902,28 @@ def local_installation_id(base: Path) -> str:
     if existing:
         return existing
 
-    value = str(uuid.uuid4())
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_name(f"{path.name}.{uuid.uuid4().hex}.tmp")
-        tmp.write_text(f"{value}\n", encoding="utf-8")
-        tmp.replace(path)
+        lock_path = path.with_suffix(".lock")
+        with lock_path.open("a", encoding="utf-8") as handle:
+            fcntl.flock(handle, fcntl.LOCK_EX)
+            try:
+                try:
+                    existing = path.read_text(encoding="utf-8").strip()
+                except (FileNotFoundError, OSError):
+                    existing = ""
+                if existing:
+                    return existing
+
+                value = str(uuid.uuid4())
+                tmp = path.with_name(f"{path.name}.{uuid.uuid4().hex}.tmp")
+                tmp.write_text(f"{value}\n", encoding="utf-8")
+                tmp.replace(path)
+                return value
+            finally:
+                fcntl.flock(handle, fcntl.LOCK_UN)
     except OSError:
-        return value
-    return value
+        return str(uuid.uuid4())
 
 
 def client_identity_key(

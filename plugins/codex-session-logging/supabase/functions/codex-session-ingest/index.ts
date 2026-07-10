@@ -531,6 +531,9 @@ function sanitizeDrainResult(value: JsonObject): JsonObject {
     uploaded: optionalNonNegativeNumber(value.uploaded),
     failed: optionalNonNegativeNumber(value.failed),
     dead_lettered: optionalNonNegativeNumber(value.dead_lettered),
+    historical_dead_lettered: optionalNonNegativeNumber(
+      value.historical_dead_lettered,
+    ),
     remaining: optionalNonNegativeNumber(value.remaining),
   };
 }

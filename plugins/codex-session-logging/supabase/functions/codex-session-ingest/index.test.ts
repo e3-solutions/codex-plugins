@@ -252,6 +252,16 @@ Deno.test("handleRequest upserts historical backfill progress", async () => {
               skipped_non_e3: 2,
               failed: 1,
             },
+            metadata: {
+              plugin_version: "0.2.0",
+              last_drain: {
+                uploaded: 38,
+                failed: 0,
+                dead_lettered: 0,
+                historical_dead_lettered: 4,
+                remaining: 0,
+              },
+            },
           },
         }),
       }),
@@ -265,6 +275,16 @@ Deno.test("handleRequest upserts historical backfill progress", async () => {
     assertEquals(runUpsert?.body?.backfill_version, 1);
     assertEquals(runUpsert?.body?.records_queued, 42);
     assertEquals(runUpsert?.body?.remaining_files, 4);
+    assertEquals(runUpsert?.body?.metadata, {
+      plugin_version: "0.2.0",
+      last_drain: {
+        uploaded: 38,
+        failed: 0,
+        dead_lettered: 0,
+        historical_dead_lettered: 4,
+        remaining: 0,
+      },
+    });
   } finally {
     globalThis.fetch = originalFetch;
     restoreEnv("SUPABASE_URL", previousUrl);

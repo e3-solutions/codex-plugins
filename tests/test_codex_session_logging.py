@@ -523,6 +523,28 @@ def test_drain_uploads_multiple_records_concurrently(tmp_path, monkeypatch):
     assert uploader.max_active > 1
 
 
+def test_concurrent_upload_workers_share_one_installation_id(tmp_path, monkeypatch):
+    session_logging = load_session_logging()
+    base = tmp_path / "state"
+    original_uuid4 = session_logging.uuid.uuid4
+
+    def slow_uuid4():
+        time.sleep(0.02)
+        return original_uuid4()
+
+    monkeypatch.setattr(session_logging.uuid, "uuid4", slow_uuid4)
+
+    with session_logging.ThreadPoolExecutor(max_workers=8) as executor:
+        installation_ids = list(
+            executor.map(lambda _: session_logging.local_installation_id(base), range(8))
+        )
+
+    assert len(set(installation_ids)) == 1
+    assert (
+        base / "installation_id"
+    ).read_text(encoding="utf-8").strip() == installation_ids[0]
+
+
 def test_drain_posts_full_message_to_ingest_endpoint_without_local_supabase_secret(tmp_path, monkeypatch):
     monkeypatch.setenv("CODEX_SESSION_LOG_STATE_DIR", str(tmp_path / "state"))
     monkeypatch.setenv("CODEX_SESSION_LOG_INGEST_URL", "https://logs.example.test/ingest")
