@@ -813,7 +813,7 @@ def test_plugin_packaging_and_supabase_migration_are_present():
         / "codex-session-logging"
         / "supabase"
         / "migrations"
-        / "20260710005921_add_thread_identity.sql"
+        / "20260710175636_add_thread_identity.sql"
     )
     trigger_hardening_migration_path = (
         ROOT
