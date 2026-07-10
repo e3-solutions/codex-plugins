@@ -6,9 +6,11 @@ export function sanitizeEventPayload(
 ): JsonObject {
   const eventType = requireString(record.event_type, "record.event_type");
   const turnId = optionalString(record.turn_id);
+  const threadId = optionalString(record.thread_id);
   return {
     id: requireString(record.id, "record.id"),
     session_id: requireString(record.session_id, "record.session_id"),
+    ...(threadId ? { thread_id: threadId } : {}),
     ...(turnId ? { turn_id: turnId } : {}),
     seq: requireNumber(record.seq, "record.seq"),
     event_type: eventType,

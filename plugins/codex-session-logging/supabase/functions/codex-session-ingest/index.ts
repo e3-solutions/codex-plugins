@@ -205,13 +205,17 @@ async function upsertSession(
   metadata = optionalObject(record.metadata),
 ): Promise<void> {
   const sessionId = requireString(record.session_id, "record.session_id");
+  const existing = await existingSession(sessionId);
+  const threadId = optionalString(record.thread_id) ??
+    existing.threadId ?? await sha256Hex(sessionId);
   const sessionMetadata = await sessionMetadataForUpsert(
-    sessionId,
     metadata,
     client,
+    existing.metadata,
   );
   const row = {
     id: sessionId,
+    thread_id: threadId,
     user_id: userId,
     repo: remote,
     branch: optionalString(client.git_branch),
@@ -254,15 +258,14 @@ async function upsertSessionUser(
 }
 
 async function sessionMetadataForUpsert(
-  sessionId: string,
   metadata: JsonObject,
   client: JsonObject,
+  existingMetadata: JsonObject,
 ): Promise<JsonObject> {
   const nextMetadata: JsonObject = { ...metadata };
-  if (!hasOwn(nextMetadata, "codex_setup")) {
-    const existingMetadata = await existingSessionMetadata(sessionId);
-    if (hasOwn(existingMetadata, "codex_setup")) {
-      nextMetadata.codex_setup = existingMetadata.codex_setup;
+  for (const field of ["codex_setup", "transcript_path"]) {
+    if (!hasOwn(nextMetadata, field) && hasOwn(existingMetadata, field)) {
+      nextMetadata[field] = existingMetadata[field];
     }
   }
   return {
@@ -271,9 +274,11 @@ async function sessionMetadataForUpsert(
   };
 }
 
-async function existingSessionMetadata(sessionId: string): Promise<JsonObject> {
+async function existingSession(
+  sessionId: string,
+): Promise<{ metadata: JsonObject; threadId: string | null }> {
   const response = await supabaseFetch(
-    `/rest/v1/codex_sessions?select=metadata&id=eq.${
+    `/rest/v1/codex_sessions?select=metadata,thread_id&id=eq.${
       encodeURIComponent(sessionId)
     }&limit=1`,
     {
@@ -285,9 +290,13 @@ async function existingSessionMetadata(sessionId: string): Promise<JsonObject> {
   );
   const rows = await response.json();
   if (!Array.isArray(rows) || rows.length === 0) {
-    return {};
+    return { metadata: {}, threadId: null };
   }
-  return optionalObject(optionalObject(rows[0]).metadata);
+  const row = optionalObject(rows[0]);
+  return {
+    metadata: optionalObject(row.metadata),
+    threadId: optionalString(row.thread_id),
+  };
 }
 
 async function upsertMessage(

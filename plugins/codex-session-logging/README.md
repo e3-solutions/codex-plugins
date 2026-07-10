@@ -8,6 +8,8 @@ Capture is scoped to repositories whose `origin` remote belongs to the `e3-solut
 
 Tool logging records only the tool name, phase, optional tool call id, and success flag when exposed by Codex. Tool arguments, shell commands, and tool outputs are not uploaded. Setup snapshots include sanitized Codex config names such as enabled plugins, installed skill names/sources, MCP server names/transport, marketplaces, app connection ids/tool names, and non-secret model/runtime settings.
 
+Each runtime `session_id` is retained for event correlation. When Codex provides a `transcript_path`, the plugin also records a SHA-256 `thread_id` derived from that path so resumed runtime sessions can be grouped as one conversation without storing another copy of the path. Legacy records without a transcript reference remain separate runtime sessions and cannot be grouped reliably after the fact.
+
 ## Supabase
 
 Project: `codex-session-logging`
@@ -20,11 +22,12 @@ Default URL:
 https://pmdfllwuctzkdjiehezq.supabase.co
 ```
 
-Apply the SQL files in `supabase/migrations` in order.
+Apply the SQL files in `supabase/migrations` before deploying the ingest Edge Function. The thread identity migration includes a compatibility trigger, so the previously deployed function continues to create sessions during this rollout. Deploying the function first is unsupported because it queries the new `thread_id` column.
 
-Deploy the ingest Edge Function from `supabase/functions/codex-session-ingest`. The function owns the Supabase admin key server-side and uses the developer's git email as the initial user key when available. If `CODEX_SESSION_LOG_USER_EMAIL_MAP` contains the email, that mapped Supabase Auth user id is used; otherwise the function derives a stable UUID from the email. When git email is not configured, the plugin sends a persistent local installation id so sessions still track without per-user setup.
+Deploy the ingest Edge Function from `supabase/functions/codex-session-ingest` after the migration. The function owns the Supabase admin key server-side and uses the developer's git email as the initial user key when available. If `CODEX_SESSION_LOG_USER_EMAIL_MAP` contains the email, that mapped Supabase Auth user id is used; otherwise the function derives a stable UUID from the email. When git email is not configured, the plugin sends a persistent local installation id so sessions still track without per-user setup.
 
 ```bash
+supabase db push --project-ref pmdfllwuctzkdjiehezq
 supabase functions deploy codex-session-ingest --project-ref pmdfllwuctzkdjiehezq
 supabase secrets set \
   --project-ref pmdfllwuctzkdjiehezq \

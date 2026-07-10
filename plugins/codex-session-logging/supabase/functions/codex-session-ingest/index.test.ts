@@ -36,6 +36,7 @@ Deno.test("handleRequest preserves existing session codex setup on later event u
     settings: { model: "gpt-5.5" },
     plugins: [{ name: "codex-session-logging@coreedge-local", enabled: true }],
   };
+  const existingTranscriptPath = "/sessions/thread.jsonl";
 
   Deno.env.set("SUPABASE_URL", "https://project.supabase.co");
   Deno.env.set("SUPABASE_SERVICE_ROLE_KEY", "service-role-key");
@@ -50,9 +51,15 @@ Deno.test("handleRequest preserves existing session codex setup on later event u
       ? JSON.parse(requestInit.body) as JsonObject
       : null;
     requests.push({ url, body });
-    if (url.includes("/rest/v1/codex_sessions?select=metadata")) {
+    if (url.includes("/rest/v1/codex_sessions?select=")) {
       return new Response(
-        JSON.stringify([{ metadata: { codex_setup: existingSetup } }]),
+        JSON.stringify([{
+          metadata: {
+            codex_setup: existingSetup,
+            transcript_path: existingTranscriptPath,
+          },
+          thread_id: "existing-thread",
+        }]),
         { status: 200, headers: { "content-type": "application/json" } },
       );
     }
@@ -100,7 +107,9 @@ Deno.test("handleRequest preserves existing session codex setup on later event u
       | undefined;
 
     assertEquals(response.status, 200);
+    assertEquals(sessionUpsert?.body?.thread_id, "existing-thread");
     assertEquals(sessionMetadata?.codex_setup, existingSetup);
+    assertEquals(sessionMetadata?.transcript_path, existingTranscriptPath);
     assertEquals(sessionMetadata?.tool_name, "functions.exec_command");
   } finally {
     globalThis.fetch = originalFetch;
@@ -128,7 +137,7 @@ Deno.test("handleRequest upserts session user identity rollup", async () => {
       ? JSON.parse(requestInit.body) as JsonObject
       : null;
     requests.push({ url, body });
-    if (url.includes("/rest/v1/codex_sessions?select=metadata")) {
+    if (url.includes("/rest/v1/codex_sessions?select=")) {
       return new Response(JSON.stringify([]), {
         status: 200,
         headers: { "content-type": "application/json" },
@@ -147,6 +156,7 @@ Deno.test("handleRequest upserts session user identity rollup", async () => {
           record: {
             id: "804fd832-7779-4665-9bec-2f10462c721b",
             session_id: "session-users",
+            thread_id: "thread-users",
             seq: 1,
             role: "user",
             content_sha256:
@@ -179,6 +189,7 @@ Deno.test("handleRequest upserts session user identity rollup", async () => {
     );
 
     assertEquals(response.status, 200);
+    assertEquals(sessionUpsert?.body?.thread_id, "thread-users");
     assertEquals(userUpsert?.body, {
       user_id: sessionUpsert?.body?.user_id,
       first_seen_at: "2026-07-07T00:00:00.000Z",
@@ -202,6 +213,7 @@ Deno.test("sanitizeEventPayload keeps only allowlisted tool event fields", () =>
     {
       id: "804fd832-7779-4665-9bec-2f10462c721b",
       session_id: "session-tools",
+      thread_id: "thread-tools",
       turn_id: "turn-1",
       seq: 7,
       event_type: "tool_call_finished",
@@ -234,6 +246,7 @@ Deno.test("sanitizeEventPayload keeps only allowlisted tool event fields", () =>
   assertEquals(sanitized, {
     id: "804fd832-7779-4665-9bec-2f10462c721b",
     session_id: "session-tools",
+    thread_id: "thread-tools",
     turn_id: "turn-1",
     seq: 7,
     event_type: "tool_call_finished",

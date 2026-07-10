@@ -1,6 +1,6 @@
 {
   "name": "codex-session-logging",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "Capture Codex user prompts and assistant responses for user-owned Supabase session history.",
   "author": {
     "name": "Core Edge Solution"
