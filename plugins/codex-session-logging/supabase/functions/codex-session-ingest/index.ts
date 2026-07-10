@@ -52,6 +52,17 @@ export async function handleRequest(req: Request): Promise<Response> {
 
     const record = requireObject(payload.record, "record");
     const recordType = optionalString(record.type) ?? "message";
+    if (recordType === "usage") {
+      const usage = requireObject(payload.usage, "usage");
+      await upsertSessionUser(record, client, userId);
+      await upsertSession(record, client, userId, remote);
+      await upsertSessionUsage(record, userId, usage);
+      return jsonResponse({
+        ok: true,
+        id: record.id,
+        kind: "usage",
+      });
+    }
     const storagePath = storagePathForRecord(record, userId);
 
     if (recordType === "event") {
@@ -382,6 +393,47 @@ async function upsertMessage(
   await restUpsert("codex_session_messages", row, "id");
 }
 
+async function upsertSessionUsage(
+  record: JsonObject,
+  userId: string,
+  usage: JsonObject,
+): Promise<void> {
+  const modelContextWindow = optionalNonNegativeInteger(
+    usage.model_context_window,
+  );
+  const row: JsonObject = {
+    session_id: requireString(record.session_id, "record.session_id"),
+    user_id: userId,
+    input_tokens: requireNonNegativeInteger(
+      usage.input_tokens,
+      "usage.input_tokens",
+    ),
+    cached_input_tokens: requireNonNegativeInteger(
+      usage.cached_input_tokens,
+      "usage.cached_input_tokens",
+    ),
+    output_tokens: requireNonNegativeInteger(
+      usage.output_tokens,
+      "usage.output_tokens",
+    ),
+    reasoning_output_tokens: requireNonNegativeInteger(
+      usage.reasoning_output_tokens,
+      "usage.reasoning_output_tokens",
+    ),
+    total_tokens: requireNonNegativeInteger(
+      usage.total_tokens,
+      "usage.total_tokens",
+    ),
+    observed_at: requireString(usage.created_at, "usage.created_at"),
+    metadata: optionalObject(usage.metadata),
+    updated_at: new Date().toISOString(),
+  };
+  if (modelContextWindow !== null) {
+    row.model_context_window = modelContextWindow;
+  }
+  await restUpsert("codex_session_usage", row, "session_id");
+}
+
 async function upsertEvent(
   record: JsonObject,
   userId: string,
@@ -518,6 +570,21 @@ function requireNumber(value: unknown, name: string): number {
     throw new PayloadValidationError(`${name} must be a finite number`);
   }
   return value;
+}
+
+function requireNonNegativeInteger(value: unknown, name: string): number {
+  if (
+    typeof value !== "number" || !Number.isSafeInteger(value) || value < 0
+  ) {
+    throw new PayloadValidationError(`${name} must be a non-negative integer`);
+  }
+  return value;
+}
+
+function optionalNonNegativeInteger(value: unknown): number | null {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0
+    ? value
+    : null;
 }
 
 function optionalNonNegativeNumber(value: unknown): number {

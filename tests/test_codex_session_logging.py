@@ -515,12 +515,15 @@ def test_drain_uploads_multiple_records_concurrently(tmp_path, monkeypatch):
 
     uploader = ConcurrentUploader()
     monkeypatch.setattr(session_logging.IngestUploader, "from_env", classmethod(lambda cls: uploader))
+    progress = []
 
-    result = session_logging.drain_queue()
+    result = session_logging.drain_queue(progress_callback=progress.append)
 
     assert result["uploaded"] == 4
     assert result["remaining"] == 0
     assert uploader.max_active > 1
+    assert progress[-1]["uploaded"] == 4
+    assert progress[-1]["remaining"] == 0
 
 
 def test_concurrent_upload_workers_share_one_installation_id(tmp_path, monkeypatch):

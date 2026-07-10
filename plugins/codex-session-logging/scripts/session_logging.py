@@ -18,7 +18,7 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 try:
     import tomllib
@@ -688,7 +688,7 @@ def drain_lock(base: Path):
             fcntl.flock(handle, fcntl.LOCK_UN)
 
 
-def drain_queue() -> JsonDict:
+def drain_queue(progress_callback: Callable[[JsonDict], None] | None = None) -> JsonDict:
     base = ensure_state_dir()
     with drain_lock(base) as acquired:
         if not acquired:
@@ -730,6 +730,14 @@ def drain_queue() -> JsonDict:
                     else:
                         failed += 1
                         failed_record_names.add(record_name)
+                    if progress_callback:
+                        progress_callback({
+                            "uploaded": uploaded,
+                            "failed": failed,
+                            "dead_lettered": dead_lettered,
+                            "remaining": len(pending_queue_paths(base))
+                            + len(list(processing_queue_dir(base).glob("*.json"))),
+                        })
         return {
             "uploaded": uploaded,
             "failed": failed,
@@ -857,6 +865,8 @@ def build_ingest_payload(record: JsonDict, *, base: Path) -> JsonDict:
     }
     if record.get("type") == "event":
         payload["event"] = detail
+    elif record.get("type") == "usage":
+        payload["usage"] = detail
     else:
         payload["message"] = detail
     return payload

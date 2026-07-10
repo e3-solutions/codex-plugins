@@ -11,7 +11,7 @@ import uuid
 from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Callable, Iterator
 
 from session_logging import (
     ALLOWED_GITHUB_ORG,
@@ -42,8 +42,11 @@ BACKFILL_VERSION = 1
 BACKFILL_ENABLED_ENV = "CODEX_SESSION_LOG_BACKFILL"
 BACKFILL_MAX_FILES_ENV = "CODEX_SESSION_LOG_BACKFILL_MAX_FILES"
 BACKFILL_DRAIN_WAIT_ENV = "CODEX_SESSION_LOG_BACKFILL_DRAIN_WAIT_SECONDS"
+BACKFILL_HEARTBEAT_ENV = "CODEX_SESSION_LOG_BACKFILL_HEARTBEAT_SECONDS"
 DEFAULT_MAX_FILES = 1000
 DEFAULT_DRAIN_WAIT_SECONDS = 7200
+DEFAULT_HEARTBEAT_SECONDS = 30
+USAGE_VERSION = 1
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -65,6 +68,13 @@ def max_files_per_run() -> int:
         return max(1, int(os.environ.get(BACKFILL_MAX_FILES_ENV, DEFAULT_MAX_FILES)))
     except ValueError:
         return DEFAULT_MAX_FILES
+
+
+def heartbeat_seconds() -> float:
+    try:
+        return max(0.0, float(os.environ.get(BACKFILL_HEARTBEAT_ENV, DEFAULT_HEARTBEAT_SECONDS)))
+    except ValueError:
+        return float(DEFAULT_HEARTBEAT_SECONDS)
 
 
 def codex_home() -> Path:
@@ -118,11 +128,40 @@ def run_backfill(*, dry_run: bool = False, force: bool = False, max_files: int =
         paths = transcript_paths()
         repo_by_cwd = known_repositories(paths)
         totals["discovered"] = len(paths)
-        state.update({"version": BACKFILL_VERSION, "status": "running", "started_at": state.get("started_at") or now_iso()})
+        state.update({
+            "version": BACKFILL_VERSION,
+            "status": "running",
+            "started_at": state.get("started_at") or now_iso(),
+            "totals": totals,
+            "remaining_files": len(paths),
+        })
         if not dry_run:
             write_json_atomic(state_path(base), state)
 
         reporting_remote = string_value(state.get("reporting_remote"))
+        last_heartbeat = float("-inf")
+
+        def emit_heartbeat(
+            drain_progress: JsonDict | None = None,
+            *,
+            force_report: bool = False,
+        ) -> None:
+            nonlocal last_heartbeat
+            if dry_run or not auto_upload_enabled() or not reporting_remote:
+                return
+            current = time.monotonic()
+            if not force_report and current - last_heartbeat < heartbeat_seconds():
+                return
+            state["status"] = "running"
+            state["completed_at"] = None
+            state["updated_at"] = now_iso()
+            if drain_progress is not None:
+                state["last_drain"] = drain_progress
+            write_json_atomic(state_path(base), state)
+            report_status(state, base=base, repo_remote=reporting_remote)
+            last_heartbeat = current
+
+        emit_heartbeat(force_report=True)
         for path in paths:
             if totals["processed"] >= max(1, max_files):
                 break
@@ -133,14 +172,25 @@ def run_backfill(*, dry_run: bool = False, force: bool = False, max_files: int =
                 totals["failed"] += 1
                 continue
             previous = files.get(key) if isinstance(files.get(key), dict) else {}
+            same_completed_file = (
+                previous.get("fingerprint") == fingerprint
+                and previous.get("status") in {"complete", "skipped_non_e3"}
+            )
             if (
                 not force
-                and previous.get("fingerprint") == fingerprint
-                and previous.get("status") in {"complete", "skipped_non_e3"}
+                and same_completed_file
+                and previous.get("usage_version") == USAGE_VERSION
             ):
+                emit_heartbeat()
                 continue
             try:
-                result = import_transcript(path, base=base, dry_run=dry_run, repo_by_cwd=repo_by_cwd)
+                result = import_transcript(
+                    path,
+                    base=base,
+                    dry_run=dry_run,
+                    repo_by_cwd=repo_by_cwd,
+                    include_messages=force or not same_completed_file,
+                )
             except Exception as exc:  # noqa: BLE001 - one corrupt transcript must not stop the migration.
                 totals["failed"] += 1
                 files[key] = {"fingerprint": fingerprint, "status": "failed", "error": str(exc), "updated_at": now_iso()}
@@ -151,7 +201,7 @@ def run_backfill(*, dry_run: bool = False, force: bool = False, max_files: int =
                     )
             else:
                 totals["processed"] += 1
-                totals["queued"] += int(result.get("queued", 0))
+                totals["queued"] += int(result.get("newly_queued", result.get("queued", 0)))
                 if result.get("status") == "skipped_non_e3":
                     totals["skipped_non_e3"] += 1
                 remote = result.get("repo_remote")
@@ -163,6 +213,7 @@ def run_backfill(*, dry_run: bool = False, force: bool = False, max_files: int =
                 state["totals"] = totals
                 state["updated_at"] = now_iso()
                 write_json_atomic(state_path(base), state)
+            emit_heartbeat()
 
         remaining = sum(
             1
@@ -170,6 +221,7 @@ def run_backfill(*, dry_run: bool = False, force: bool = False, max_files: int =
             if not isinstance(files.get(str(path)), dict)
             or files[str(path)].get("fingerprint") != file_fingerprint(path)
             or files[str(path)].get("status") not in {"complete", "skipped_non_e3"}
+            or files[str(path)].get("usage_version") != USAGE_VERSION
         )
         aggregate_totals = {
             "discovered": len(paths),
@@ -204,7 +256,8 @@ def run_backfill(*, dry_run: bool = False, force: bool = False, max_files: int =
                 state["updated_at"] = now_iso()
                 write_json_atomic(state_path(base), state)
             else:
-                drain_result = drain_when_available(base)
+                emit_heartbeat(force_report=True)
+                drain_result = drain_when_available(base, progress_callback=emit_heartbeat)
                 drain_result["historical_dead_lettered"] = historical_dead_letter_count(base)
                 state["last_drain"] = drain_result
                 drain_problem = any(
@@ -234,6 +287,7 @@ def import_transcript(
     base: Path,
     dry_run: bool,
     repo_by_cwd: dict[str, str] | None = None,
+    include_messages: bool = True,
 ) -> JsonDict:
     meta = read_session_meta(path)
     cwd = string_value(meta.get("cwd"))
@@ -244,7 +298,12 @@ def import_transcript(
         or (git_origin_remote(cwd) if cwd else None)
     )
     if not remote_belongs_to_org(remote, ALLOWED_GITHUB_ORG):
-        return {"status": "skipped_non_e3", "queued": 0}
+        return {
+            "status": "skipped_non_e3",
+            "queued": 0,
+            "newly_queued": 0,
+            "usage_version": USAGE_VERSION,
+        }
 
     session_id = string_value(meta.get("session_id")) or string_value(meta.get("id")) or session_id_from_filename(path)
     thread_id = sha256_hex(str(path.resolve()))
@@ -252,9 +311,29 @@ def import_transcript(
         path.stat().st_mtime,
         tz=timezone.utc,
     ).isoformat()
-    queued = 0
+    record_count = 0
+    newly_queued = 0
+    metadata: JsonDict = {
+        "cwd": cwd,
+        "repo_remote": remote,
+        "transcript_path": str(path.resolve()),
+        "source": "historical_transcript",
+        "backfill_version": BACKFILL_VERSION,
+        "source_line": None,
+    }
+    branch = string_value(git.get("branch"))
+    commit = string_value(git.get("commit_hash"))
+    if branch:
+        metadata["git_branch"] = branch
+    if commit:
+        metadata["git_commit"] = commit
+
+    final_usage: JsonDict | None = None
     skipped_user_lines = response_user_lines_to_skip(path)
     for line_number, envelope in iter_transcript(path):
+        usage = historical_token_usage(envelope, fallback_created_at=fallback_created_at)
+        if usage is not None:
+            final_usage = {**usage, "source_line": line_number}
         parsed = historical_message(
             envelope,
             skip_response_user=line_number in skipped_user_lines,
@@ -262,25 +341,15 @@ def import_transcript(
         )
         if parsed is None:
             continue
+        record_count += 1
+        if not include_messages:
+            continue
         role, content, turn_id, created_at = parsed
         seq = historical_sequence(path, line_number)
         record_id = deterministic_uuid(f"backfill-v{BACKFILL_VERSION}:{path.resolve()}:{line_number}:message")
         content_bytes = content.encode("utf-8")
         storage_path = f"users/local/sessions/{safe_segment(session_id)}/messages/{seq}-{role}.json"
-        metadata: JsonDict = {
-            "cwd": cwd,
-            "repo_remote": remote,
-            "transcript_path": str(path.resolve()),
-            "source": "historical_transcript",
-            "backfill_version": BACKFILL_VERSION,
-            "source_line": line_number,
-        }
-        branch = string_value(git.get("branch"))
-        commit = string_value(git.get("commit_hash"))
-        if branch:
-            metadata["git_branch"] = branch
-        if commit:
-            metadata["git_commit"] = commit
+        message_metadata = {**metadata, "source_line": line_number}
         detail: JsonDict = {
             "id": record_id,
             "session_id": session_id,
@@ -293,7 +362,7 @@ def import_transcript(
             "content_byte_size": len(content_bytes),
             "hook_event_name": "HistoricalBackfill",
             "created_at": created_at,
-            "metadata": metadata,
+            "metadata": message_metadata,
         }
         record: JsonDict = {
             key: value
@@ -308,11 +377,46 @@ def import_transcript(
             "content_excerpt": content_bytes[:EXCERPT_BYTES].decode("utf-8", errors="replace"),
             "uploaded_at": None,
         })
-        queued += 1
+        newly_queued += 1
         if not dry_run:
             write_json_atomic(base / storage_path, detail)
             enqueue_record(base, record)
-    return {"status": "complete", "queued": queued, "repo_remote": remote, "session_id": session_id}
+
+    if final_usage is not None:
+        record_count += 1
+        newly_queued += 1
+        usage_id = deterministic_uuid(f"backfill-usage-v{USAGE_VERSION}:{path.resolve()}")
+        usage_path = f"users/local/sessions/{safe_segment(session_id)}/usage.json"
+        usage_metadata = {**metadata, "source_line": final_usage.pop("source_line")}
+        usage_detail: JsonDict = {
+            "id": usage_id,
+            "session_id": session_id,
+            "thread_id": thread_id,
+            **final_usage,
+            "metadata": usage_metadata,
+        }
+        usage_record: JsonDict = {
+            "id": usage_id,
+            "type": "usage",
+            "session_id": session_id,
+            "thread_id": thread_id,
+            "created_at": final_usage["created_at"],
+            "metadata": usage_metadata,
+            "local_content_path": usage_path,
+            "uploaded_at": None,
+        }
+        if not dry_run:
+            write_json_atomic(base / usage_path, usage_detail)
+            enqueue_record(base, usage_record)
+
+    return {
+        "status": "complete",
+        "queued": record_count,
+        "newly_queued": newly_queued,
+        "usage_version": USAGE_VERSION,
+        "repo_remote": remote,
+        "session_id": session_id,
+    }
 
 
 def iter_transcript(path: Path) -> Iterator[tuple[int, JsonDict]]:
@@ -433,6 +537,45 @@ def read_session_meta(path: Path) -> JsonDict:
     return {}
 
 
+def historical_token_usage(
+    envelope: JsonDict,
+    *,
+    fallback_created_at: str | None = None,
+) -> JsonDict | None:
+    payload = envelope.get("payload")
+    if (
+        envelope.get("type") != "event_msg"
+        or not isinstance(payload, dict)
+        or payload.get("type") != "token_count"
+    ):
+        return None
+    info = payload.get("info")
+    if not isinstance(info, dict):
+        return None
+    total = info.get("total_token_usage")
+    if not isinstance(total, dict):
+        return None
+
+    input_tokens = non_negative_int(total.get("input_tokens"))
+    output_tokens = non_negative_int(total.get("output_tokens"))
+    total_tokens = non_negative_int(total.get("total_tokens"))
+    if input_tokens is None or output_tokens is None or total_tokens is None:
+        return None
+
+    usage: JsonDict = {
+        "input_tokens": input_tokens,
+        "cached_input_tokens": non_negative_int(total.get("cached_input_tokens")) or 0,
+        "output_tokens": output_tokens,
+        "reasoning_output_tokens": non_negative_int(total.get("reasoning_output_tokens")) or 0,
+        "total_tokens": total_tokens,
+        "created_at": string_value(envelope.get("timestamp")) or fallback_created_at or now_iso(),
+    }
+    model_context_window = non_negative_int(info.get("model_context_window"))
+    if model_context_window is not None:
+        usage["model_context_window"] = model_context_window
+    return usage
+
+
 def historical_message(
     envelope: JsonDict,
     *,
@@ -512,6 +655,10 @@ def string_value(value: object) -> str | None:
     return value.strip() if isinstance(value, str) and value.strip() else None
 
 
+def non_negative_int(value: object) -> int | None:
+    return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
+
+
 def drain_wait_seconds() -> float:
     try:
         return max(0.0, float(os.environ.get(BACKFILL_DRAIN_WAIT_ENV, DEFAULT_DRAIN_WAIT_SECONDS)))
@@ -523,11 +670,17 @@ def queue_inflight_count(base: Path) -> int:
     return len(pending_queue_paths(base)) + len(list(processing_queue_dir(base).glob("*.json")))
 
 
-def drain_when_available(base: Path) -> JsonDict:
+def drain_when_available(
+    base: Path,
+    *,
+    progress_callback: Callable[[JsonDict], None] | None = None,
+) -> JsonDict:
     deadline = time.monotonic() + drain_wait_seconds()
     while True:
-        result = drain_queue()
+        result = drain_queue(progress_callback=progress_callback)
         result["remaining"] = queue_inflight_count(base)
+        if progress_callback:
+            progress_callback(result)
         if not result.get("locked") or time.monotonic() >= deadline:
             return result
         time.sleep(1)

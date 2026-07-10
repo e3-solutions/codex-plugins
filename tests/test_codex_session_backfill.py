@@ -20,7 +20,7 @@ def load_backfill():
     return module
 
 
-def write_transcript(path: Path, *, remote: str) -> None:
+def write_transcript(path: Path, *, remote: str, include_usage: bool = False) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     rows = [
         {
@@ -67,7 +67,26 @@ def write_transcript(path: Path, *, remote: str) -> None:
                 "content": [{"type": "output_text", "text": "Historical answer"}],
             },
         },
-        {
+    ]
+    if include_usage:
+        rows.append({
+            "timestamp": "2025-01-02T03:04:08.500Z",
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "info": {
+                    "total_token_usage": {
+                        "input_tokens": 4090,
+                        "cached_input_tokens": 1024,
+                        "output_tokens": 52,
+                        "reasoning_output_tokens": 8,
+                        "total_tokens": 4142,
+                    },
+                    "model_context_window": 258400,
+                },
+            },
+        })
+    rows.append({
             "timestamp": "2025-01-02T03:04:09.000Z",
             "type": "response_item",
             "payload": {
@@ -75,8 +94,7 @@ def write_transcript(path: Path, *, remote: str) -> None:
                 "role": "developer",
                 "content": [{"type": "input_text", "text": "Do not upload"}],
             },
-        },
-    ]
+        })
     path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
 
 
@@ -127,6 +145,74 @@ def test_auto_upload_disabled_does_not_report_status(tmp_path, monkeypatch):
     assert result["status"] == "partial"
     assert state["completed_at"] is None
     assert state["last_drain"]["disabled"] is True
+
+
+def test_backfill_queues_final_cumulative_token_usage(tmp_path, monkeypatch):
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex"))
+    monkeypatch.setenv("CODEX_SESSION_LOG_STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setenv("CODEX_SESSION_LOG_AUTO_UPLOAD", "0")
+    transcript = tmp_path / "codex" / "sessions" / "usage.jsonl"
+    write_transcript(
+        transcript,
+        remote="https://github.com/e3-solutions/repo.git",
+        include_usage=True,
+    )
+    backfill = load_backfill()
+
+    result = backfill.run_backfill(max_files=10)
+    records = [
+        json.loads(path.read_text(encoding="utf-8"))
+        for path in (tmp_path / "state" / "queue" / "pending").glob("*.json")
+    ]
+    usage_record = next(record for record in records if record.get("type") == "usage")
+    payload = backfill.build_ingest_payload(usage_record, base=tmp_path / "state")
+
+    assert result["queued"] == 3
+    assert payload["usage"]["input_tokens"] == 4090
+    assert payload["usage"]["cached_input_tokens"] == 1024
+    assert payload["usage"]["output_tokens"] == 52
+    assert payload["usage"]["reasoning_output_tokens"] == 8
+    assert payload["usage"]["total_tokens"] == 4142
+    assert payload["usage"]["model_context_window"] == 258400
+
+
+def test_existing_message_checkpoint_queues_only_missing_usage(tmp_path, monkeypatch):
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex"))
+    monkeypatch.setenv("CODEX_SESSION_LOG_STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setenv("CODEX_SESSION_LOG_AUTO_UPLOAD", "0")
+    transcript = tmp_path / "codex" / "sessions" / "usage-upgrade.jsonl"
+    write_transcript(
+        transcript,
+        remote="https://github.com/e3-solutions/repo.git",
+        include_usage=True,
+    )
+    backfill = load_backfill()
+    base = tmp_path / "state"
+    backfill.write_json_atomic(
+        backfill.state_path(base),
+        {
+            "version": 1,
+            "files": {
+                str(transcript): {
+                    "fingerprint": backfill.file_fingerprint(transcript),
+                    "status": "complete",
+                    "queued": 2,
+                },
+            },
+        },
+    )
+
+    result = backfill.run_backfill(max_files=10)
+    records = [
+        json.loads(path.read_text(encoding="utf-8"))
+        for path in (base / "queue" / "pending").glob("*.json")
+    ]
+    state = backfill.read_state(base)
+
+    assert result["queued"] == 1
+    assert [record["type"] for record in records] == ["usage"]
+    assert state["files"][str(transcript)]["queued"] == 3
+    assert state["files"][str(transcript)]["usage_version"] == 1
 
 
 def test_legacy_response_user_is_used_when_canonical_user_event_is_absent():
@@ -191,6 +277,7 @@ def test_locked_drain_is_reconciled_before_reporting_complete(tmp_path, monkeypa
     monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex"))
     monkeypatch.setenv("CODEX_SESSION_LOG_STATE_DIR", str(tmp_path / "state"))
     monkeypatch.setenv("CODEX_SESSION_LOG_AUTO_UPLOAD", "1")
+    monkeypatch.setenv("CODEX_SESSION_LOG_BACKFILL_HEARTBEAT_SECONDS", "0")
     transcript = tmp_path / "codex" / "sessions" / "rollout.jsonl"
     write_transcript(transcript, remote="https://github.com/e3-solutions/repo.git")
     backfill = load_backfill()
@@ -198,13 +285,15 @@ def test_locked_drain_is_reconciled_before_reporting_complete(tmp_path, monkeypa
     reports = []
     pre_drain_states = []
 
-    def fake_drain():
+    def fake_drain(progress_callback=None):
         drain_calls.append(True)
         pre_drain_states.append(backfill.read_state(tmp_path / "state"))
         if len(drain_calls) == 1:
             return {"uploaded": 0, "failed": 0, "dead_lettered": 0, "remaining": 0, "locked": True}
         for path in (tmp_path / "state" / "queue" / "pending").glob("*.json"):
             path.unlink()
+        if progress_callback:
+            progress_callback({"uploaded": 2, "failed": 0, "dead_lettered": 0, "remaining": 0})
         return {"uploaded": 2, "failed": 0, "dead_lettered": 0, "remaining": 0}
 
     monkeypatch.setattr(backfill, "drain_queue", fake_drain)
@@ -214,11 +303,13 @@ def test_locked_drain_is_reconciled_before_reporting_complete(tmp_path, monkeypa
     result = backfill.run_backfill(max_files=10)
 
     assert len(drain_calls) == 2
-    assert all(state["status"] == "partial" for state in pre_drain_states)
+    assert all(state["status"] == "running" for state in pre_drain_states)
     assert all(state["completed_at"] is None for state in pre_drain_states)
     assert result["status"] == "complete"
-    assert reports[0]["status"] == "complete"
-    assert reports[0]["completed_at"] is not None
+    assert any(report["status"] == "running" for report in reports)
+    assert any(report.get("last_drain", {}).get("uploaded") == 2 for report in reports)
+    assert reports[-1]["status"] == "complete"
+    assert reports[-1]["completed_at"] is not None
 
 
 def test_backfill_skips_non_e3_transcripts_without_queuing_content(tmp_path, monkeypatch):
@@ -247,3 +338,14 @@ def test_backfill_database_migration_is_private_and_service_role_writable():
     assert "using ((select auth.uid()) = user_id)" in migration
     assert "grant select on public.codex_session_backfill_runs to authenticated" in migration
     assert "grant select, insert, update on public.codex_session_backfill_runs to service_role" in migration
+
+    usage_migration = (
+        ROOT
+        / "plugins/codex-session-logging/supabase/migrations/20260710210437_historical_session_usage.sql"
+    ).read_text(encoding="utf-8")
+    assert "create table public.codex_session_usage" in usage_migration
+    assert "references public.codex_sessions(id) on delete cascade" in usage_migration
+    assert "alter table public.codex_session_usage enable row level security" in usage_migration
+    assert "using ((select auth.uid()) = user_id)" in usage_migration
+    assert "grant select on public.codex_session_usage to authenticated" in usage_migration
+    assert "grant select, insert, update on public.codex_session_usage to service_role" in usage_migration
