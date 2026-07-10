@@ -237,7 +237,7 @@ def import_transcript(
         if parsed is None:
             continue
         role, content, turn_id, created_at = parsed
-        seq = -(line_number + 1)
+        seq = historical_sequence(path, line_number)
         record_id = deterministic_uuid(f"backfill-v{BACKFILL_VERSION}:{path.resolve()}:{line_number}:message")
         content_bytes = content.encode("utf-8")
         storage_path = f"users/local/sessions/{safe_segment(session_id)}/messages/{seq}-{role}.json"
@@ -406,6 +406,13 @@ def deterministic_uuid(value: str) -> str:
     digest[6] = (digest[6] & 0x0F) | 0x50
     digest[8] = (digest[8] & 0x3F) | 0x80
     return str(uuid.UUID(bytes=bytes(digest)))
+
+
+def historical_sequence(path: Path, line_number: int) -> int:
+    digest = hashlib.sha256(
+        f"backfill-v{BACKFILL_VERSION}:{path.resolve()}:{line_number}".encode("utf-8")
+    ).digest()
+    return -(int.from_bytes(digest[:8], "big") % 2_000_000_000 + 1)
 
 
 def session_id_from_filename(path: Path) -> str:

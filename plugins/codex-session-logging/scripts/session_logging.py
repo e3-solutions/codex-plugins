@@ -15,6 +15,7 @@ import sys
 import urllib.error
 import urllib.request
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -31,6 +32,7 @@ SUPABASE_BUCKET_ENV = "CODEX_SESSION_LOG_BUCKET"
 INGEST_URL_ENV = "CODEX_SESSION_LOG_INGEST_URL"
 INGEST_TOKEN_ENV = "CODEX_SESSION_LOG_INGEST_TOKEN"
 AUTO_UPLOAD_ENV = "CODEX_SESSION_LOG_AUTO_UPLOAD"
+UPLOAD_WORKERS_ENV = "CODEX_SESSION_LOG_UPLOAD_WORKERS"
 DEFAULT_SUPABASE_URL = "https://pmdfllwuctzkdjiehezq.supabase.co"
 DEFAULT_INGEST_URL = f"{DEFAULT_SUPABASE_URL}/functions/v1/codex-session-ingest"
 DEFAULT_BUCKET = "codex-sessions"
@@ -705,47 +707,73 @@ def drain_queue() -> JsonDict:
         dead_lettered = 0
         failed_record_names: set[str] = set()
         uploader: IngestUploader | None = None
-        while True:
-            queue_paths = [path for path in pending_queue_paths(base) if path.name not in failed_record_names]
-            if not queue_paths:
-                break
-            if uploader is None:
-                uploader = IngestUploader.from_env()
-            for queue_path in queue_paths:
-                claimed_path = claim_queue_path(queue_path, base)
-                if claimed_path is None:
-                    continue
-                record: JsonDict | None = None
-                try:
-                    record = read_json_file(claimed_path)
-                    uploader.upload_message(record, base=base)
-                except PermanentUploadError as exc:
-                    dead_lettered += 1
-                    if record is None:
-                        target = dead_letter_queue_dir(base) / claimed_path.name
-                        target.parent.mkdir(parents=True, exist_ok=True)
-                        claimed_path.replace(target)
-                        continue
-                    dead_letter_record(base, record, claimed_path, exc)
-                except Exception as exc:  # noqa: BLE001 - hook uploader must preserve queue on any failure.
-                    failed += 1
-                    failed_record_names.add(claimed_path.name)
-                    if record is None:
-                        claimed_path.replace(pending_queue_dir(base) / claimed_path.name)
-                        continue
-                    record["last_upload_error"] = str(exc)
-                    record["last_upload_failed_at"] = now_iso()
-                    enqueue_record(base, record)
-                    claimed_path.unlink(missing_ok=True)
-                else:
-                    uploaded += 1
-                    claimed_path.unlink(missing_ok=True)
+        with ThreadPoolExecutor(max_workers=upload_worker_count()) as executor:
+            while True:
+                queue_paths = [path for path in pending_queue_paths(base) if path.name not in failed_record_names]
+                if not queue_paths:
+                    break
+                if uploader is None:
+                    uploader = IngestUploader.from_env()
+                claimed_paths = [
+                    claimed
+                    for path in queue_paths
+                    if (claimed := claim_queue_path(path, base)) is not None
+                ]
+                for status, record_name in executor.map(
+                    lambda path: upload_claimed_record(path, uploader=uploader, base=base),
+                    claimed_paths,
+                ):
+                    if status == "uploaded":
+                        uploaded += 1
+                    elif status == "dead_lettered":
+                        dead_lettered += 1
+                    else:
+                        failed += 1
+                        failed_record_names.add(record_name)
         return {
             "uploaded": uploaded,
             "failed": failed,
             "dead_lettered": dead_lettered,
             "remaining": len(pending_queue_paths(base)),
         }
+
+
+def upload_worker_count() -> int:
+    try:
+        return min(32, max(1, int(os.environ.get(UPLOAD_WORKERS_ENV, "4"))))
+    except ValueError:
+        return 4
+
+
+def upload_claimed_record(
+    claimed_path: Path,
+    *,
+    uploader: "IngestUploader",
+    base: Path,
+) -> tuple[str, str]:
+    record: JsonDict | None = None
+    try:
+        record = read_json_file(claimed_path)
+        uploader.upload_message(record, base=base)
+    except PermanentUploadError as exc:
+        if record is None:
+            target = dead_letter_queue_dir(base) / claimed_path.name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            claimed_path.replace(target)
+        else:
+            dead_letter_record(base, record, claimed_path, exc)
+        return "dead_lettered", claimed_path.name
+    except Exception as exc:  # noqa: BLE001 - uploader must preserve queue on any failure.
+        if record is None:
+            claimed_path.replace(pending_queue_dir(base) / claimed_path.name)
+        else:
+            record["last_upload_error"] = str(exc)
+            record["last_upload_failed_at"] = now_iso()
+            enqueue_record(base, record)
+            claimed_path.unlink(missing_ok=True)
+        return "failed", claimed_path.name
+    claimed_path.unlink(missing_ok=True)
+    return "uploaded", claimed_path.name
 
 
 def dead_letter_record(base: Path, record: JsonDict, source_path: Path, exc: Exception) -> None:

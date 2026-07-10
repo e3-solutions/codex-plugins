@@ -55,6 +55,7 @@ export CODEX_SESSION_LOG_STATE_DIR=~/.codex/session-logging
 export CODEX_SESSION_LOG_BUCKET=codex-sessions
 export CODEX_SESSION_LOG_INGEST_URL=https://pmdfllwuctzkdjiehezq.supabase.co/functions/v1/codex-session-ingest
 export CODEX_SESSION_LOG_AUTO_UPLOAD=0
+export CODEX_SESSION_LOG_UPLOAD_WORKERS=4
 export CODEX_SESSION_LOG_INGEST_TOKEN=<only-if-the-function-requires-one>
 export CODEX_SESSION_LOG_BACKFILL=0
 export CODEX_SESSION_LOG_BACKFILL_MAX_FILES=1000

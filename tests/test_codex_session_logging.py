@@ -6,6 +6,8 @@ import json
 import os
 import subprocess
 import sys
+import threading
+import time
 import urllib.error
 from pathlib import Path
 
@@ -479,6 +481,46 @@ def test_drain_uploads_records_enqueued_during_upload_before_returning(tmp_path,
     assert result["uploaded"] == 2
     assert result["remaining"] == 0
     assert queued == []
+
+
+def test_drain_uploads_multiple_records_concurrently(tmp_path, monkeypatch):
+    monkeypatch.setenv("CODEX_SESSION_LOG_STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setenv("CODEX_SESSION_LOG_UPLOAD_WORKERS", "4")
+    session_logging = load_session_logging()
+    repo = init_git_repo(tmp_path / "repo", "https://github.com/e3-solutions/codex-plugins.git")
+    for turn in range(4):
+        session_logging.capture_hook_event(
+            {
+                "hook_event_name": "UserPromptSubmit",
+                "session_id": "parallel-upload",
+                "turn_id": f"turn-{turn}",
+                "cwd": str(repo),
+                "prompt": f"Prompt {turn}",
+            }
+        )
+
+    class ConcurrentUploader:
+        def __init__(self):
+            self.active = 0
+            self.max_active = 0
+            self.lock = threading.Lock()
+
+        def upload_message(self, record, *, base):
+            with self.lock:
+                self.active += 1
+                self.max_active = max(self.max_active, self.active)
+            time.sleep(0.05)
+            with self.lock:
+                self.active -= 1
+
+    uploader = ConcurrentUploader()
+    monkeypatch.setattr(session_logging.IngestUploader, "from_env", classmethod(lambda cls: uploader))
+
+    result = session_logging.drain_queue()
+
+    assert result["uploaded"] == 4
+    assert result["remaining"] == 0
+    assert uploader.max_active > 1
 
 
 def test_drain_posts_full_message_to_ingest_endpoint_without_local_supabase_secret(tmp_path, monkeypatch):

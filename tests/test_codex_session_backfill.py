@@ -128,6 +128,17 @@ def test_legacy_response_user_is_used_when_canonical_user_event_is_absent():
     )
 
 
+def test_historical_sequences_do_not_collide_across_resumed_transcript_files(tmp_path):
+    backfill = load_backfill()
+
+    first = backfill.historical_sequence(tmp_path / "rollout-a.jsonl", 42)
+    second = backfill.historical_sequence(tmp_path / "rollout-b.jsonl", 42)
+
+    assert first < 0
+    assert second < 0
+    assert first != second
+
+
 def test_backfill_skips_non_e3_transcripts_without_queuing_content(tmp_path, monkeypatch):
     monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex"))
     monkeypatch.setenv("CODEX_SESSION_LOG_STATE_DIR", str(tmp_path / "state"))
