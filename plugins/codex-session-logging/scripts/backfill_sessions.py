@@ -112,6 +112,7 @@ def run_backfill(*, dry_run: bool = False, force: bool = False, max_files: int =
             return {"version": BACKFILL_VERSION, "status": "already_running"}
 
         state = read_state(base)
+        previous_completed_at = string_value(state.get("completed_at"))
         files = state.setdefault("files", {})
         totals = {"discovered": 0, "processed": 0, "queued": 0, "skipped_non_e3": 0, "failed": 0}
         paths = transcript_paths()
@@ -185,8 +186,9 @@ def run_backfill(*, dry_run: bool = False, force: bool = False, max_files: int =
                 1 for value in files.values() if isinstance(value, dict) and value.get("status") == "failed"
             ),
         }
-        state["status"] = "complete" if remaining == 0 else "partial"
-        state["completed_at"] = now_iso() if remaining == 0 else None
+        scan_complete = remaining == 0
+        state["status"] = "complete" if dry_run and scan_complete else "partial"
+        state["completed_at"] = now_iso() if dry_run and scan_complete else None
         state["updated_at"] = now_iso()
         state["totals"] = aggregate_totals
         state["remaining_files"] = remaining
@@ -209,9 +211,16 @@ def run_backfill(*, dry_run: bool = False, force: bool = False, max_files: int =
                     int(drain_result.get(key, 0)) > 0
                     for key in ("failed", "dead_lettered", "historical_dead_lettered", "remaining")
                 ) or bool(drain_result.get("locked"))
-                if drain_problem:
+                if drain_problem or not scan_complete:
                     state["status"] = "partial"
                     state["completed_at"] = None
+                else:
+                    state["status"] = "complete"
+                    state["completed_at"] = (
+                        previous_completed_at
+                        if totals["processed"] == 0 and previous_completed_at
+                        else now_iso()
+                    )
                 state["updated_at"] = now_iso()
                 write_json_atomic(state_path(base), state)
                 if reporting_remote:

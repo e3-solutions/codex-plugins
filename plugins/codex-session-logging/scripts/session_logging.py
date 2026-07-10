@@ -772,6 +772,7 @@ def upload_claimed_record(
             enqueue_record(base, record)
             claimed_path.unlink(missing_ok=True)
         return "failed", claimed_path.name
+    (dead_letter_queue_dir(base) / claimed_path.name).unlink(missing_ok=True)
     claimed_path.unlink(missing_ok=True)
     return "uploaded", claimed_path.name
 

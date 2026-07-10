@@ -695,6 +695,39 @@ def test_drain_dead_letters_permanent_ingest_rejection(tmp_path, monkeypatch):
     assert "client.repo_remote" in dead_lettered["last_upload_error"]
 
 
+def test_successful_retry_removes_matching_stale_dead_letter(tmp_path, monkeypatch):
+    monkeypatch.setenv("CODEX_SESSION_LOG_STATE_DIR", str(tmp_path / "state"))
+    session_logging = load_session_logging()
+    repo = init_git_repo(tmp_path / "repo", "https://github.com/e3-solutions/codex-plugins.git")
+    captured = session_logging.capture_hook_event(
+        {
+            "hook_event_name": "UserPromptSubmit",
+            "session_id": "session-retry",
+            "cwd": str(repo),
+            "prompt": "Retry this record.",
+        }
+    )
+    pending_path = tmp_path / "state" / "queue" / "pending" / f"{captured['id']}.json"
+    dead_letter_path = tmp_path / "state" / "queue" / "dead-letter" / pending_path.name
+    dead_letter_path.parent.mkdir(parents=True)
+    dead_letter_path.write_text(pending_path.read_text(encoding="utf-8"), encoding="utf-8")
+
+    class SuccessfulUploader:
+        def upload_message(self, record, *, base):
+            return None
+
+    monkeypatch.setattr(
+        session_logging.IngestUploader,
+        "from_env",
+        classmethod(lambda cls: SuccessfulUploader()),
+    )
+
+    result = session_logging.drain_queue()
+
+    assert result["uploaded"] == 1
+    assert not dead_letter_path.exists()
+
+
 def test_drain_dead_letters_record_missing_repo_context_without_network(tmp_path, monkeypatch):
     monkeypatch.setenv("CODEX_SESSION_LOG_STATE_DIR", str(tmp_path / "state"))
     monkeypatch.setenv("CODEX_SESSION_LOG_INGEST_URL", "https://logs.example.test/ingest")

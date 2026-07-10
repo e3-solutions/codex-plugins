@@ -196,9 +196,11 @@ def test_locked_drain_is_reconciled_before_reporting_complete(tmp_path, monkeypa
     backfill = load_backfill()
     drain_calls = []
     reports = []
+    pre_drain_states = []
 
     def fake_drain():
         drain_calls.append(True)
+        pre_drain_states.append(backfill.read_state(tmp_path / "state"))
         if len(drain_calls) == 1:
             return {"uploaded": 0, "failed": 0, "dead_lettered": 0, "remaining": 0, "locked": True}
         for path in (tmp_path / "state" / "queue" / "pending").glob("*.json"):
@@ -212,8 +214,11 @@ def test_locked_drain_is_reconciled_before_reporting_complete(tmp_path, monkeypa
     result = backfill.run_backfill(max_files=10)
 
     assert len(drain_calls) == 2
+    assert all(state["status"] == "partial" for state in pre_drain_states)
+    assert all(state["completed_at"] is None for state in pre_drain_states)
     assert result["status"] == "complete"
     assert reports[0]["status"] == "complete"
+    assert reports[0]["completed_at"] is not None
 
 
 def test_backfill_skips_non_e3_transcripts_without_queuing_content(tmp_path, monkeypatch):
