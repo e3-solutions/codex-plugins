@@ -1,6 +1,6 @@
 {
   "name": "codex-session-logging",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Capture and backfill Codex sessions into user-owned Supabase session history.",
   "author": {
     "name": "Core Edge Solution"

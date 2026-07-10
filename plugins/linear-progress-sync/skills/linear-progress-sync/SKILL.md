@@ -79,7 +79,7 @@ This repository is a Codex plugin marketplace, not a single plugin source. Do no
 
 Installed plugin caches check for updates on every SessionStart. The updater downloads the current `main.zip` archive, reads the plugin manifest from that archive, syncs coreedge-local marketplace plugins marked `INSTALLED_BY_DEFAULT`, and removes legacy global copies of native plugin hooks. Disable this with:
 
-For existing `0.2.9` installations, the first SessionStart installs `0.2.10`; the following SessionStart runs the updated session logger and starts its resumable historical backfill. Fresh setup installs the current plugins immediately.
+Existing installations before `0.2.11` install `0.2.11` on the next SessionStart; the following SessionStart runs the updated session logger and starts its resumable historical backfill. Fresh setup installs the current plugins immediately.
 
 ```bash
 LINEAR_SYNC_AUTO_UPDATE=0
@@ -88,7 +88,7 @@ LINEAR_SYNC_AUTO_UPDATE=0
 Force a manual update check when needed:
 
 ```bash
-python3 ~/.codex/plugins/cache/coreedge-local/linear-progress-sync/0.2.10/scripts/update_plugin.py --force
+python3 ~/.codex/plugins/cache/coreedge-local/linear-progress-sync/0.2.11/scripts/update_plugin.py --force
 ```
 
 If Codex asks to review hooks after setup, trust the Linear Progress Sync and Codex Session Logging hooks once. Automatic kickoff and session capture depend on those hooks running.

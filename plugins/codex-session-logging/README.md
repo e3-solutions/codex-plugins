@@ -12,7 +12,7 @@ Each runtime `session_id` is retained for event correlation. When Codex provides
 
 ## Historical backfill
 
-Version 0.2.0 adds a resumable background importer for existing transcripts under `$CODEX_HOME/sessions` (normally `~/.codex/sessions`). `SessionStart` launches the importer without delaying Codex startup. It reads the repository URL recorded in each transcript, accepts only `e3-solutions` repositories, queues deterministic message records through the same ingest endpoint, and checkpoints progress under `~/.codex/session-logging/backfills/v1`.
+Version 0.2.1 adds a resumable background importer for existing transcripts under `$CODEX_HOME/sessions` (normally `~/.codex/sessions`). `SessionStart` launches the importer without delaying Codex startup. It reads the repository URL recorded in each transcript, accepts only `e3-solutions` repositories, queues deterministic message records through the same ingest endpoint, and checkpoints progress under `~/.codex/session-logging/backfills/v1`.
 
 Newer transcripts use canonical user-message events and final assistant answers so duplicated user envelopes and intermediate commentary are not imported. Older transcript formats fall back to user and assistant response messages. The importer also stores the final cumulative token-usage snapshot for each session in `codex_session_usage`, including input, cached-input, output, reasoning-output, and total tokens. Historical records retain their original timestamps and use deterministic IDs, making repeated and interrupted runs safe.
 
