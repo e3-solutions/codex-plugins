@@ -70,6 +70,16 @@ To force a manual update check:
 python3 ~/.codex/plugins/cache/coreedge-local/linear-progress-sync/0.2.11/scripts/update_plugin.py --force
 ```
 
+## Direct Session Export
+
+When an analyst needs the original local transcripts immediately, bypass the Supabase queue and create a shareable ZIP of verified `e3-solutions` Codex and Claude sessions:
+
+```bash
+python3 scripts/export_e3_sessions.py
+```
+
+Credential-like values are redacted by default. See [the session export guide](docs/session-export.md) for destination, preview, and trusted raw-export options.
+
 ## Rolling Out Updates
 
 Teammates install this repository once with `setup.py`. After that, they should not need to reinstall from the marketplace for normal plugin, skill, command, hook, or extension updates.
