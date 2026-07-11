@@ -24,3 +24,36 @@ python3 scripts/export_e3_sessions.py --raw --output ~/Desktop/e3-sessions-raw.z
 ```
 
 The exporter never contacts Supabase or any other network service. Sessions that cannot be verified as belonging to `e3-solutions` are omitted instead of risking unrelated personal data.
+
+## Import archives for Supabase MCP queries
+
+The archive importer writes every JSONL line into queryable Postgres rows. It requires an authenticated Supabase CLI profile that can retrieve the project's service-role key; the key is held in memory and never printed.
+
+```bash
+python3 scripts/import_session_archives.py \
+  --project-ref pmdfllwuctzkdjiehezq \
+  --archive 'USER_UUID=/absolute/path/to/export.zip'
+```
+
+Repeat `--archive` to import multiple owners in one run. Imports use deterministic UUIDs and Postgres upserts, so retrying the same archive is safe.
+
+The MCP-queryable tables are:
+
+- `ai_session_imports`: archive status, owner, manifest, and aggregate counts.
+- `ai_session_transcripts`: one row per Codex or Claude JSONL transcript.
+- `ai_session_records`: one row per source line with the complete JSON object in `payload`, plus searchable platform, type, subtype, timestamp, role, tool name, and excerpt fields.
+
+Malformed JSON and PostgreSQL-incompatible `U+0000` values are preserved exactly in `raw_text` with `parse_error` instead of being dropped. Example MCP SQL:
+
+```sql
+select platform, record_type, record_subtype, count(*)
+from public.ai_session_records
+where user_id = 'USER_UUID'
+group by platform, record_type, record_subtype
+order by count(*) desc;
+
+select occurred_at, role, tool_name, content_excerpt, payload
+from public.ai_session_records
+where transcript_id = 'TRANSCRIPT_UUID'
+order by seq;
+```

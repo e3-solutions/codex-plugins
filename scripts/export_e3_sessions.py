@@ -33,6 +33,10 @@ SECRET_PATTERNS = (
     ),
     re.compile(r"(?i)(\b(?:postgres(?:ql)?|mysql)://[^:\s/]+:)([^@\s/]+)(@)"),
 )
+PRIVATE_KEY_PATTERN = re.compile(
+    r"-----BEGIN [^-\r\n]*PRIVATE KEY-----.*?-----END [^-\r\n]*PRIVATE KEY-----",
+    flags=re.DOTALL,
+)
 
 
 @dataclass(frozen=True)
@@ -354,20 +358,15 @@ def write_session_file(
                 byte_count += len(chunk)
         return {"sha256": digest.hexdigest(), "bytes": byte_count, "redactions": 0}
 
-    in_private_key = False
     with source.open(encoding="utf-8", errors="replace") as handle, archive.open(archive_path, "w") as target:
         for line in handle:
-            if "-----BEGIN " in line and "PRIVATE KEY-----" in line:
-                in_private_key = True
-                rendered = REDACTED + "\n"
-                count = 1
-            elif in_private_key:
-                count = 1
-                if "-----END " in line and "PRIVATE KEY-----" in line:
-                    in_private_key = False
-                rendered = ""
-            else:
+            try:
+                parsed = json.loads(line)
+            except json.JSONDecodeError:
                 rendered, count = redact_text(line)
+            else:
+                redacted_value, count = redact_json_value(parsed)
+                rendered = json.dumps(redacted_value, ensure_ascii=False, separators=(",", ":")) + "\n"
             data = rendered.encode("utf-8")
             target.write(data)
             digest.update(data)
@@ -377,8 +376,7 @@ def write_session_file(
 
 
 def redact_text(text: str) -> tuple[str, int]:
-    result = text
-    count = 0
+    result, count = PRIVATE_KEY_PATTERN.subn(REDACTED, text)
     for pattern in SECRET_PATTERNS:
         if pattern.groups == 3:
             result, replaced = pattern.subn(rf"\1{REDACTED}\3", result)
@@ -388,6 +386,28 @@ def redact_text(text: str) -> tuple[str, int]:
             result, replaced = pattern.subn(REDACTED, result)
         count += replaced
     return result, count
+
+
+def redact_json_value(value: Any) -> tuple[Any, int]:
+    if isinstance(value, str):
+        return redact_text(value)
+    if isinstance(value, list):
+        output: list[Any] = []
+        count = 0
+        for item in value:
+            rendered, replacements = redact_json_value(item)
+            output.append(rendered)
+            count += replacements
+        return output, count
+    if isinstance(value, dict):
+        output: dict[str, Any] = {}
+        count = 0
+        for key, item in value.items():
+            rendered, replacements = redact_json_value(item)
+            output[key] = rendered
+            count += replacements
+        return output, count
+    return value, 0
 
 
 def manifest_entry(item: SessionFile) -> dict[str, Any]:

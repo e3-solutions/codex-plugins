@@ -173,3 +173,35 @@ def test_export_refuses_to_overwrite_existing_archive(tmp_path):
 
     assert output.read_bytes() == b"keep me"
     assert not list(tmp_path.glob("*.partial"))
+
+
+def test_redacted_export_keeps_jsonl_valid_for_private_keys_and_escaped_quotes(tmp_path):
+    exporter = load_exporter()
+    codex_home = tmp_path / "codex"
+    source = codex_home / "sessions" / "secrets.jsonl"
+    private_key = "-----BEGIN PRIVATE KEY-----\nabc123\n-----END PRIVATE KEY-----"
+    write_jsonl(
+        source,
+        codex_rows(
+            session_id="secrets",
+            remote="https://github.com/e3-solutions/repo.git",
+            secret=f'password=value-before-escaped-quote\\" tail {private_key}',
+        ),
+    )
+    output = tmp_path / "redacted.zip"
+
+    exporter.export_sessions(
+        codex_home=codex_home,
+        claude_home=tmp_path / "claude",
+        output=output,
+    )
+
+    with zipfile.ZipFile(output) as archive:
+        manifest_name = next(name for name in archive.namelist() if name.endswith("/manifest.json"))
+        manifest = json.loads(archive.read(manifest_name))
+        lines = archive.read(manifest["sessions"][0]["archive_path"]).decode().splitlines()
+    parsed = [json.loads(line) for line in lines]
+    rendered = json.dumps(parsed)
+    assert "abc123" not in rendered
+    assert "value-before-escaped-quote" not in rendered
+    assert rendered.count("[REDACTED]") >= 2

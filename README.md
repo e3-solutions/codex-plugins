@@ -80,6 +80,8 @@ python3 scripts/export_e3_sessions.py
 
 Credential-like values are redacted by default. See [the session export guide](docs/session-export.md) for destination, preview, and trusted raw-export options.
 
+The same guide documents the idempotent archive importer and the `ai_session_imports`, `ai_session_transcripts`, and `ai_session_records` tables used for direct Supabase MCP analysis.
+
 ## Rolling Out Updates
 
 Teammates install this repository once with `setup.py`. After that, they should not need to reinstall from the marketplace for normal plugin, skill, command, hook, or extension updates.
