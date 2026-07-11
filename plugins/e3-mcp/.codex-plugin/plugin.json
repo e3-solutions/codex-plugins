@@ -1,0 +1,35 @@
+{
+  "name": "e3-mcp",
+  "version": "0.1.0",
+  "description": "Connect Codex to E3's unified gateway for meetings, chat, Linear, GitHub, CRM, email, and coding-agent usage.",
+  "author": {
+    "name": "Core Edge Solution"
+  },
+  "homepage": "https://e3-mcp-production.up.railway.app/",
+  "repository": "https://github.com/e3-solutions/codex-plugins",
+  "keywords": [
+    "e3",
+    "mcp",
+    "knowledge",
+    "meetings",
+    "linear"
+  ],
+  "mcpServers": "./.mcp.json",
+  "interface": {
+    "displayName": "E3 MCP",
+    "shortDescription": "Query E3 knowledge through one secure gateway.",
+    "longDescription": "E3 MCP connects Codex to the Core Edge organization's unified, access-controlled gateway for meetings, chat, calendars, Linear, GitHub, Salesforce, email, and coding-agent usage.",
+    "developerName": "Core Edge Solution",
+    "category": "Productivity",
+    "capabilities": [
+      "Read"
+    ],
+    "websiteURL": "https://e3-mcp-production.up.railway.app/",
+    "defaultPrompt": [
+      "Call E3 MCP documentation and show what I can access.",
+      "Find recent meetings and related Linear work.",
+      "Summarize our current engineering activity."
+    ],
+    "brandColor": "#0EA5E9"
+  }
+}

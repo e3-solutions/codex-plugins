@@ -6,7 +6,7 @@ Local Codex plugin for Linear-first development in `e3-solutions` repos. Codex s
 
 This repository is a Codex plugin marketplace, not a single plugin source. Do not install the GitHub URL or repository root directly with `codex plugin add`.
 
-Agents installing this for a teammate must clone the repo and run `setup.py`, because setup registers the marketplace, installs both required plugins, removes legacy duplicate global hooks, and registers Linear MCP.
+Agents installing this for a teammate must clone the repo and run `setup.py`, because setup registers the marketplace, installs all default plugins, removes legacy duplicate global hooks, and registers Linear MCP.
 
 Current behavior:
 
@@ -27,9 +27,11 @@ python3 plugins/linear-progress-sync/scripts/setup.py
 codex mcp login linear
 ```
 
-Then restart Codex or start a new Codex thread. If Codex asks to review hooks, trust the Linear Progress Sync and Codex Session Logging hooks once.
+Set `E3_MCP_ACCESS_CODE` in the environment that launches Codex, then restart Codex or start a new Codex thread. If Codex asks to review hooks, trust the Linear Progress Sync and Codex Session Logging hooks once.
 
-`setup.py` checks GitHub CLI auth, installs Linear Progress Sync and Codex Session Logging, removes legacy Core Edge hook copies from `~/.codex/hooks.json`, and registers Linear MCP. It does not log you in to Linear, so `codex mcp login linear` is still required.
+`setup.py` checks GitHub CLI auth, installs Linear Progress Sync, Codex Session Logging, and E3 MCP, removes legacy Core Edge hook copies from `~/.codex/hooks.json`, and registers Linear MCP. It does not log you in to Linear, so `codex mcp login linear` is still required.
+
+E3 MCP reads its bearer access code from `E3_MCP_ACCESS_CODE`; the access code is never stored in this repository. Obtain an `e3_...` code from an E3 MCP administrator or the [gateway console](https://e3-mcp-production.up.railway.app/). For the macOS desktop app, expose an already-set variable to the launch environment with `launchctl setenv E3_MCP_ACCESS_CODE "$E3_MCP_ACCESS_CODE"`, then fully restart Codex. See [plugins/e3-mcp/README.md](plugins/e3-mcp/README.md) for details.
 
 Preview setup without changing Codex config:
 
@@ -62,12 +64,12 @@ After kickoff, Codex writes and standard Codex commits are synced back to the ac
 
 Installed plugin caches check for updates during every `SessionStart`. The updater downloads the current `main.zip` archive, reads the plugin manifest from that archive, installs newer bootstrap versions into `~/.codex/plugins/cache/coreedge-local/linear-progress-sync/<version>/`, syncs coreedge-local marketplace plugins marked `INSTALLED_BY_DEFAULT`, and removes legacy global copies of native plugin hooks. Set `LINEAR_SYNC_AUTO_UPDATE=0` to disable automatic checks.
 
-Existing installations before `0.2.11` install `0.2.11` on the next SessionStart; the following SessionStart runs the updated session logger and starts its resumable historical backfill. Fresh setup installs the current plugins immediately.
+Existing installations before `0.2.12` install `0.2.12` and sync E3 MCP on the next SessionStart. Fresh setup installs the current plugins immediately.
 
 To force a manual update check:
 
 ```bash
-python3 ~/.codex/plugins/cache/coreedge-local/linear-progress-sync/0.2.11/scripts/update_plugin.py --force
+python3 ~/.codex/plugins/cache/coreedge-local/linear-progress-sync/0.2.12/scripts/update_plugin.py --force
 ```
 
 ## Rolling Out Updates

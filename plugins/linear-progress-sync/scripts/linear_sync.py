@@ -1116,6 +1116,7 @@ def setup_plan(
         shlex.join(["codex", "plugin", "marketplace", "add", str(plugin_root)]),
         shlex.join(["codex", "plugin", "add", "linear-progress-sync@coreedge-local"]),
         shlex.join(["codex", "plugin", "add", "codex-session-logging@coreedge-local"]),
+        shlex.join(["codex", "plugin", "add", "e3-mcp@coreedge-local"]),
         shlex.join(
             [
                 sys.executable,
@@ -1137,6 +1138,7 @@ def setup_plan(
         "optional_git_hook": with_git_hook,
         "notes": [
             "Default setup is user-level: plugin marketplace, plugin install, legacy global hook cleanup, GitHub auth check, and Linear MCP registration.",
+            "E3 MCP authentication is read from E3_MCP_ACCESS_CODE; set it in the environment that launches Codex, then restart Codex.",
             "GitHub auth is a manual prerequisite: run gh auth login when needed.",
             "Linear auth is manual after setup registers the MCP server: run codex mcp login linear after setup when needed.",
             "If Codex asks to review hooks, trust the Linear Progress Sync and Codex Session Logging hooks once so kickoff and session capture can run.",

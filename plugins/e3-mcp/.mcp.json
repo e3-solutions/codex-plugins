@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "e3-mcp": {
+      "type": "http",
+      "url": "https://e3-mcp-production.up.railway.app/mcp",
+      "bearer_token_env_var": "E3_MCP_ACCESS_CODE",
+      "startup_timeout_sec": 20,
+      "tool_timeout_sec": 120
+    }
+  }
+}
