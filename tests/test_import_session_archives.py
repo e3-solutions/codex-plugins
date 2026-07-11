@@ -120,3 +120,23 @@ def test_json_with_postgres_unsupported_nul_is_preserved_as_raw_text():
     assert row["payload"] is None
     assert "\\u0000" in row["raw_text"]
     assert "U+0000" in row["parse_error"]
+
+
+def test_canonical_analysis_views_are_security_invoker_and_cover_core_shapes():
+    migration = (
+        ROOT
+        / "plugins/codex-session-logging/supabase/migrations/20260711002854_canonical_session_analysis_views.sql"
+    ).read_text(encoding="utf-8")
+
+    for view in (
+        "session_analysis_sessions",
+        "session_analysis_messages",
+        "session_analysis_tool_events",
+        "session_analysis_usage",
+        "session_analysis_models",
+    ):
+        assert f"create view public.{view}" in migration
+        assert f"grant select on public.{view} to authenticated, service_role" in migration
+    assert migration.count("with (security_invoker = true)") == 5
+    assert "usage_rank = 1" in migration
+    assert "not exists (" in migration

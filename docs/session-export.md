@@ -57,3 +57,28 @@ from public.ai_session_records
 where transcript_id = 'TRANSCRIPT_UUID'
 order by seq;
 ```
+
+## Unified live and archive analysis
+
+Use the canonical read-only views instead of manually unioning live tables with archive imports:
+
+- `session_analysis_sessions`
+- `session_analysis_messages`
+- `session_analysis_tool_events`
+- `session_analysis_usage`
+- `session_analysis_models`
+
+Every view exposes `source` (`live` or `archive`) and `platform` (`codex` or `claude`). Message and tool views also expose `has_live_session`; use `is_canonical` on messages to exclude duplicate Codex message representations.
+
+`session_analysis_usage` is already deduplicated: it prefers the typed live Codex usage row, otherwise selects the final cumulative Codex token snapshot, and sums per-response Claude usage for each transcript.
+
+```sql
+select platform, model, count(*) as sessions
+from public.session_analysis_models
+group by platform, model
+order by sessions desc;
+
+select platform, sum(total_tokens) as total_tokens
+from public.session_analysis_usage
+group by platform;
+```
