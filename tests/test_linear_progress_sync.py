@@ -1882,10 +1882,12 @@ def test_setup_plan_is_global_by_default_and_does_not_install_repo_hook(tmp_path
     assert "codex plugin marketplace add" in commands
     assert "codex plugin add linear-progress-sync@coreedge-local" in commands
     assert "codex plugin add codex-session-logging@coreedge-local" in commands
+    assert "codex plugin add e3-mcp@coreedge-local" in commands
     assert "install_codex_hooks.py" in commands
     assert "codex mcp add linear --url https://mcp.linear.app/mcp" in commands
     assert "codex mcp login linear" not in commands
     assert "codex mcp login linear after setup" in notes
+    assert "E3_MCP_ACCESS_CODE" in notes
     assert "review hooks" in notes
     assert "Codex Session Logging hooks" in notes
     assert "First use lists Linear users" in notes
@@ -1936,6 +1938,8 @@ def test_setup_summary_prints_team_next_steps(capsys):
     output = capsys.readouterr().out
 
     assert "Run: codex mcp login linear" in output
+    assert "Set E3_MCP_ACCESS_CODE" in output
+    assert "access codes are never stored in this repository" in output
     assert "trust the Linear Progress Sync and Codex Session Logging hooks once" in output
     assert "list Linear users/projects" in output
     assert "--disable-linear-sync" in output
@@ -2352,8 +2356,8 @@ def test_readmes_register_linear_mcp_before_linear_login():
         assert "trust the Linear Progress Sync and Codex Session Logging hooks once" in text
         assert "saves it in `~/.codex/linear-sync/repos.json`" in text
         assert "update_plugin.py --force" in text
-        assert "install `0.2.11` on the next SessionStart" in text
-        assert "following SessionStart" in text
+        assert "install `0.2.12` and sync E3 MCP on the next SessionStart" in text
+        assert "E3_MCP_ACCESS_CODE" in text
         assert "LINEAR_SYNC_AUTO_UPDATE=0" in text
         assert "not a single plugin source" in text
         assert "Do not install the GitHub URL or repository root directly with `codex plugin add`" in text
@@ -2374,6 +2378,23 @@ def test_agent_install_contract_and_marketplace_defaults_are_explicit():
     }
     assert policies["linear-progress-sync"] == "INSTALLED_BY_DEFAULT"
     assert policies["codex-session-logging"] == "INSTALLED_BY_DEFAULT"
+    assert policies["e3-mcp"] == "INSTALLED_BY_DEFAULT"
+
+
+def test_e3_mcp_plugin_packages_remote_server_without_a_secret():
+    plugin_root = ROOT / "plugins/e3-mcp"
+    manifest = json.loads((plugin_root / ".codex-plugin/plugin.json").read_text(encoding="utf-8"))
+    mcp_config = json.loads((plugin_root / ".mcp.json").read_text(encoding="utf-8"))
+    server = mcp_config["mcpServers"]["e3-mcp"]
+
+    assert manifest["name"] == "e3-mcp"
+    assert manifest["mcpServers"] == "./.mcp.json"
+    assert manifest["interface"]["capabilities"] == ["Read"]
+    assert server["type"] == "http"
+    assert server["url"] == "https://e3-mcp-production.up.railway.app/mcp"
+    assert server["bearer_token_env_var"] == "E3_MCP_ACCESS_CODE"
+    assert "http_headers" not in server
+    assert "e3_" not in json.dumps(mcp_config)
 
 
 def test_setup_run_step_does_not_treat_auth_failure_as_idempotent_success(monkeypatch):
