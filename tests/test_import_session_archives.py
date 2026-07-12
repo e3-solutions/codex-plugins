@@ -168,3 +168,33 @@ def test_canonical_analysis_views_are_security_invoker_and_cover_core_shapes():
     assert migration.count("with (security_invoker = true)") == 5
     assert "usage_rank = 1" in migration
     assert "not exists (" in migration
+
+
+def test_project_analysis_views_are_searchable_and_security_invoker():
+    migration = (
+        ROOT
+        / "plugins/codex-session-logging/supabase/migrations/20260712195308_project_analysis_views.sql"
+    ).read_text(encoding="utf-8")
+
+    for view in (
+        "session_analysis_project_sessions",
+        "session_analysis_projects",
+        "session_analysis_project_messages",
+        "session_analysis_project_tool_events",
+        "session_analysis_project_usage",
+        "session_analysis_project_models",
+    ):
+        assert f"create view public.{view}" in migration
+        assert f"grant select on public.{view} to authenticated, service_role" in migration
+    assert migration.count("with (security_invoker = true)") == 6
+    assert "coalesce(normalized_project_key, 'unmapped')" in migration
+    assert "codex_sessions_repo_user_idx" in migration
+    assert "ai_session_transcripts_repo_user_idx" in migration
+
+    optimization = (
+        ROOT
+        / "plugins/codex-session-logging/supabase/migrations/20260712195543_optimize_project_search.sql"
+    ).read_text(encoding="utf-8")
+    assert "codex_sessions_project_user_idx" in optimization
+    assert "ai_session_transcripts_project_user_idx" in optimization
+    assert "lower(" in optimization

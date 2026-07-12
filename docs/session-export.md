@@ -68,6 +68,15 @@ Use the canonical read-only views instead of manually unioning live tables with 
 - `session_analysis_usage`
 - `session_analysis_models`
 
+For project-grouped searches, use:
+
+- `session_analysis_projects` for one summary row per repository
+- `session_analysis_project_sessions` for session lookup by `project_key`
+- `session_analysis_project_messages` and `session_analysis_project_tool_events` for transcript search
+- `session_analysis_project_usage` and `session_analysis_project_models` for token and model analysis
+
+GitHub HTTPS and SSH remotes are normalized to a lowercase `owner/repository` `project_key`, such as `e3-solutions/codex-plugins`. Sessions whose original transcript has no repository metadata remain searchable under the `unmapped` project instead of being dropped.
+
 Every view exposes `source` (`live` or `archive`) and `platform` (`codex` or `claude`). Message and tool views also expose `has_live_session`; use `is_canonical` on messages to exclude duplicate Codex message representations.
 
 `session_analysis_usage` is already deduplicated: it prefers the typed live Codex usage row, otherwise selects the final cumulative Codex token snapshot, and sums per-response Claude usage for each transcript.
@@ -81,4 +90,14 @@ order by sessions desc;
 select platform, sum(total_tokens) as total_tokens
 from public.session_analysis_usage
 group by platform;
+
+select project_key, session_count, user_count, last_activity_at
+from public.session_analysis_projects
+order by last_activity_at desc;
+
+select occurred_at, role, content
+from public.session_analysis_project_messages
+where project_key = 'e3-solutions/codex-plugins'
+  and content ilike '%backfill%'
+order by occurred_at;
 ```
