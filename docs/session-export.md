@@ -43,7 +43,7 @@ The MCP-queryable tables are:
 - `ai_session_transcripts`: one row per Codex or Claude JSONL transcript.
 - `ai_session_records`: one row per source line with the complete JSON object in `payload`, plus searchable platform, type, subtype, timestamp, role, tool name, and excerpt fields.
 
-Malformed JSON and PostgreSQL-incompatible `U+0000` values are preserved exactly in `raw_text` with `parse_error` instead of being dropped. Example MCP SQL:
+Malformed JSON, PostgreSQL-incompatible `U+0000` values, and individual records larger than 500 KB are preserved exactly in `raw_text` with `parse_error` instead of being dropped. Oversized records still retain locally extracted type, subtype, timestamp, role, tool, and excerpt fields. Example MCP SQL:
 
 ```sql
 select platform, record_type, record_subtype, count(*)

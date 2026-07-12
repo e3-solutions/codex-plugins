@@ -27,6 +27,7 @@ DEFAULT_BATCH_BYTES = 1_500_000
 DEFAULT_BATCH_ROWS = 750
 DEFAULT_WORKERS = 4
 MAX_EXCERPT_CHARS = 4_000
+MAX_JSONB_RECORD_BYTES = 500_000
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -396,6 +397,7 @@ def archive_record_row(
 ) -> JsonObject:
     decoded = raw_line.decode("utf-8", errors="replace").rstrip("\r\n")
     payload: JsonObject | None
+    searchable_payload: JsonObject | None = None
     raw_text: str | None
     parse_error: str | None
     try:
@@ -404,16 +406,24 @@ def archive_record_row(
             raise ValueError("record must be a JSON object")
         if contains_nul(loaded):
             raise ValueError("record contains U+0000 and is preserved as raw JSON text")
-        payload = loaded
-        raw_text = None
-        parse_error = None
+        searchable_payload = loaded
+        if len(raw_line) > MAX_JSONB_RECORD_BYTES:
+            payload = None
+            raw_text = decoded
+            parse_error = (
+                f"record exceeds {MAX_JSONB_RECORD_BYTES} bytes and is preserved as raw JSON text"
+            )
+        else:
+            payload = loaded
+            raw_text = None
+            parse_error = None
     except (json.JSONDecodeError, ValueError) as exc:
         payload = None
         raw_text = decoded
         parse_error = str(exc)[:500]
 
     record_type, record_subtype, occurred_at, role, tool_name, excerpt = searchable_fields(
-        payload,
+        searchable_payload,
         platform=platform,
     )
     return {

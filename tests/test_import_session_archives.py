@@ -122,6 +122,34 @@ def test_json_with_postgres_unsupported_nul_is_preserved_as_raw_text():
     assert "U+0000" in row["parse_error"]
 
 
+def test_oversized_json_is_raw_but_keeps_searchable_fields():
+    importer = load_importer()
+    source = {
+        "timestamp": "2026-07-10T12:34:56Z",
+        "type": "response_item",
+        "payload": {
+            "type": "function_call_output",
+            "call_id": "call-large",
+            "output": "x" * importer.MAX_JSONB_RECORD_BYTES,
+        },
+    }
+    row = importer.archive_record_row(
+        raw_line=json.dumps(source).encode(),
+        seq=4,
+        transcript_id="00000000-0000-0000-0000-000000000001",
+        import_id="00000000-0000-0000-0000-000000000002",
+        user_id="00000000-0000-0000-0000-000000000003",
+        platform="codex",
+        session_id="session-6",
+    )
+
+    assert row["record_type"] == "response_item"
+    assert row["record_subtype"] == "function_call_output"
+    assert row["payload"] is None
+    assert len(row["raw_text"]) > importer.MAX_JSONB_RECORD_BYTES
+    assert "exceeds" in row["parse_error"]
+
+
 def test_canonical_analysis_views_are_security_invoker_and_cover_core_shapes():
     migration = (
         ROOT
