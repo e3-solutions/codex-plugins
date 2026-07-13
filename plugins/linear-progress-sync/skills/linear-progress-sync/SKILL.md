@@ -77,9 +77,9 @@ codex mcp login linear
 
 This repository is a Codex plugin marketplace, not a single plugin source. Do not tell teammates or agents to run `codex plugin add` with the GitHub URL or repository root directly; that can skip marketplace registration, default plugin installation, legacy hook cleanup, and Linear MCP registration.
 
-Installed plugin caches check for updates on every SessionStart. The updater downloads the current `main.zip` archive, reads the plugin manifest from that archive, syncs coreedge-local marketplace plugins marked `INSTALLED_BY_DEFAULT`, and removes legacy global copies of native plugin hooks. Disable this with:
+Setup installs a resident updater under `~/.codex/coreedge`. On macOS it checks at login and every 30 minutes, validates and stages the current `main.zip`, atomically switches the managed marketplace, selects one cache version per default plugin, and retains rollback copies outside Codex's cache scan. SessionStart and PreToolUse self-heal a missing service. Disable network checks with:
 
-Existing installations before `0.2.11` install `0.2.11` on the next SessionStart; the following SessionStart runs the updated session logger and starts its resumable historical backfill. Fresh setup installs the current plugins immediately.
+Existing installations before `0.3.0` download `0.3.0` during ordinary Codex use and install the resident service on a following normal hook invocation. Do not ask teammates to run an update command, deliberately restart Codex, or create a renewal thread. Fresh setup installs and schedules the current plugins immediately.
 
 ```bash
 LINEAR_SYNC_AUTO_UPDATE=0
@@ -88,7 +88,13 @@ LINEAR_SYNC_AUTO_UPDATE=0
 Force a manual update check when needed:
 
 ```bash
-python3 ~/.codex/plugins/cache/coreedge-local/linear-progress-sync/0.2.11/scripts/update_plugin.py --force
+python3 ~/.codex/coreedge/runtime/current/update_plugin.py --force
+```
+
+Inspect updater health:
+
+```bash
+python3 ~/.codex/coreedge/runtime/current/update_plugin.py --doctor
 ```
 
 If Codex asks to review hooks after setup, trust the Linear Progress Sync and Codex Session Logging hooks once. Automatic kickoff and session capture depend on those hooks running.
@@ -102,7 +108,7 @@ To roll out a new default plugin, skill, command, hook, or extension after teamm
 5. Bump `plugins/linear-progress-sync/.codex-plugin/plugin.json` and `plugins/linear-progress-sync/update-manifest.json`.
 6. Merge to `main`.
 
-Do not tell teammates to reinstall from the marketplace for normal default plugin updates. They get newer default plugins on the next new Codex thread or session through the installed SessionStart hook.
+Do not tell teammates to reinstall, run an update command, or create a renewal thread for normal default plugin updates. The resident service activates them; a later normal task naturally reloads changed skill text.
 
 Authenticate Linear after setup registers the MCP server when needed:
 

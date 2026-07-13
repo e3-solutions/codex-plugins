@@ -474,11 +474,45 @@ def update_lock_path(state_path: Path) -> Path:
     return state_path.with_suffix(state_path.suffix + ".lock")
 
 
+def process_is_running(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
 def acquire_lock(lock_path: Path) -> int:
     lock_path.parent.mkdir(parents=True, exist_ok=True)
-    fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
-    os.write(fd, str(os.getpid()).encode("utf-8"))
-    return fd
+    for attempt in range(2):
+        try:
+            fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+        except FileExistsError:
+            try:
+                raw_pid = lock_path.read_text(encoding="utf-8").strip()
+                pid = int(raw_pid)
+            except (FileNotFoundError, OSError, ValueError):
+                try:
+                    age = max(0.0, utc_now().timestamp() - lock_path.stat().st_mtime)
+                except FileNotFoundError:
+                    continue
+                if age < 30:
+                    raise FileExistsError(lock_path)
+                pid = -1
+            if process_is_running(pid) or attempt:
+                raise FileExistsError(lock_path)
+            try:
+                lock_path.unlink()
+            except FileNotFoundError:
+                pass
+            continue
+        os.write(fd, str(os.getpid()).encode("utf-8"))
+        return fd
+    raise FileExistsError(lock_path)
 
 
 def release_lock(fd: int | None, lock_path: Path) -> None:
@@ -522,6 +556,7 @@ def run_update(
         installed_plugins: list[JsonDict] = []
         hook_results: list[JsonDict] = []
         hook_roots: list[Path] = []
+        resident_result: JsonDict = {}
         bootstrap_path: Path = root
         bootstrap_installed = False
 
@@ -603,10 +638,18 @@ def run_update(
                     if install_hooks:
                         hook_roots.append(plugin_path)
 
+                from resident_updater import activate_release
+
+                resident_result = activate_release(
+                    marketplace_repo_root(marketplace_path),
+                    cache_root=cache_root,
+                    install_service=False,
+                )
+
         hook_summary = refresh_plugins_hooks(hook_roots) if install_hooks else {"changed": False, "plugins": []}
         hook_results = hook_summary["plugins"]
         hooks_changed = bool(hook_summary.get("changed"))
-        updated = bool(installed_plugins or hooks_changed)
+        updated = bool(installed_plugins or hooks_changed or resident_result.get("changed"))
         next_state["last_result"] = "updated" if updated else "current"
         if bootstrap_installed:
             next_state["installed_version"] = latest_version
@@ -621,6 +664,7 @@ def run_update(
             "latest_version": latest_version,
             "installed_plugins": installed_plugins,
             "hooks": hook_results,
+            "resident": resident_result,
         }
         if bootstrap_installed:
             result["installed_version"] = latest_version
@@ -670,8 +714,24 @@ def main() -> None:
     parser.add_argument("--manifest-url", help="Override update manifest URL.")
     parser.add_argument("--state-path", help="Override update state path.")
     parser.add_argument("--force", action="store_true", help="Check even when the throttle interval has not elapsed.")
+    parser.add_argument("--resident", action="store_true", help="Run from the installed resident updater service.")
+    parser.add_argument("--doctor", action="store_true", help="Inspect updater activation and scheduling health.")
     parser.add_argument("--json", action="store_true", help="Print machine-readable output.")
     args = parser.parse_args()
+
+    if args.doctor:
+        from resident_updater import doctor
+
+        result = doctor()
+        if args.json:
+            print(json.dumps(result, indent=2, sort_keys=True))
+        elif result["healthy"]:
+            print(f"Core Edge updater is healthy at {result['marketplace']}.")
+        else:
+            print("Core Edge updater needs repair:")
+            for issue in result["issues"]:
+                print(f"- {issue}")
+        raise SystemExit(0 if result["healthy"] else 1)
 
     result = run_update(
         current_plugin_root=args.plugin_root,

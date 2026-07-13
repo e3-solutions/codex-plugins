@@ -4,6 +4,7 @@ import importlib.util
 import hashlib
 import json
 import os
+import shutil
 import subprocess
 import sys
 import zipfile
@@ -28,14 +29,29 @@ assert setup_spec.loader is not None
 setup_spec.loader.exec_module(linear_setup)
 
 UPDATE_PATH = ROOT / "plugins" / "linear-progress-sync" / "scripts" / "update_plugin.py"
+RESIDENT_UPDATE_PATH = ROOT / "plugins" / "linear-progress-sync" / "scripts" / "resident_updater.py"
 
 
 def load_update_plugin():
+    resident_spec = importlib.util.spec_from_file_location("resident_updater", RESIDENT_UPDATE_PATH)
+    resident_updater = importlib.util.module_from_spec(resident_spec)
+    assert resident_spec.loader is not None
+    sys.modules[resident_spec.name] = resident_updater
+    resident_spec.loader.exec_module(resident_updater)
     update_spec = importlib.util.spec_from_file_location("linear_update_plugin", UPDATE_PATH)
     update_plugin = importlib.util.module_from_spec(update_spec)
     assert update_spec.loader is not None
     update_spec.loader.exec_module(update_plugin)
     return update_plugin
+
+
+def load_resident_updater():
+    resident_spec = importlib.util.spec_from_file_location("resident_updater", RESIDENT_UPDATE_PATH)
+    resident_updater = importlib.util.module_from_spec(resident_spec)
+    assert resident_spec.loader is not None
+    sys.modules[resident_spec.name] = resident_updater
+    resident_spec.loader.exec_module(resident_updater)
+    return resident_updater
 
 
 def write_minimal_plugin(
@@ -65,6 +81,12 @@ def write_minimal_plugin(
     )
     script_name = "linear_sync.py" if name == "linear-progress-sync" else "session_start.py"
     (plugin / "scripts" / script_name).write_text(f"VERSION = {version!r}\n", encoding="utf-8")
+    if name == "linear-progress-sync":
+        for required_script in ("update_plugin.py", "resident_updater.py"):
+            (plugin / "scripts" / required_script).write_text(
+                f"VERSION = {version!r}\n",
+                encoding="utf-8",
+            )
     hooks = {
         event: [
             {
@@ -132,7 +154,7 @@ def make_marketplace_archive(tmp_path: Path, *, bootstrap_version: str) -> tuple
             {
                 "name": "linear-progress-sync",
                 "source": {"source": "local", "path": "./plugins/linear-progress-sync"},
-                "policy": {"installation": "AVAILABLE"},
+                "policy": {"installation": "INSTALLED_BY_DEFAULT"},
             },
             {
                 "name": "codex-session-logging",
@@ -2014,7 +2036,8 @@ def test_update_plugin_syncs_default_marketplace_plugins_and_hooks_when_bootstra
     cache_root = tmp_path / "cache" / "coreedge-local"
     cache_parent = cache_root / "linear-progress-sync"
     current = write_minimal_plugin(
-        cache_parent / "0.2.2",
+        cache_parent,
+        directory_name="0.2.2",
         version="0.2.2",
         hook_events=("SessionStart", "PreToolUse"),
     )
@@ -2231,6 +2254,469 @@ def test_maybe_spawn_auto_update_passes_state_path(tmp_path, monkeypatch):
     assert kwargs["stdin"] == subprocess.DEVNULL
 
 
+def test_resident_marketplace_activation_is_atomic_and_deterministic(tmp_path):
+    resident = load_resident_updater()
+    repo_root = tmp_path / "repo"
+    plugins_root = repo_root / "plugins"
+    write_minimal_plugin(plugins_root, name="linear-progress-sync", version="0.3.0")
+    write_minimal_plugin(plugins_root, name="codex-session-logging", version="0.2.1")
+    (repo_root / ".agents" / "plugins").mkdir(parents=True)
+    (repo_root / ".agents" / "plugins" / "marketplace.json").write_text(
+        json.dumps(
+            {
+                "name": "coreedge-local",
+                "plugins": [
+                    {
+                        "name": "linear-progress-sync",
+                        "source": {"source": "local", "path": "./plugins/linear-progress-sync"},
+                        "policy": {"installation": "INSTALLED_BY_DEFAULT"},
+                    },
+                    {
+                        "name": "codex-session-logging",
+                        "source": {"source": "local", "path": "./plugins/codex-session-logging"},
+                        "policy": {"installation": "INSTALLED_BY_DEFAULT"},
+                    },
+                ],
+            },
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    cache_root = tmp_path / "codex" / "plugins" / "cache" / "coreedge-local"
+    write_minimal_plugin(cache_root / "linear-progress-sync", directory_name="0.2.11", version="0.2.11")
+    write_minimal_plugin(cache_root / "linear-progress-sync", directory_name="0.3.0", version="0.3.0")
+    write_minimal_plugin(cache_root / "codex-session-logging", name="codex-session-logging", directory_name="0.1.0", version="0.1.0")
+    write_minimal_plugin(cache_root / "codex-session-logging", name="codex-session-logging", directory_name="0.2.1", version="0.2.1")
+    config_path = tmp_path / "codex" / "config.toml"
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text(
+        '[model]\nname = "gpt-test"\n\n[marketplaces.coreedge-local]\n'
+        'last_updated = "old"\nsource_type = "local"\nsource = "/tmp/deleted-worktree"\n',
+        encoding="utf-8",
+    )
+
+    result = resident.activate_release(
+        repo_root,
+        codex_home=tmp_path / "codex",
+        resident_root=tmp_path / "resident",
+        install_service=False,
+    )
+    second = resident.activate_release(
+        repo_root,
+        codex_home=tmp_path / "codex",
+        resident_root=tmp_path / "resident",
+        install_service=False,
+    )
+
+    current = tmp_path / "resident" / "marketplace" / "current"
+    assert current.is_symlink()
+    assert current.resolve().name == "0.3.0"
+    assert (current / ".agents" / "plugins" / "marketplace.json").exists()
+    assert sorted(path.name for path in (cache_root / "linear-progress-sync").iterdir() if not path.name.startswith(".")) == ["0.3.0"]
+    assert sorted(path.name for path in (cache_root / "codex-session-logging").iterdir() if not path.name.startswith(".")) == ["0.2.1"]
+    assert (tmp_path / "resident" / "rollback" / "cache" / "linear-progress-sync" / "0.2.11").exists()
+    assert (tmp_path / "resident" / "rollback" / "cache" / "codex-session-logging" / "0.1.0").exists()
+    config = config_path.read_text(encoding="utf-8")
+    assert '[model]\nname = "gpt-test"' in config
+    assert f'source = "{current}"' in config
+    assert "/tmp/deleted-worktree" not in config
+    assert result["changed"] is True
+    assert second["changed"] is False
+
+
+def test_resident_activation_rolls_back_cache_config_and_pointer_on_failure(tmp_path, monkeypatch):
+    resident = load_resident_updater()
+    old_repo = tmp_path / "old-repo"
+    new_repo = tmp_path / "new-repo"
+    for repo, version in ((old_repo, "0.2.11"), (new_repo, "0.3.0")):
+        write_minimal_plugin(repo / "plugins", name="linear-progress-sync", version=version)
+        (repo / ".agents" / "plugins").mkdir(parents=True)
+        (repo / ".agents" / "plugins" / "marketplace.json").write_text(
+            json.dumps(
+                {
+                    "name": "coreedge-local",
+                    "plugins": [
+                        {
+                            "name": "linear-progress-sync",
+                            "source": {"source": "local", "path": "./plugins/linear-progress-sync"},
+                            "policy": {"installation": "INSTALLED_BY_DEFAULT"},
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+    codex_home = tmp_path / "codex"
+    cache_root = codex_home / "plugins" / "cache" / "coreedge-local"
+    write_minimal_plugin(cache_root / "linear-progress-sync", directory_name="0.2.11", version="0.2.11")
+    config_path = codex_home / "config.toml"
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text(
+        '[marketplaces.coreedge-local]\nsource_type = "local"\nsource = "/old/source"\n',
+        encoding="utf-8",
+    )
+    resident_root = tmp_path / "resident"
+    resident.activate_release(
+        old_repo,
+        codex_home=codex_home,
+        resident_root=resident_root,
+        install_service=False,
+    )
+    write_minimal_plugin(cache_root / "linear-progress-sync", directory_name="0.3.0", version="0.3.0")
+    before_config = config_path.read_text(encoding="utf-8")
+    before_target = (resident_root / "marketplace" / "current").resolve()
+    before_runtime = (resident_root / "runtime" / "current").resolve()
+
+    def fail_after_cache(*_args, **_kwargs):
+        raise OSError("simulated activation failure")
+
+    monkeypatch.setattr(resident, "install_runtime", fail_after_cache)
+    with pytest.raises(OSError, match="simulated activation failure"):
+        resident.activate_release(
+            new_repo,
+            codex_home=codex_home,
+            resident_root=resident_root,
+            install_service=False,
+        )
+
+    assert config_path.read_text(encoding="utf-8") == before_config
+    assert (resident_root / "marketplace" / "current").resolve() == before_target
+    assert (resident_root / "runtime" / "current").resolve() == before_runtime
+    assert (cache_root / "linear-progress-sync" / "0.2.11").exists()
+    assert (cache_root / "linear-progress-sync" / "0.3.0").exists()
+
+
+def test_resident_activation_repairs_corrupt_managed_release_and_runtime(tmp_path):
+    resident = load_resident_updater()
+    repo = tmp_path / "repo"
+    write_minimal_plugin(repo / "plugins", name="linear-progress-sync", version="0.3.0")
+    (repo / ".agents" / "plugins").mkdir(parents=True)
+    (repo / ".agents" / "plugins" / "marketplace.json").write_text(
+        json.dumps(
+            {
+                "name": "coreedge-local",
+                "plugins": [
+                    {
+                        "name": "linear-progress-sync",
+                        "source": {"source": "local", "path": "./plugins/linear-progress-sync"},
+                        "policy": {"installation": "INSTALLED_BY_DEFAULT"},
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    codex_home = tmp_path / "codex"
+    write_minimal_plugin(
+        codex_home / "plugins" / "cache" / "coreedge-local" / "linear-progress-sync",
+        directory_name="0.3.0",
+        version="0.3.0",
+    )
+    resident_root = tmp_path / "resident"
+    resident.activate_release(
+        repo,
+        codex_home=codex_home,
+        resident_root=resident_root,
+        install_service=False,
+    )
+    managed_manifest = (
+        resident_root
+        / "marketplace"
+        / "releases"
+        / "0.3.0"
+        / ".agents"
+        / "plugins"
+        / "marketplace.json"
+    )
+    runtime_script = resident_root / "runtime" / "releases" / "0.3.0" / "update_plugin.py"
+    managed_manifest.write_text("not json", encoding="utf-8")
+    runtime_script.write_text("def broken(:\n", encoding="utf-8")
+
+    result = resident.activate_release(
+        repo,
+        codex_home=codex_home,
+        resident_root=resident_root,
+        install_service=False,
+    )
+
+    assert result["changed"] is True
+    assert json.loads(managed_manifest.read_text(encoding="utf-8"))["name"] == "coreedge-local"
+    compile(runtime_script.read_text(encoding="utf-8"), str(runtime_script), "exec")
+
+
+def test_resident_marketplace_rejects_source_path_escape(tmp_path):
+    resident = load_resident_updater()
+    repo = tmp_path / "repo"
+    outside = tmp_path / "outside"
+    write_minimal_plugin(outside, name="linear-progress-sync", version="0.3.0")
+    (repo / ".agents" / "plugins").mkdir(parents=True)
+    (repo / ".agents" / "plugins" / "marketplace.json").write_text(
+        json.dumps(
+            {
+                "name": "coreedge-local",
+                "plugins": [
+                    {
+                        "name": "linear-progress-sync",
+                        "source": {"source": "local", "path": "../outside/linear-progress-sync"},
+                        "policy": {"installation": "INSTALLED_BY_DEFAULT"},
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="escapes marketplace root"):
+        resident.marketplace_plugins(repo)
+
+
+def test_real_marketplace_activates_in_isolated_codex_home_and_passes_doctor(tmp_path):
+    resident = load_resident_updater()
+    codex_home = tmp_path / "isolated codex home"
+    cache_root = codex_home / "plugins" / "cache" / "coreedge-local"
+    for plugin in resident.marketplace_plugins(ROOT):
+        destination = cache_root / str(plugin["name"]) / str(plugin["version"])
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(Path(plugin["source"]), destination)
+    resident_root = tmp_path / "isolated resident home"
+
+    activation = resident.activate_release(
+        ROOT,
+        codex_home=codex_home,
+        resident_root=resident_root,
+        install_service=True,
+        platform="linux",
+    )
+    health = resident.doctor(
+        codex_home=codex_home,
+        resident_root=resident_root,
+        platform="linux",
+    )
+
+    assert activation["version"] == "0.3.0"
+    assert health["healthy"] is True
+    assert health["issues"] == []
+    assert health["cache_versions"] == {
+        "codex-session-logging": ["0.2.1"],
+        "linear-progress-sync": ["0.3.0"],
+    }
+    assert subprocess.run(["sh", "-n", str(resident_root / "run.sh")], check=False).returncode == 0
+
+
+def test_resident_runtime_and_launch_agent_are_idempotent(tmp_path, monkeypatch):
+    resident = load_resident_updater()
+    plugin_root = write_minimal_plugin(
+        tmp_path / "plugins",
+        name="linear-progress-sync",
+        version="0.3.0",
+    )
+    calls = []
+
+    class Completed:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    def runner(args, **kwargs):
+        calls.append((args, kwargs))
+        return Completed()
+
+    monkeypatch.setattr(resident.os, "getuid", lambda: 501)
+    first = resident.ensure_resident_updater(
+        plugin_root,
+        codex_home=tmp_path / "codex",
+        resident_root=tmp_path / "resident",
+        launch_agents_dir=tmp_path / "LaunchAgents",
+        platform="darwin",
+        runner=runner,
+    )
+    second = resident.ensure_resident_updater(
+        plugin_root,
+        codex_home=tmp_path / "codex",
+        resident_root=tmp_path / "resident",
+        launch_agents_dir=tmp_path / "LaunchAgents",
+        platform="darwin",
+        runner=runner,
+    )
+
+    runtime_current = tmp_path / "resident" / "runtime" / "current"
+    plist = tmp_path / "LaunchAgents" / "com.coreedge.codex-plugins-updater.plist"
+    assert runtime_current.is_symlink()
+    assert (runtime_current / "update_plugin.py").exists()
+    assert (runtime_current / "linear_sync.py").exists()
+    assert (runtime_current / "resident_updater.py").exists()
+    assert (tmp_path / "resident" / "run.sh").stat().st_mode & 0o111
+    assert subprocess.run(
+        ["sh", "-n", str(tmp_path / "resident" / "run.sh")],
+        check=False,
+    ).returncode == 0
+    plist_text = plist.read_text(encoding="utf-8")
+    assert "RunAtLoad" in plist_text
+    assert "StartInterval" in plist_text
+    assert "1800" in plist_text
+    assert "com.coreedge.codex-plugins-updater" in plist_text
+    assert first["changed"] is True
+    assert second["changed"] is False
+    assert len(calls) == 1
+    assert calls[0][0][:3] == ["launchctl", "bootstrap", "gui/501"]
+
+
+def test_resident_launch_agent_recovers_when_plist_exists_but_job_is_unloaded(tmp_path, monkeypatch):
+    resident = load_resident_updater()
+    plugin_root = write_minimal_plugin(
+        tmp_path / "plugins",
+        name="linear-progress-sync",
+        version="0.3.0",
+    )
+    launch_agents = tmp_path / "LaunchAgents"
+    launch_agents.mkdir()
+    plist = launch_agents / "com.coreedge.codex-plugins-updater.plist"
+    plist.write_bytes(
+        resident.launch_agent_payload(
+            runner_path=tmp_path / "resident" / "run.sh",
+            resident_root=tmp_path / "resident",
+        )
+    )
+    calls = []
+
+    class Completed:
+        stdout = ""
+        stderr = ""
+
+        def __init__(self, returncode):
+            self.returncode = returncode
+
+    def runner(args, **_kwargs):
+        calls.append(args)
+        return Completed(1 if args[1] == "kickstart" else 0)
+
+    monkeypatch.setattr(resident.os, "getuid", lambda: 501)
+    result = resident.ensure_resident_updater(
+        plugin_root,
+        codex_home=tmp_path / "codex",
+        resident_root=tmp_path / "resident",
+        launch_agents_dir=launch_agents,
+        platform="darwin",
+        runner=runner,
+    )
+
+    assert result["scheduled"] is True
+    assert calls[0][1] == "kickstart"
+    assert calls[1][:3] == ["launchctl", "bootstrap", "gui/501"]
+
+
+def test_marketplace_config_migration_supports_quoted_section_and_preserves_comments(tmp_path):
+    resident = load_resident_updater()
+    config = tmp_path / "config.toml"
+    config.write_text(
+        '# personal setting\n[marketplaces."coreedge-local"]\n'
+        'source_type = "git" # migrated\nsource = "/old" # stale\n\n[other]\nenabled = true\n',
+        encoding="utf-8",
+    )
+
+    changed = resident.update_marketplace_config(config, tmp_path / "managed" / "current")
+    second = resident.update_marketplace_config(config, tmp_path / "managed" / "current")
+    text = config.read_text(encoding="utf-8")
+
+    assert changed is True
+    assert second is False
+    assert "# personal setting" in text
+    assert '[marketplaces."coreedge-local"]' in text
+    assert 'source_type = "local"' in text
+    expected_source = tmp_path / "managed" / "current"
+    assert f'source = "{expected_source}"' in text
+    assert "[other]\nenabled = true" in text
+
+
+def test_resident_installer_degrades_safely_off_macos(tmp_path):
+    resident = load_resident_updater()
+    plugin_root = write_minimal_plugin(
+        tmp_path / "plugins",
+        name="linear-progress-sync",
+        version="0.3.0",
+    )
+
+    result = resident.ensure_resident_updater(
+        plugin_root,
+        codex_home=tmp_path / "codex",
+        resident_root=tmp_path / "resident",
+        platform="linux",
+    )
+
+    assert result["installed"] is True
+    assert result["scheduled"] is False
+    assert result["reason"] == "unsupported_platform"
+
+
+def test_resident_doctor_reports_activation_drift(tmp_path):
+    resident = load_resident_updater()
+    codex_home = tmp_path / "codex"
+    resident_root = tmp_path / "resident"
+    current = resident_root / "marketplace" / "current"
+    current.parent.mkdir(parents=True)
+    broken_target = resident_root / "marketplace" / "releases" / "missing"
+    os.symlink(broken_target, current)
+    codex_home.mkdir(parents=True)
+    (codex_home / "config.toml").write_text(
+        '[marketplaces.coreedge-local]\nsource_type = "local"\nsource = "/tmp/stale"\n',
+        encoding="utf-8",
+    )
+
+    result = resident.doctor(
+        codex_home=codex_home,
+        resident_root=resident_root,
+        launch_agents_dir=tmp_path / "LaunchAgents",
+        platform="darwin",
+    )
+
+    assert result["healthy"] is False
+    assert "managed marketplace pointer is missing or broken" in result["issues"]
+    assert "marketplace config does not point at the managed current release" in result["issues"]
+    assert "resident updater LaunchAgent is not installed" in result["issues"]
+
+
+def test_update_lock_reclaims_dead_process(tmp_path, monkeypatch):
+    update_plugin = load_update_plugin()
+    lock_path = tmp_path / "update.json.lock"
+    lock_path.write_text("99999999", encoding="utf-8")
+    monkeypatch.setattr(update_plugin, "process_is_running", lambda _pid: False)
+
+    descriptor = update_plugin.acquire_lock(lock_path)
+    try:
+        assert lock_path.read_text(encoding="utf-8") == str(os.getpid())
+    finally:
+        update_plugin.release_lock(descriptor, lock_path)
+
+
+def test_update_lock_preserves_live_process(tmp_path, monkeypatch):
+    update_plugin = load_update_plugin()
+    lock_path = tmp_path / "update.json.lock"
+    lock_path.write_text("4242", encoding="utf-8")
+    monkeypatch.setattr(update_plugin, "process_is_running", lambda pid: pid == 4242)
+
+    with pytest.raises(FileExistsError):
+        update_plugin.acquire_lock(lock_path)
+
+    assert lock_path.read_text(encoding="utf-8") == "4242"
+
+
+def test_hook_entrypoints_self_heal_resident_updater():
+    for script_name in ("session_start.py", "pre_tool_use.py"):
+        text = (ROOT / "plugins" / "linear-progress-sync" / "scripts" / script_name).read_text(encoding="utf-8")
+        assert "ensure_resident_updater" in text
+
+
+def test_setup_installs_resident_updater_without_teammate_followup(tmp_path):
+    plan = linear_sync.setup_plan(plugin_repo_root=ROOT, target_repo_root=tmp_path)
+    commands = "\n".join(plan["commands"])
+    notes = "\n".join(plan["notes"])
+
+    assert "install_resident_updater.py" in commands
+    assert "updates run at login and every 30 minutes" in notes
+    assert "no renewal thread" in notes
+
+
 def test_install_codex_hooks_removes_legacy_plugin_hooks_and_preserves_user_hooks(tmp_path):
     codex_home = tmp_path / "codex-home"
     hooks_path = codex_home / "hooks.json"
@@ -2352,8 +2838,10 @@ def test_readmes_register_linear_mcp_before_linear_login():
         assert "trust the Linear Progress Sync and Codex Session Logging hooks once" in text
         assert "saves it in `~/.codex/linear-sync/repos.json`" in text
         assert "update_plugin.py --force" in text
-        assert "install `0.2.11` on the next SessionStart" in text
-        assert "following SessionStart" in text
+        assert "update_plugin.py --doctor" in text
+        assert "before `0.3.0`" in text
+        assert "renewal thread" in text
+        assert "every 30 minutes" in text
         assert "LINEAR_SYNC_AUTO_UPDATE=0" in text
         assert "not a single plugin source" in text
         assert "Do not install the GitHub URL or repository root directly with `codex plugin add`" in text
@@ -2506,6 +2994,8 @@ def test_plugin_exposes_linear_start_command_and_pre_tool_guard_hook():
     assert "choose the project from that list" in skill_text
     assert "--disable-linear-sync" in skill_text
     assert "update_plugin.py --force" in skill_text
+    assert "update_plugin.py --doctor" in skill_text
+    assert "renewal thread" in skill_text
     assert "LINEAR_SYNC_AUTO_UPDATE=0" in skill_text
     assert "configure-user" in skill_text
     assert "Do not create the Linear issue, branch, PR, or code changes until the chosen repo destination is saved" in skill_text

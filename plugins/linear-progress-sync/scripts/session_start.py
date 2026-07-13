@@ -1,10 +1,18 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+from pathlib import Path
+
 from linear_sync import ensure_state, read_state
 
 
 def main() -> None:
+    try:
+        from resident_updater import ensure_resident_updater
+
+        ensure_resident_updater(Path(__file__).resolve().parents[1])
+    except Exception:
+        pass
     try:
         from update_plugin import maybe_spawn_auto_update
 
