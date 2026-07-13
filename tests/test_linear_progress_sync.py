@@ -2352,7 +2352,7 @@ def test_readmes_register_linear_mcp_before_linear_login():
         assert "trust the Linear Progress Sync and Codex Session Logging hooks once" in text
         assert "saves it in `~/.codex/linear-sync/repos.json`" in text
         assert "update_plugin.py --force" in text
-        assert "install `0.2.11` on the next SessionStart" in text
+        assert "install `0.2.12` on the next SessionStart" in text
         assert "following SessionStart" in text
         assert "LINEAR_SYNC_AUTO_UPDATE=0" in text
         assert "not a single plugin source" in text
