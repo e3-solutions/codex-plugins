@@ -349,3 +349,11 @@ def test_backfill_database_migration_is_private_and_service_role_writable():
     assert "using ((select auth.uid()) = user_id)" in usage_migration
     assert "grant select on public.codex_session_usage to authenticated" in usage_migration
     assert "grant select, insert, update on public.codex_session_usage to service_role" in usage_migration
+
+
+def test_session_start_does_not_spawn_historical_backfills():
+    source = (SCRIPTS / "session_start.py").read_text(encoding="utf-8")
+
+    assert "spawn_backfill" not in source
+    assert "backfill_sessions.py" not in source
+    assert "CODEX_SESSION_LOG_BACKFILL" not in source

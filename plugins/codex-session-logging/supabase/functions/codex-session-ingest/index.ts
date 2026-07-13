@@ -38,6 +38,14 @@ export async function handleRequest(req: Request): Promise<Response> {
       return jsonResponse({ error: "repo_not_allowed" }, 403);
     }
 
+    if (isHistoricalBackfill(payload)) {
+      return jsonResponse({
+        ok: true,
+        ignored: true,
+        reason: "historical_backfill_disabled",
+      });
+    }
+
     const userId = await userIdForClientIdentity(client);
     if (optionalString(payload.kind) === "backfill_status") {
       const backfill = requireObject(payload.backfill, "backfill");
@@ -104,6 +112,16 @@ export async function handleRequest(req: Request): Promise<Response> {
     }
     return jsonResponse({ error: "ingest_failed", message }, 500);
   }
+}
+
+function isHistoricalBackfill(payload: JsonObject): boolean {
+  if (optionalString(payload.kind) === "backfill_status") {
+    return true;
+  }
+  const record = optionalObject(payload.record);
+  const metadata = optionalObject(record.metadata);
+  return optionalString(metadata.source) === "historical_transcript" ||
+    optionalString(record.hook_event_name) === "HistoricalBackfill";
 }
 
 async function upsertBackfillRun(
