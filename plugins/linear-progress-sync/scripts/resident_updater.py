@@ -637,14 +637,48 @@ def ensure_resident_updater(
     codex = Path(codex_home or default_codex_home()).expanduser().resolve()
     resident = Path(resident_root or default_resident_root(codex)).expanduser().resolve()
     preference_changed = persist_environment_opt_out()
-    runtime = install_runtime(plugin_root, resident_root=resident)
+    bootstrap_root = Path(plugin_root).expanduser().resolve()
+    runtime_source = bootstrap_root
+    managed_plugins: list[JsonDict] = []
+    try:
+        managed_plugins = marketplace_plugins(resident / "marketplace" / "current")
+        runtime_source = next(
+            Path(item["source"])
+            for item in managed_plugins
+            if item["name"] == "linear-progress-sync"
+        )
+    except (FileNotFoundError, OSError, StopIteration, ValueError, json.JSONDecodeError):
+        managed_plugins = []
+    runtime = install_runtime(runtime_source, resident_root=resident)
+    repaired_caches: list[JsonDict] = []
+    if managed_plugins and runtime["changed"]:
+        replacements: list[tuple[Path, Path | None]] = []
+        try:
+            cache_root = codex / "plugins" / "cache" / MARKETPLACE_NAME
+            for plugin in managed_plugins:
+                target = cache_root / str(plugin["name"]) / str(plugin["version"])
+                installed, replacement = install_plugin_cache(Path(plugin["source"]), target)
+                if replacement is not None:
+                    replacements.append(replacement)
+                if installed:
+                    repaired_caches.append(
+                        {
+                            "name": plugin["name"],
+                            "version": plugin["version"],
+                            "path": str(target),
+                        }
+                    )
+        except Exception:
+            rollback_plugin_cache_installs(replacements)
+            raise
+        commit_plugin_cache_installs(replacements)
     runner_path = resident / "run.sh"
     runner_changed = write_if_changed(
         runner_path,
         runner_script(
             resident_root=resident,
             codex_home=codex,
-            bootstrap_plugin_root=Path(plugin_root).expanduser().resolve(),
+            bootstrap_plugin_root=bootstrap_root,
         ).encode("utf-8"),
         mode=0o755,
     )
@@ -656,8 +690,9 @@ def ensure_resident_updater(
             "installed": True,
             "scheduled": False,
             "reason": "unsupported_platform",
-            "changed": bool(preference_changed or runtime["changed"] or runner_changed),
+            "changed": bool(preference_changed or runtime["changed"] or repaired_caches or runner_changed),
             "runtime": str(runtime["path"]),
+            "repaired_caches": repaired_caches,
         }
 
     agents = Path(launch_agents_dir or Path.home() / "Library" / "LaunchAgents").expanduser().resolve()
@@ -685,9 +720,10 @@ def ensure_resident_updater(
             return {
                 "installed": True,
                 "scheduled": True,
-                "changed": bool(preference_changed or runtime["changed"] or runner_changed),
+                "changed": bool(preference_changed or runtime["changed"] or repaired_caches or runner_changed),
                 "runtime": str(runtime["path"]),
                 "plist": str(plist_path),
+                "repaired_caches": repaired_caches,
             }
     try:
         service_stamp.unlink()
@@ -736,9 +772,12 @@ def ensure_resident_updater(
     result: JsonDict = {
         "installed": True,
         "scheduled": scheduled,
-        "changed": bool(preference_changed or runtime["changed"] or runner_changed or plist_changed),
+        "changed": bool(
+            preference_changed or runtime["changed"] or repaired_caches or runner_changed or plist_changed
+        ),
         "runtime": str(runtime["path"]),
         "plist": str(plist_path),
+        "repaired_caches": repaired_caches,
     }
     if error:
         result["error"] = error

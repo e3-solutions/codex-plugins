@@ -2236,11 +2236,13 @@ def test_run_update_skips_entire_older_marketplace_without_partial_installs(tmp_
         encoding="utf-8",
     )
 
+    state_path = tmp_path / "update-state.json"
+    update_plugin.write_update_state(state_path, {"last_error": "stale network failure"})
     result = update_plugin.run_update(
         current_plugin_root=current,
         cache_parent=cache_parent,
         manifest_url=manifest.as_uri(),
-        state_path=tmp_path / "update-state.json",
+        state_path=state_path,
         force=True,
         install_hooks=False,
     )
@@ -2251,6 +2253,7 @@ def test_run_update_skips_entire_older_marketplace_without_partial_installs(tmp_
     logging_parent = cache_root / "codex-session-logging"
     assert sorted(path.name for path in logging_parent.iterdir() if not path.name.startswith(".")) == ["0.2.2"]
     assert not (codex_home / "coreedge" / "marketplace" / "current").exists()
+    assert "last_error" not in update_plugin.read_update_state(state_path)
 
 
 def test_run_update_rolls_back_new_cache_install_when_activation_fails(tmp_path, monkeypatch):
@@ -2349,7 +2352,10 @@ def test_update_plugin_checks_even_when_recently_checked(tmp_path):
     state_path = tmp_path / "update-state.json"
     update_plugin.write_update_state(
         state_path,
-        {"last_checked_at": "2026-07-03T18:00:00+00:00"},
+        {
+            "last_checked_at": "2026-07-03T18:00:00+00:00",
+            "last_error": "stale network failure",
+        },
     )
 
     result = update_plugin.run_update(
@@ -2363,6 +2369,7 @@ def test_update_plugin_checks_even_when_recently_checked(tmp_path):
 
     assert result["updated"] is True
     assert result["installed_version"] == "0.2.1"
+    assert "last_error" not in update_plugin.read_update_state(state_path)
 
 
 def test_default_update_manifest_is_read_from_archive_not_stale_raw(tmp_path, monkeypatch):
@@ -2880,6 +2887,43 @@ def test_real_marketplace_activates_in_isolated_codex_home_and_passes_doctor(tmp
         "linear-progress-sync": ["0.3.0"],
     }
     assert subprocess.run(["sh", "-n", str(resident_root / "run.sh")], check=False).returncode == 0
+
+
+def test_resident_hook_repairs_matching_cache_and_runtime_corruption_from_managed_release(tmp_path):
+    resident = load_resident_updater()
+    codex_home = tmp_path / "codex"
+    resident_root = tmp_path / "resident"
+    resident.activate_release(
+        ROOT,
+        codex_home=codex_home,
+        resident_root=resident_root,
+        install_service=False,
+        platform="linux",
+    )
+    managed = resident_root / "marketplace/current/plugins/linear-progress-sync"
+    cache = codex_home / "plugins/cache/coreedge-local/linear-progress-sync/0.3.0"
+    runtime = resident_root / "runtime/current"
+    corrupt_content = (managed / "scripts/linear_sync.py").read_bytes()
+    (cache / "scripts/update_plugin.py").write_bytes(corrupt_content)
+    (runtime / "update_plugin.py").write_bytes(corrupt_content)
+
+    result = resident.ensure_resident_updater(
+        cache,
+        codex_home=codex_home,
+        resident_root=resident_root,
+        platform="linux",
+    )
+    health = resident.doctor(
+        codex_home=codex_home,
+        resident_root=resident_root,
+        platform="linux",
+    )
+
+    assert result["changed"] is True
+    assert [item["name"] for item in result["repaired_caches"]] == ["linear-progress-sync"]
+    assert (runtime / "update_plugin.py").read_bytes() == (managed / "scripts/update_plugin.py").read_bytes()
+    assert (cache / "scripts/update_plugin.py").read_bytes() == (managed / "scripts/update_plugin.py").read_bytes()
+    assert health["healthy"] is True
 
 
 def test_resident_runtime_and_launch_agent_are_idempotent(tmp_path, monkeypatch):

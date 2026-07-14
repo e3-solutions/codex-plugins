@@ -630,6 +630,7 @@ def run_update(
             if version_is_newer(current_version, latest_version):
                 next_state["last_result"] = "newer_current"
                 next_state["installed_plugins"] = []
+                next_state.pop("last_error", None)
                 write_update_state(state_file, next_state)
                 return {
                     "updated": False,
@@ -683,6 +684,7 @@ def run_update(
         hooks_changed = bool(hook_summary.get("changed"))
         updated = bool(installed_plugins or hooks_changed or resident_result.get("changed"))
         next_state["last_result"] = "updated" if updated else "current"
+        next_state.pop("last_error", None)
         if bootstrap_installed:
             next_state["installed_version"] = latest_version
         next_state["installed_plugins"] = [
