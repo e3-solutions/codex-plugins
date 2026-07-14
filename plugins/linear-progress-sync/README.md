@@ -62,7 +62,7 @@ After kickoff, Codex writes and standard Codex commits are synced back to the ac
 
 Setup installs a resident updater under `~/.codex/coreedge`. On macOS it runs at login and every 30 minutes, independently of Codex tasks. It downloads the current `main.zip`, validates and stages the default marketplace plugins, switches `~/.codex/coreedge/marketplace/current` atomically, points the registered marketplace at that stable path, and leaves only the selected version visible in each Codex plugin cache. Previous versions move to `~/.codex/coreedge/rollback/cache` so a failed activation can restore the prior state. `SessionStart` and `PreToolUse` repair a missing resident service without delaying or blocking Codex.
 
-Existing installations before `0.3.0` download `0.3.0` during ordinary Codex use. The next normal hook invocation installs and launches the resident updater from that cached plugin, even before the managed marketplace exists, so no additional `SessionStart` or renewal task is needed. The managed activation also installs Codex Session Logging 0.2.2 with historical backfills disabled. Fresh setup installs and schedules the current plugins immediately. An already-running task keeps the skill text it loaded at creation, while hook implementations switch to the selected cache automatically.
+Existing 0.3.0 installations download and activate `0.3.1` with historical backfills disabled during one ordinary resident check; the next successful scheduled check (normally within 30 minutes while the Mac is logged in and awake) uses the new runtime to install the separate one-minute task-presence publisher. Both checks are automatic and require no Codex restart, new task, or teammate action. Fresh setup installs and schedules the current plugins immediately. Presence reads metadata-only native Codex task state, expires observations older than five minutes instead of replaying false activity after an outage, and does not depend on an already-running Codex process reloading hooks. An already-running task keeps the skill text it loaded at creation, while hook implementations switch to the selected cache automatically and presence continues independently.
 
 Persistently disable or re-enable automatic network update checks with:
 
@@ -99,6 +99,8 @@ To roll out a new default plugin or extension:
 6. Merge to `main`.
 
 After the one-time setup, releases are staged and activated by the resident service. No teammate reinstall, update command, or renewal thread is part of the rollout. A normal future task naturally picks up changed skill text; existing hook events use the sole selected cache version.
+
+`update_plugin.py --doctor` also verifies that the updater and metadata-only task-presence LaunchAgents are installed and loaded.
 
 ## Optional
 

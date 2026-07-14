@@ -429,6 +429,64 @@ Deno.test("sanitizeEventPayload keeps only allowlisted tool event fields", () =>
   assertNotIncludes(serialized, "arbitrary_secret");
 });
 
+Deno.test("sanitizeEventPayload keeps resident presence metadata content-free", () => {
+  const sanitized = sanitizeEventPayload(
+    {
+      id: "resident-presence-id",
+      session_id: "codex-thread-id",
+      thread_id: "stable-thread-id",
+      seq: 0,
+      event_type: "resident_presence",
+      hook_event_name: "ResidentPresence",
+      created_at: "2026-07-14T18:20:00.000Z",
+      metadata: {
+        cwd: "/repo",
+        transcript_path: "/codex/rollout.jsonl",
+        source: "resident_presence",
+        repo_remote: "https://github.com/e3-solutions/example.git",
+        git_branch: "arya/example",
+        native_created_at: "2026-07-14T18:00:00.000Z",
+        native_updated_at: "2026-07-14T18:20:00.000Z",
+        title: "sensitive title",
+        preview: "sensitive preview",
+        prompt: "sensitive prompt",
+        content: "sensitive response",
+      },
+    },
+    { metadata: {} },
+  );
+  const serialized = JSON.stringify(sanitized);
+
+  assertEquals(sanitized, {
+    id: "resident-presence-id",
+    session_id: "codex-thread-id",
+    thread_id: "stable-thread-id",
+    seq: 0,
+    event_type: "resident_presence",
+    hook_event_name: "ResidentPresence",
+    created_at: "2026-07-14T18:20:00.000Z",
+    metadata: {
+      cwd: "/repo",
+      transcript_path: "/codex/rollout.jsonl",
+      source: "resident_presence",
+    },
+  });
+  for (
+    const forbidden of [
+      "repo_remote",
+      "git_branch",
+      "native_created_at",
+      "native_updated_at",
+      "sensitive title",
+      "sensitive preview",
+      "sensitive prompt",
+      "sensitive response",
+    ]
+  ) {
+    assertNotIncludes(serialized, forbidden);
+  }
+});
+
 Deno.test("sanitizeEventPayload keeps safe Claude thread metadata only", () => {
   const sanitized = sanitizeEventPayload(
     {

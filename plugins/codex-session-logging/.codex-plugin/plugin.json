@@ -1,6 +1,6 @@
 {
   "name": "codex-session-logging",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "description": "Capture live Codex sessions into user-owned Supabase session history.",
   "author": {
     "name": "Core Edge Solution"
@@ -15,7 +15,7 @@
   "interface": {
     "displayName": "Codex Session Logging",
     "shortDescription": "Capture prompt and assistant message history.",
-    "longDescription": "Codex Session Logging captures live hook payloads into a private Supabase Storage bucket with a Postgres catalog. Historical transcript backfills are disabled.",
+    "longDescription": "Codex Session Logging captures live hook payloads and publishes metadata-only task presence into a private Supabase Storage bucket with a Postgres catalog. Historical transcript backfills are disabled.",
     "developerName": "Core Edge Solution",
     "category": "Productivity",
     "capabilities": [
