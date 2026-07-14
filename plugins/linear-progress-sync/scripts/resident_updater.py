@@ -565,6 +565,14 @@ plugin_root={shlex.quote(str(managed_plugin_root))}
 if [ ! -f "$plugin_root/.codex-plugin/plugin.json" ]; then
   plugin_root={shlex.quote(str(bootstrap_plugin_root))}
 fi
+if [ ! -f "$plugin_root/.codex-plugin/plugin.json" ]; then
+  cache_root={shlex.quote(str(codex_home / "plugins" / "cache"))}
+  plugin_manifest=$(find "$cache_root" -mindepth 5 -maxdepth 5 -type f \
+    -path '*/linear-progress-sync/*/.codex-plugin/plugin.json' -print 2>/dev/null \
+    | sort | tail -n 1)
+  [ -n "$plugin_manifest" ] || exit 0
+  plugin_root=${{plugin_manifest%/.codex-plugin/plugin.json}}
+fi
 exec "$python_bin" {shlex.quote(str(runtime / "update_plugin.py"))} --plugin-root "$plugin_root" --force --resident
 """
 
