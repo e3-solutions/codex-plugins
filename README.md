@@ -60,9 +60,18 @@ Before kickoff, file edits, write-like Bash commands, and branch creation wait u
 
 After kickoff, Codex writes and standard Codex commits are synced back to the active Linear issue automatically.
 
-Setup installs a resident updater under `~/.codex/coreedge`. On macOS it runs at login and every 30 minutes, independently of Codex tasks. It downloads the current `main.zip`, validates and stages the default marketplace plugins, switches `~/.codex/coreedge/marketplace/current` atomically, points the registered marketplace at that stable path, and leaves only the selected version visible in each Codex plugin cache. Previous versions move to `~/.codex/coreedge/rollback/cache` so a failed activation can restore the prior state. `SessionStart` and `PreToolUse` repair a missing resident service without delaying or blocking Codex. Set `LINEAR_SYNC_AUTO_UPDATE=0` to disable network update checks.
+Setup installs a resident updater under `~/.codex/coreedge`. On macOS it runs at login and every 30 minutes, independently of Codex tasks. It downloads the current `main.zip`, validates and stages the default marketplace plugins, switches `~/.codex/coreedge/marketplace/current` atomically, points the registered marketplace at that stable path, and leaves only the selected version visible in each Codex plugin cache. Previous versions move to `~/.codex/coreedge/rollback/cache` so a failed activation can restore the prior state. `SessionStart` and `PreToolUse` repair a missing resident service without delaying or blocking Codex.
 
-Existing installations before `0.3.0` download `0.3.0` during ordinary Codex use. The next normal hook invocation installs the resident updater automatically; teammates do not need to run a command, restart Codex deliberately, or create a renewal thread. Fresh setup installs and schedules it immediately. An already-running task keeps the skill text it loaded at creation, while hook implementations switch to the selected cache automatically.
+Existing installations before `0.3.0` download `0.3.0` during ordinary Codex use. The next normal hook invocation installs and launches the resident updater from that cached plugin, even before the managed marketplace exists, so no additional `SessionStart` or renewal task is needed. The managed activation also installs Codex Session Logging 0.2.2 with historical backfills disabled. Fresh setup installs and schedules the current plugins immediately. An already-running task keeps the skill text it loaded at creation, while hook implementations switch to the selected cache automatically.
+
+Persistently disable or re-enable automatic network update checks with:
+
+```bash
+python3 ~/.codex/coreedge/runtime/current/update_plugin.py --disable-auto-update
+python3 ~/.codex/coreedge/runtime/current/update_plugin.py --enable-auto-update
+```
+
+`LINEAR_SYNC_AUTO_UPDATE=0` is also honored. When setup or a self-healing hook observes it, the opt-out is saved for future resident launches that do not inherit the shell environment.
 
 To force a manual update check:
 

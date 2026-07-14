@@ -79,7 +79,7 @@ This repository is a Codex plugin marketplace, not a single plugin source. Do no
 
 Setup installs a resident updater under `~/.codex/coreedge`. On macOS it checks at login and every 30 minutes, validates and stages the current `main.zip`, atomically switches the managed marketplace, selects one cache version per default plugin, and retains rollback copies outside Codex's cache scan. SessionStart and PreToolUse self-heal a missing service. Persistently disable or re-enable network checks with:
 
-Existing installations before `0.3.0` download `0.3.0` during ordinary Codex use. A following normal hook invocation launches the resident updater from that cached plugin even before the managed marketplace exists; it does not require another SessionStart or renewal task. Do not ask teammates to run an update command, deliberately restart Codex, or create a renewal thread. Fresh setup installs and schedules the current plugins immediately.
+Existing installations before `0.3.0` download `0.3.0` during ordinary Codex use. A following normal hook invocation launches the resident updater from that cached plugin even before the managed marketplace exists; it does not require another SessionStart or renewal task. Managed activation installs Codex Session Logging 0.2.2 with historical backfills disabled. Do not ask teammates to run an update command, deliberately restart Codex, or create a renewal thread. Fresh setup installs and schedules the current plugins immediately.
 
 ```bash
 python3 ~/.codex/coreedge/runtime/current/update_plugin.py --disable-auto-update
