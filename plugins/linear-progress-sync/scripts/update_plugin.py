@@ -614,6 +614,11 @@ def run_update(
             latest_version = str(manifest.get("version") or "").strip()
             if not latest_version:
                 raise ValueError("update manifest requires version")
+            archive_version = plugin_version(bootstrap_source)
+            if archive_version != latest_version:
+                raise ValueError(
+                    f"update manifest version {latest_version} does not match archive plugin {archive_version}"
+                )
             next_state = dict(state)
             next_state.update(
                 {
@@ -622,8 +627,43 @@ def run_update(
                     "manifest_url": str(url),
                 }
             )
-            # Reinstall equal versions when their content differs, but never downgrade.
-            if not version_is_newer(current_version, latest_version):
+            if version_is_newer(current_version, latest_version):
+                next_state["last_result"] = "newer_current"
+                next_state["installed_plugins"] = []
+                write_update_state(state_file, next_state)
+                return {
+                    "updated": False,
+                    "current_version": current_version,
+                    "latest_version": latest_version,
+                    "installed_plugins": [],
+                    "hooks": [],
+                    "resident": {},
+                    "skipped": "newer_current",
+                }
+
+            marketplace_path = find_marketplace_path(
+                extract_dir,
+                str(manifest.get("marketplace_path") or manifest.get("marketplace_subdir") or "").strip() or None,
+            )
+            if marketplace_path:
+                from resident_updater import activate_release
+
+                resident_result = activate_release(
+                    marketplace_repo_root(marketplace_path),
+                    cache_root=cache_root,
+                    install_service=False,
+                )
+                installed_plugins.extend(resident_result.get("installed_plugins", []))
+                for item in resident_result.get("plugins", []):
+                    plugin_path = cache_root / str(item["name"]) / str(item["version"])
+                    if item["name"] == PLUGIN_NAME:
+                        bootstrap_path = plugin_path
+                        bootstrap_installed = any(
+                            installed["name"] == PLUGIN_NAME for installed in installed_plugins
+                        )
+                    if install_hooks:
+                        hook_roots.append(plugin_path)
+            else:
                 bootstrap_result = install_plugin_if_needed(bootstrap_source, cache_root=cache_root)
                 bootstrap_path = Path(str(bootstrap_result["path"]))
                 bootstrap_installed = bool(bootstrap_result.get("installed"))
@@ -635,41 +675,8 @@ def run_update(
                             "path": bootstrap_result["path"],
                         }
                     )
-
-            if install_hooks:
-                hook_roots.append(bootstrap_path)
-
-            marketplace_path = find_marketplace_path(
-                extract_dir,
-                str(manifest.get("marketplace_path") or manifest.get("marketplace_subdir") or "").strip() or None,
-            )
-            if marketplace_path:
-                synced_names = {PLUGIN_NAME}
-                for plugin_dir in read_default_marketplace_plugins(marketplace_path):
-                    name = plugin_name(plugin_dir)
-                    if name in synced_names:
-                        continue
-                    synced_names.add(name)
-                    plugin_result = install_plugin_if_needed(plugin_dir, cache_root=cache_root)
-                    plugin_path = Path(str(plugin_result["path"]))
-                    if plugin_result.get("installed"):
-                        installed_plugins.append(
-                            {
-                                "name": plugin_result["name"],
-                                "version": plugin_result["version"],
-                                "path": plugin_result["path"],
-                            }
-                        )
-                    if install_hooks:
-                        hook_roots.append(plugin_path)
-
-                from resident_updater import activate_release
-
-                resident_result = activate_release(
-                    marketplace_repo_root(marketplace_path),
-                    cache_root=cache_root,
-                    install_service=False,
-                )
+                if install_hooks:
+                    hook_roots.append(bootstrap_path)
 
         hook_summary = refresh_plugins_hooks(hook_roots) if install_hooks else {"changed": False, "plugins": []}
         hook_results = hook_summary["plugins"]

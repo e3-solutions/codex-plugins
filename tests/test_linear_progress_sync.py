@@ -2204,6 +2204,100 @@ def test_run_update_repairs_corrupt_same_version_bootstrap_cache(tmp_path, monke
     assert second["updated"] is False
 
 
+def test_run_update_skips_entire_older_marketplace_without_partial_installs(tmp_path, monkeypatch):
+    update_plugin = load_update_plugin()
+    codex_home = tmp_path / "codex"
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    monkeypatch.setenv("LINEAR_SYNC_CONFIG_DIR", str(tmp_path / "config"))
+    cache_root = tmp_path / "cache" / "coreedge-local"
+    cache_parent = cache_root / "linear-progress-sync"
+    current = write_minimal_plugin(
+        cache_parent,
+        directory_name="0.4.0",
+        version="0.4.0",
+    )
+    write_minimal_plugin(
+        cache_root / "codex-session-logging",
+        name="codex-session-logging",
+        directory_name="0.2.2",
+        version="0.2.2",
+    )
+    archive, digest = make_marketplace_archive(tmp_path, bootstrap_version="0.3.0")
+    manifest = tmp_path / "latest.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "version": "0.3.0",
+                "archive_url": archive.as_uri(),
+                "sha256": digest,
+                "plugin_subdir": "plugins/linear-progress-sync",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = update_plugin.run_update(
+        current_plugin_root=current,
+        cache_parent=cache_parent,
+        manifest_url=manifest.as_uri(),
+        state_path=tmp_path / "update-state.json",
+        force=True,
+        install_hooks=False,
+    )
+
+    assert result["updated"] is False
+    assert result["skipped"] == "newer_current"
+    assert sorted(path.name for path in cache_parent.iterdir() if not path.name.startswith(".")) == ["0.4.0"]
+    logging_parent = cache_root / "codex-session-logging"
+    assert sorted(path.name for path in logging_parent.iterdir() if not path.name.startswith(".")) == ["0.2.2"]
+    assert not (codex_home / "coreedge" / "marketplace" / "current").exists()
+
+
+def test_run_update_rolls_back_new_cache_install_when_activation_fails(tmp_path, monkeypatch):
+    update_plugin = load_update_plugin()
+    resident = sys.modules["resident_updater"]
+    codex_home = tmp_path / "codex"
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    monkeypatch.setenv("LINEAR_SYNC_CONFIG_DIR", str(tmp_path / "config"))
+    cache_root = tmp_path / "cache" / "coreedge-local"
+    cache_parent = cache_root / "linear-progress-sync"
+    current = write_minimal_plugin(
+        cache_parent,
+        directory_name="0.2.11",
+        version="0.2.11",
+    )
+    archive, digest = make_marketplace_archive(tmp_path, bootstrap_version="0.3.0")
+    manifest = tmp_path / "latest.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "version": "0.3.0",
+                "archive_url": archive.as_uri(),
+                "sha256": digest,
+                "plugin_subdir": "plugins/linear-progress-sync",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    def fail_runtime(*_args, **_kwargs):
+        raise OSError("simulated runtime failure")
+
+    monkeypatch.setattr(resident, "install_runtime", fail_runtime)
+    with pytest.raises(OSError, match="simulated runtime failure"):
+        update_plugin.run_update(
+            current_plugin_root=current,
+            cache_parent=cache_parent,
+            manifest_url=manifest.as_uri(),
+            state_path=tmp_path / "update-state.json",
+            force=True,
+            install_hooks=False,
+        )
+
+    assert sorted(path.name for path in cache_parent.iterdir() if not path.name.startswith(".")) == ["0.2.11"]
+    assert not (cache_root / "codex-session-logging").exists()
+
+
 def test_update_plugin_rejects_archive_with_wrong_sha(tmp_path, monkeypatch):
     update_plugin = load_update_plugin()
     monkeypatch.setenv("LINEAR_SYNC_CONFIG_DIR", str(tmp_path / "config"))
@@ -2396,6 +2490,7 @@ def test_resident_marketplace_activation_is_atomic_and_deterministic(tmp_path):
     assert "/tmp/deleted-worktree" not in config
     assert result["changed"] is True
     assert second["changed"] is False
+    assert json.loads(json.dumps(result))["version"] == "0.3.0"
 
 
 def test_resident_activation_rolls_back_cache_config_and_pointer_on_failure(tmp_path, monkeypatch):
@@ -2429,6 +2524,7 @@ def test_resident_activation_rolls_back_cache_config_and_pointer_on_failure(tmp_
         '[marketplaces.coreedge-local]\nsource_type = "local"\nsource = "/old/source"\n',
         encoding="utf-8",
     )
+    os.chmod(config_path, 0o600)
     resident_root = tmp_path / "resident"
     resident.activate_release(
         old_repo,
@@ -2454,6 +2550,7 @@ def test_resident_activation_rolls_back_cache_config_and_pointer_on_failure(tmp_
         )
 
     assert config_path.read_text(encoding="utf-8") == before_config
+    assert config_path.stat().st_mode & 0o777 == 0o600
     assert (resident_root / "marketplace" / "current").resolve() == before_target
     assert (resident_root / "runtime" / "current").resolve() == before_runtime
     assert (cache_root / "linear-progress-sync" / "0.2.11").exists()
@@ -2601,6 +2698,131 @@ def test_resident_activation_repairs_corrupt_managed_release_and_runtime(tmp_pat
     assert managed_hook.read_bytes() == (repo / "plugins" / "linear-progress-sync" / "hooks" / "hooks.json").read_bytes()
 
 
+def test_resident_activation_restores_replaced_same_version_release_on_failure(tmp_path, monkeypatch):
+    resident = load_resident_updater()
+    original_repo = tmp_path / "original"
+    changed_repo = tmp_path / "changed"
+    for repo, marker in ((original_repo, "original"), (changed_repo, "changed")):
+        plugin = write_minimal_plugin(repo / "plugins", name="linear-progress-sync", version="0.3.0")
+        (plugin / "hooks" / "hooks.json").write_text(
+            json.dumps({"hooks": {}, "marker": marker}) + "\n",
+            encoding="utf-8",
+        )
+        (repo / ".agents" / "plugins").mkdir(parents=True)
+        (repo / ".agents" / "plugins" / "marketplace.json").write_text(
+            json.dumps(
+                {
+                    "name": "coreedge-local",
+                    "plugins": [
+                        {
+                            "name": "linear-progress-sync",
+                            "source": {"source": "local", "path": "./plugins/linear-progress-sync"},
+                            "policy": {"installation": "INSTALLED_BY_DEFAULT"},
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+    codex_home = tmp_path / "codex"
+    resident_root = tmp_path / "resident"
+    resident.activate_release(
+        original_repo,
+        codex_home=codex_home,
+        resident_root=resident_root,
+        install_service=False,
+    )
+
+    real_copy_release = resident.copy_marketplace_release
+
+    def copy_then_fail_validation(*args, **kwargs):
+        result = real_copy_release(*args, **kwargs)
+
+        def fail_validation(*_args, **_kwargs):
+            raise OSError("simulated post-staging validation failure")
+
+        monkeypatch.setattr(resident, "marketplace_plugins", fail_validation)
+        return result
+
+    monkeypatch.setattr(resident, "copy_marketplace_release", copy_then_fail_validation)
+    with pytest.raises(OSError, match="post-staging validation failure"):
+        resident.activate_release(
+            changed_repo,
+            codex_home=codex_home,
+            resident_root=resident_root,
+            install_service=False,
+        )
+
+    managed_hook = resident_root / "marketplace" / "current" / "plugins" / "linear-progress-sync" / "hooks" / "hooks.json"
+    cache_hook = codex_home / "plugins" / "cache" / "coreedge-local" / "linear-progress-sync" / "0.3.0" / "hooks" / "hooks.json"
+    assert json.loads(managed_hook.read_text(encoding="utf-8"))["marker"] == "original"
+    assert json.loads(cache_hook.read_text(encoding="utf-8"))["marker"] == "original"
+
+
+def test_resident_activation_restores_same_version_runtime_when_service_setup_fails(tmp_path, monkeypatch):
+    resident = load_resident_updater()
+    original_repo = tmp_path / "original"
+    plugin = write_minimal_plugin(
+        original_repo / "plugins",
+        name="linear-progress-sync",
+        version="0.3.0",
+    )
+    (original_repo / ".agents" / "plugins").mkdir(parents=True)
+    (original_repo / ".agents" / "plugins" / "marketplace.json").write_text(
+        json.dumps(
+            {
+                "name": "coreedge-local",
+                "plugins": [
+                    {
+                        "name": "linear-progress-sync",
+                        "source": {"source": "local", "path": "./plugins/linear-progress-sync"},
+                        "policy": {"installation": "INSTALLED_BY_DEFAULT"},
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    changed_repo = tmp_path / "changed"
+    shutil.copytree(original_repo, changed_repo)
+    changed_script = changed_repo / "plugins" / "linear-progress-sync" / "scripts" / "update_plugin.py"
+    changed_script.write_text("VERSION = 'changed-same-version'\n", encoding="utf-8")
+    codex_home = tmp_path / "codex"
+    resident_root = tmp_path / "resident"
+    resident.activate_release(
+        original_repo,
+        codex_home=codex_home,
+        resident_root=resident_root,
+        install_service=False,
+    )
+    runtime_script = resident_root / "runtime" / "current" / "update_plugin.py"
+    original_runtime = runtime_script.read_bytes()
+
+    def fail_service(*_args, **_kwargs):
+        raise OSError("simulated service setup failure")
+
+    def fail_config_restore(*_args, **_kwargs):
+        raise PermissionError("simulated config rollback failure")
+
+    monkeypatch.setattr(resident, "ensure_resident_updater", fail_service)
+    monkeypatch.setattr(resident, "restore_file", fail_config_restore)
+    with pytest.raises(RuntimeError, match="marketplace config: simulated config rollback failure") as exc_info:
+        resident.activate_release(
+            changed_repo,
+            codex_home=codex_home,
+            resident_root=resident_root,
+            install_service=True,
+        )
+    assert isinstance(exc_info.value.__cause__, OSError)
+    assert "service setup failure" in str(exc_info.value.__cause__)
+
+    assert runtime_script.read_bytes() == original_runtime
+    managed_script = resident_root / "marketplace" / "current" / "plugins" / "linear-progress-sync" / "scripts" / "update_plugin.py"
+    cache_script = codex_home / "plugins" / "cache" / "coreedge-local" / "linear-progress-sync" / "0.3.0" / "scripts" / "update_plugin.py"
+    assert managed_script.read_bytes() == original_runtime
+    assert cache_script.read_bytes() == original_runtime
+
+
 def test_resident_marketplace_rejects_source_path_escape(tmp_path):
     resident = load_resident_updater()
     repo = tmp_path / "repo"
@@ -2714,8 +2936,9 @@ def test_resident_runtime_and_launch_agent_are_idempotent(tmp_path, monkeypatch)
     assert "com.coreedge.codex-plugins-updater" in plist_text
     assert first["changed"] is True
     assert second["changed"] is False
-    assert len(calls) == 1
+    assert len(calls) == 2
     assert calls[0][0][:3] == ["launchctl", "bootstrap", "gui/501"]
+    assert calls[1][0][:3] == ["launchctl", "print", "gui/501/com.coreedge.codex-plugins-updater"]
 
 
 def test_resident_runner_bootstraps_from_cached_plugin_before_managed_marketplace_exists(tmp_path):
@@ -2806,14 +3029,6 @@ def test_resident_launch_agent_recovers_when_plist_exists_but_job_is_unloaded(tm
         version="0.3.0",
     )
     launch_agents = tmp_path / "LaunchAgents"
-    launch_agents.mkdir()
-    plist = launch_agents / "com.coreedge.codex-plugins-updater.plist"
-    plist.write_bytes(
-        resident.launch_agent_payload(
-            runner_path=tmp_path / "resident" / "run.sh",
-            resident_root=tmp_path / "resident",
-        )
-    )
     calls = []
 
     class Completed:
@@ -2825,9 +3040,18 @@ def test_resident_launch_agent_recovers_when_plist_exists_but_job_is_unloaded(tm
 
     def runner(args, **_kwargs):
         calls.append(args)
-        return Completed(1 if args[1] == "kickstart" else 0)
+        return Completed(1 if args[1] in {"print", "kickstart"} else 0)
 
     monkeypatch.setattr(resident.os, "getuid", lambda: 501)
+    resident.ensure_resident_updater(
+        plugin_root,
+        codex_home=tmp_path / "codex",
+        resident_root=tmp_path / "resident",
+        launch_agents_dir=launch_agents,
+        platform="darwin",
+        runner=runner,
+    )
+    calls.clear()
     result = resident.ensure_resident_updater(
         plugin_root,
         codex_home=tmp_path / "codex",
@@ -2838,8 +3062,9 @@ def test_resident_launch_agent_recovers_when_plist_exists_but_job_is_unloaded(tm
     )
 
     assert result["scheduled"] is True
-    assert calls[0][1] == "kickstart"
-    assert calls[1][:3] == ["launchctl", "bootstrap", "gui/501"]
+    assert calls[0][:3] == ["launchctl", "print", "gui/501/com.coreedge.codex-plugins-updater"]
+    assert calls[1][1] == "kickstart"
+    assert calls[2][:3] == ["launchctl", "bootstrap", "gui/501"]
 
 
 def test_marketplace_config_migration_supports_quoted_section_and_preserves_comments(tmp_path):
@@ -2910,6 +3135,58 @@ def test_resident_doctor_reports_activation_drift(tmp_path):
     assert "managed marketplace pointer is missing or broken" in result["issues"]
     assert "marketplace config does not point at the managed current release" in result["issues"]
     assert "resident updater LaunchAgent is not installed" in result["issues"]
+
+
+def test_resident_doctor_reports_content_corruption_and_unloaded_service(tmp_path, monkeypatch):
+    resident = load_resident_updater()
+    codex_home = tmp_path / "codex"
+    resident_root = tmp_path / "resident"
+    cache_root = codex_home / "plugins" / "cache" / "coreedge-local"
+    for plugin in resident.marketplace_plugins(ROOT):
+        destination = cache_root / str(plugin["name"]) / str(plugin["version"])
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(Path(plugin["source"]), destination)
+    launch_agents = tmp_path / "LaunchAgents"
+
+    class Completed:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    monkeypatch.setattr(resident.os, "getuid", lambda: 501)
+    resident.activate_release(
+        ROOT,
+        codex_home=codex_home,
+        resident_root=resident_root,
+        launch_agents_dir=launch_agents,
+        platform="darwin",
+        runner=lambda *_args, **_kwargs: Completed(),
+    )
+    broken_cache_script = (
+        cache_root
+        / "linear-progress-sync"
+        / "0.3.0"
+        / "scripts"
+        / "update_plugin.py"
+    )
+    broken_cache_script.write_text("VERSION = 'corrupt but valid'\n", encoding="utf-8")
+
+    class Unloaded:
+        returncode = 1
+        stdout = ""
+        stderr = "not loaded"
+
+    result = resident.doctor(
+        codex_home=codex_home,
+        resident_root=resident_root,
+        launch_agents_dir=launch_agents,
+        platform="darwin",
+        runner=lambda *_args, **_kwargs: Unloaded(),
+    )
+
+    assert result["healthy"] is False
+    assert "linear-progress-sync cache content is incomplete or corrupt" in result["issues"]
+    assert "resident updater LaunchAgent is installed but not loaded" in result["issues"]
 
 
 def test_update_lock_reclaims_dead_process(tmp_path, monkeypatch):

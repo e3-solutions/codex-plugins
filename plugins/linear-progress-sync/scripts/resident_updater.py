@@ -167,10 +167,17 @@ def copy_marketplace_release(repo_root: str | Path, *, resident_root: str | Path
             pass
         else:
             if marketplace_matches and plugins_match:
-                return {"changed": False, "path": target, "version": linear_version, "plugins": plugins}
+                return {
+                    "changed": False,
+                    "path": target,
+                    "version": linear_version,
+                    "plugins": plugins,
+                    "previous": None,
+                }
 
     releases.mkdir(parents=True, exist_ok=True)
     temporary = Path(tempfile.mkdtemp(prefix=f".{linear_version}.", dir=str(releases)))
+    previous: Path | None = None
     try:
         marketplace_source = root / ".agents" / "plugins" / "marketplace.json"
         marketplace_target = temporary / ".agents" / "plugins" / "marketplace.json"
@@ -182,20 +189,25 @@ def copy_marketplace_release(repo_root: str | Path, *, resident_root: str | Path
             shutil.copytree(Path(plugin["source"]), destination)
         marketplace_plugins(temporary)
         if target.exists():
-            quarantine = target.with_name(f".{target.name}.{uuid.uuid4().hex}.corrupt")
-            target.replace(quarantine)
+            previous = target.with_name(f".{target.name}.{uuid.uuid4().hex}.previous")
+            target.replace(previous)
             try:
                 temporary.replace(target)
             except Exception:
-                quarantine.replace(target)
+                previous.replace(target)
                 raise
-            shutil.rmtree(quarantine, ignore_errors=True)
         else:
             temporary.replace(target)
     except Exception:
         shutil.rmtree(temporary, ignore_errors=True)
         raise
-    return {"changed": True, "path": target, "version": linear_version, "plugins": plugins}
+    return {
+        "changed": True,
+        "path": target,
+        "version": linear_version,
+        "plugins": plugins,
+        "previous": previous,
+    }
 
 
 def atomic_symlink(target: Path, link: Path) -> bool:
@@ -307,7 +319,7 @@ def configured_marketplace_source(config_path: str | Path) -> str | None:
     return None
 
 
-def restore_file(path: Path, existed: bool, content: bytes) -> None:
+def restore_file(path: Path, existed: bool, content: bytes, *, mode: int | None = None) -> None:
     if not existed:
         try:
             path.unlink()
@@ -317,7 +329,95 @@ def restore_file(path: Path, existed: bool, content: bytes) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
     temporary.write_bytes(content)
+    if mode is not None:
+        os.chmod(temporary, mode)
     os.replace(temporary, path)
+
+
+def remove_path(path: Path) -> None:
+    if path.is_symlink() or path.is_file():
+        path.unlink(missing_ok=True)
+    elif path.exists():
+        shutil.rmtree(path)
+
+
+def touch_tree(root: Path) -> None:
+    for path in root.rglob("*"):
+        try:
+            os.utime(path, None)
+        except OSError:
+            continue
+    try:
+        os.utime(root, None)
+    except OSError:
+        pass
+
+
+def install_plugin_cache(
+    source: Path,
+    target: Path,
+) -> tuple[bool, tuple[Path, Path | None] | None]:
+    try:
+        source_metadata = plugin_metadata(source)
+        target_metadata = plugin_metadata(target)
+        if (
+            target_metadata["name"] == source_metadata["name"]
+            and target_metadata["version"] == source_metadata["version"]
+            and plugin_tree_matches(source, target)
+        ):
+            return False, None
+    except (FileNotFoundError, OSError, ValueError, json.JSONDecodeError):
+        pass
+
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary_parent = Path(tempfile.mkdtemp(prefix=f".{target.name}.", dir=str(target.parent)))
+    temporary_target = temporary_parent / target.name
+    previous: Path | None = None
+    try:
+        shutil.copytree(source, temporary_target)
+        touch_tree(temporary_target)
+        if target.exists() or target.is_symlink():
+            previous = target.with_name(f".{target.name}.{uuid.uuid4().hex}.previous")
+            target.replace(previous)
+        try:
+            temporary_target.replace(target)
+        except Exception:
+            if previous is not None and previous.exists():
+                previous.replace(target)
+            raise
+    finally:
+        shutil.rmtree(temporary_parent, ignore_errors=True)
+    return True, (target, previous)
+
+
+def rollback_plugin_cache_installs(replacements: list[tuple[Path, Path | None]]) -> None:
+    for target, previous in reversed(replacements):
+        remove_path(target)
+        if previous is not None and previous.exists():
+            previous.replace(target)
+        elif previous is None:
+            try:
+                target.parent.rmdir()
+            except OSError:
+                pass
+
+
+def commit_plugin_cache_installs(replacements: list[tuple[Path, Path | None]]) -> None:
+    for _target, previous in replacements:
+        if previous is not None:
+            remove_path(previous)
+
+
+def rollback_marketplace_release(target: Path, previous: Path | None) -> None:
+    if previous is None or not previous.exists():
+        return
+    remove_path(target)
+    previous.replace(target)
+
+
+def commit_marketplace_release(previous: Path | None) -> None:
+    if previous is not None:
+        remove_path(previous)
 
 
 def activate_plugin_caches(
@@ -379,7 +479,27 @@ def restore_plugin_caches(moved: list[tuple[Path, Path]]) -> None:
         shutil.move(str(rollback), str(original))
 
 
-def install_runtime(plugin_root: str | Path, *, resident_root: str | Path) -> JsonDict:
+def runtime_matches_plugin(plugin_root: str | Path, runtime_root: str | Path) -> bool:
+    plugin = Path(plugin_root).expanduser().resolve()
+    runtime = Path(runtime_root).expanduser().resolve()
+    try:
+        for script_name in RUNTIME_SCRIPTS:
+            script = runtime / script_name
+            content = script.read_text(encoding="utf-8")
+            compile(content, str(script), "exec")
+            if script.read_bytes() != (plugin / "scripts" / script_name).read_bytes():
+                return False
+    except (FileNotFoundError, OSError, SyntaxError, UnicodeError):
+        return False
+    return True
+
+
+def install_runtime(
+    plugin_root: str | Path,
+    *,
+    resident_root: str | Path,
+    retain_previous: bool = False,
+) -> JsonDict:
     plugin = Path(plugin_root).expanduser().resolve()
     metadata = plugin_metadata(plugin)
     version = str(metadata["version"])
@@ -387,18 +507,8 @@ def install_runtime(plugin_root: str | Path, *, resident_root: str | Path) -> Js
     releases = resident / "runtime" / "releases"
     target = releases / version
     changed = False
-    valid_target = False
-    if target.exists():
-        try:
-            for script_name in RUNTIME_SCRIPTS:
-                script = target / script_name
-                content = script.read_text(encoding="utf-8")
-                compile(content, str(script), "exec")
-                if script.read_bytes() != (plugin / "scripts" / script_name).read_bytes():
-                    raise ValueError(f"resident runtime differs from plugin source: {script}")
-            valid_target = True
-        except (FileNotFoundError, OSError, SyntaxError, UnicodeError, ValueError):
-            valid_target = False
+    previous: Path | None = None
+    valid_target = target.exists() and runtime_matches_plugin(plugin, target)
     if not valid_target:
         releases.mkdir(parents=True, exist_ok=True)
         temporary = Path(tempfile.mkdtemp(prefix=f".{version}.", dir=str(releases)))
@@ -409,25 +519,36 @@ def install_runtime(plugin_root: str | Path, *, resident_root: str | Path) -> Js
                 compile(content, str(source), "exec")
                 shutil.copy2(source, temporary / script_name)
             if target.exists():
-                quarantine = target.with_name(f".{target.name}.{uuid.uuid4().hex}.corrupt")
-                target.replace(quarantine)
+                previous = target.with_name(f".{target.name}.{uuid.uuid4().hex}.previous")
+                target.replace(previous)
                 try:
                     temporary.replace(target)
                 except Exception:
-                    quarantine.replace(target)
+                    previous.replace(target)
                     raise
-                shutil.rmtree(quarantine, ignore_errors=True)
             else:
                 temporary.replace(target)
             changed = True
         except Exception:
             shutil.rmtree(temporary, ignore_errors=True)
             raise
-    for script_name in RUNTIME_SCRIPTS:
-        script = target / script_name
-        compile(script.read_text(encoding="utf-8"), str(script), "exec")
-    pointer_changed = atomic_symlink(target, resident / "runtime" / "current")
-    return {"changed": changed or pointer_changed, "path": target, "version": version}
+    try:
+        for script_name in RUNTIME_SCRIPTS:
+            script = target / script_name
+            compile(script.read_text(encoding="utf-8"), str(script), "exec")
+        pointer_changed = atomic_symlink(target, resident / "runtime" / "current")
+    except Exception:
+        rollback_marketplace_release(target, previous)
+        raise
+    if previous is not None and not retain_previous:
+        commit_marketplace_release(previous)
+        previous = None
+    return {
+        "changed": changed or pointer_changed,
+        "path": str(target),
+        "version": version,
+        "previous": previous,
+    }
 
 
 def runner_script(*, resident_root: Path, codex_home: Path, bootstrap_plugin_root: Path) -> str:
@@ -548,16 +669,26 @@ def ensure_resident_updater(
         mode=0o644,
     )
     service_stamp = resident / "service-active"
-    needs_load = plist_changed or not service_stamp.exists()
-    if not needs_load:
-        return {
-            "installed": True,
-            "scheduled": True,
-            "changed": bool(preference_changed or runtime["changed"] or runner_changed),
-            "runtime": str(runtime["path"]),
-            "plist": str(plist_path),
-        }
     domain = f"gui/{os.getuid()}"
+    if not plist_changed and service_stamp.exists():
+        try:
+            probe = runner(
+                ["launchctl", "print", f"{domain}/{SERVICE_LABEL}"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+            )
+        except (FileNotFoundError, OSError):
+            probe = None
+        if probe is not None and probe.returncode == 0:
+            return {
+                "installed": True,
+                "scheduled": True,
+                "changed": bool(preference_changed or runtime["changed"] or runner_changed),
+                "runtime": str(runtime["path"]),
+                "plist": str(plist_path),
+            }
     try:
         service_stamp.unlink()
     except FileNotFoundError:
@@ -627,9 +758,6 @@ def activate_release(
 ) -> JsonDict:
     codex = Path(codex_home or default_codex_home()).expanduser().resolve()
     resident = Path(resident_root or default_resident_root(codex)).expanduser().resolve()
-    release = copy_marketplace_release(repo_root, resident_root=resident)
-    staged_root = Path(release["path"])
-    plugins = marketplace_plugins(staged_root)
     current = resident / "marketplace" / "current"
     previous_target = current.resolve() if current.is_symlink() and current.exists() else None
     runtime_pointer = resident / "runtime" / "current"
@@ -639,19 +767,50 @@ def activate_release(
     config_path = codex / "config.toml"
     config_existed = config_path.exists()
     config_content = config_path.read_bytes() if config_existed else b""
+    config_mode = stat.S_IMODE(config_path.stat().st_mode) if config_existed else None
+    cache = Path(cache_root or codex / "plugins" / "cache" / MARKETPLACE_NAME).expanduser().resolve()
+    replacements: list[tuple[Path, Path | None]] = []
+    installed_plugins: list[JsonDict] = []
     moved: list[tuple[Path, Path]] = []
     pointer_changed = False
     config_changed = False
+    release: JsonDict | None = None
+    staged_root: Path | None = None
+    previous_release: Path | None = None
+    runtime_target: Path | None = None
+    previous_runtime_release: Path | None = None
     try:
+        release = copy_marketplace_release(repo_root, resident_root=resident)
+        staged_root = Path(release["path"])
+        if release.get("previous") is not None:
+            previous_release = Path(release["previous"])
+        plugins = marketplace_plugins(staged_root)
+        for plugin in plugins:
+            target = cache / str(plugin["name"]) / str(plugin["version"])
+            installed, replacement = install_plugin_cache(Path(plugin["source"]), target)
+            if replacement is not None:
+                replacements.append(replacement)
+            if installed:
+                installed_plugins.append(
+                    {
+                        "name": plugin["name"],
+                        "version": plugin["version"],
+                        "path": str(target),
+                    }
+                )
         pointer_changed = atomic_symlink(staged_root, current)
         config_changed = update_marketplace_config(config_path, current)
         moved = activate_plugin_caches(
             plugins,
-            cache_root=cache_root or codex / "plugins" / "cache" / MARKETPLACE_NAME,
+            cache_root=cache,
             rollback_root=resident / "rollback" / "cache",
         )
         linear_root = next(Path(item["source"]) for item in marketplace_plugins(current) if item["name"] == "linear-progress-sync")
-        runtime = install_runtime(linear_root, resident_root=resident)
+        runtime = install_runtime(linear_root, resident_root=resident, retain_previous=True)
+        runtime_target = Path(runtime["path"])
+        retained_runtime = runtime.pop("previous", None)
+        if retained_runtime is not None:
+            previous_runtime_release = Path(retained_runtime)
         service = (
             ensure_resident_updater(
                 linear_root,
@@ -664,18 +823,52 @@ def activate_release(
             if install_service
             else {"installed": False, "scheduled": False, "changed": False}
         )
-    except Exception:
-        restore_plugin_caches(moved)
-        restore_file(config_path, config_existed, config_content)
-        restore_symlink(current, previous_target)
-        restore_symlink(runtime_pointer, previous_runtime_target)
+    except Exception as activation_error:
+        rollback_errors: list[str] = []
+        actions: list[tuple[str, Callable[[], None]]] = [
+            ("pruned caches", lambda: restore_plugin_caches(moved)),
+            ("installed caches", lambda: rollback_plugin_cache_installs(replacements)),
+            (
+                "marketplace config",
+                lambda: restore_file(config_path, config_existed, config_content, mode=config_mode),
+            ),
+            ("marketplace pointer", lambda: restore_symlink(current, previous_target)),
+            ("runtime pointer", lambda: restore_symlink(runtime_pointer, previous_runtime_target)),
+        ]
+        if runtime_target is not None:
+            actions.append(
+                (
+                    "runtime release",
+                    lambda: rollback_marketplace_release(runtime_target, previous_runtime_release),
+                )
+            )
+        if staged_root is not None:
+            actions.append(
+                (
+                    "marketplace release",
+                    lambda: rollback_marketplace_release(staged_root, previous_release),
+                )
+            )
+        for label, action in actions:
+            try:
+                action()
+            except Exception as rollback_error:
+                rollback_errors.append(f"{label}: {rollback_error}")
+        if rollback_errors:
+            details = "; ".join(rollback_errors)
+            raise RuntimeError(f"activation failed and rollback was incomplete: {details}") from activation_error
         raise
+    commit_plugin_cache_installs(replacements)
+    commit_marketplace_release(previous_release)
+    commit_marketplace_release(previous_runtime_release)
+    assert release is not None and staged_root is not None
     changed = bool(release["changed"] or pointer_changed or config_changed or moved or runtime["changed"] or service["changed"])
     return {
         "changed": changed,
         "version": release["version"],
         "marketplace": str(current),
         "plugins": [{"name": item["name"], "version": item["version"]} for item in plugins],
+        "installed_plugins": installed_plugins,
         "pruned": [{"name": original.parent.name, "version": original.name} for original, _ in moved],
         "runtime": runtime,
         "service": service,
@@ -688,6 +881,7 @@ def doctor(
     resident_root: str | Path | None = None,
     launch_agents_dir: str | Path | None = None,
     platform: str | None = None,
+    runner: Callable[..., Any] = subprocess.run,
 ) -> JsonDict:
     codex = Path(codex_home or default_codex_home()).expanduser().resolve()
     resident = Path(resident_root or default_resident_root(codex)).expanduser().resolve()
@@ -719,6 +913,13 @@ def doctor(
         issues.append("resident updater runtime pointer is missing or broken")
     elif result.get("marketplace_version") and runtime.resolve().name != result["marketplace_version"]:
         issues.append("resident updater runtime version does not match the marketplace")
+    elif plugins:
+        linear_source = next(
+            (Path(item["source"]) for item in plugins if item["name"] == "linear-progress-sync"),
+            None,
+        )
+        if linear_source is not None and not runtime_matches_plugin(linear_source, runtime):
+            issues.append("resident updater runtime content is incomplete or corrupt")
     cache_versions: dict[str, list[str]] = {}
     cache_root = codex / "plugins" / "cache" / MARKETPLACE_NAME
     for plugin in plugins:
@@ -733,6 +934,8 @@ def doctor(
             issues.append(
                 f"{plugin['name']} cache selection is {visible or 'missing'}, expected only {plugin['version']}"
             )
+        elif not plugin_tree_matches(Path(plugin["source"]), parent / str(plugin["version"])):
+            issues.append(f"{plugin['name']} cache content is incomplete or corrupt")
     result["cache_versions"] = cache_versions
     if (platform or sys.platform) == "darwin":
         agents = Path(launch_agents_dir or Path.home() / "Library" / "LaunchAgents").expanduser().resolve()
@@ -740,6 +943,22 @@ def doctor(
         result["launch_agent"] = str(plist_path)
         if not plist_path.is_file():
             issues.append("resident updater LaunchAgent is not installed")
+        else:
+            domain = f"gui/{os.getuid()}"
+            try:
+                probe = runner(
+                    ["launchctl", "print", f"{domain}/{SERVICE_LABEL}"],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    check=False,
+                )
+                loaded = probe.returncode == 0
+            except (FileNotFoundError, OSError):
+                loaded = False
+            result["launch_agent_loaded"] = loaded
+            if not loaded:
+                issues.append("resident updater LaunchAgent is installed but not loaded")
     result["issues"] = issues
     result["healthy"] = not issues
     return result
