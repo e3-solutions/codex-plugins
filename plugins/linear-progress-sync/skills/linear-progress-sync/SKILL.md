@@ -79,7 +79,7 @@ This repository is a Codex plugin marketplace, not a single plugin source. Do no
 
 Setup installs a resident updater under `~/.codex/coreedge`. On macOS it checks at login and every 30 minutes, validates and stages the current `main.zip`, atomically switches the managed marketplace, selects one cache version per default plugin, and retains rollback copies outside Codex's cache scan. SessionStart and PreToolUse self-heal a missing service. Persistently disable or re-enable network checks with:
 
-Existing installations before `0.3.0` download `0.3.0` during ordinary Codex use. A following normal hook invocation launches the resident updater from that cached plugin even before the managed marketplace exists; it does not require another SessionStart or renewal task. Managed activation installs Codex Session Logging 0.2.2 with historical backfills disabled. Do not ask teammates to run an update command, deliberately restart Codex, or create a renewal thread. Fresh setup installs and schedules the current plugins immediately.
+Existing 0.3.0 installations activate `0.3.1` with historical backfills disabled during one ordinary resident check. The next successful scheduled check, normally within 30 minutes while the Mac is logged in and awake, runs the new updater runtime and installs the separate one-minute metadata-only task-presence publisher. Both checks are automatic; presence does not depend on an already-running Codex process reloading hooks. Do not ask teammates to run an update command, deliberately restart Codex, or create a renewal thread. Fresh setup installs and schedules the current plugins immediately.
 
 ```bash
 python3 ~/.codex/coreedge/runtime/current/update_plugin.py --disable-auto-update
@@ -99,6 +99,8 @@ Inspect updater health:
 ```bash
 python3 ~/.codex/coreedge/runtime/current/update_plugin.py --doctor
 ```
+
+The doctor result includes both the resident updater and the metadata-only task-presence LaunchAgent. Presence runs once per minute and does not require Codex to reload hooks.
 
 If Codex asks to review hooks after setup, trust the Linear Progress Sync and Codex Session Logging hooks once. Automatic kickoff and session capture depend on those hooks running.
 

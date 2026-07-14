@@ -13,6 +13,7 @@ import subprocess
 import sys
 import tempfile
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
@@ -21,7 +22,10 @@ JsonDict = dict[str, Any]
 MARKETPLACE_NAME = "coreedge-local"
 DEFAULT_INSTALL_POLICY = "INSTALLED_BY_DEFAULT"
 SERVICE_LABEL = "com.coreedge.codex-plugins-updater"
+PRESENCE_SERVICE_LABEL = "com.coreedge.codex-session-presence"
 UPDATE_INTERVAL_SECONDS = 1800
+PRESENCE_INTERVAL_SECONDS = 60
+PRESENCE_HEALTH_GRACE_SECONDS = 5 * PRESENCE_INTERVAL_SECONDS
 RUNTIME_SCRIPTS = ("linear_sync.py", "resident_updater.py", "update_plugin.py")
 IGNORED_TREE_NAMES = {".DS_Store", "__pycache__"}
 
@@ -577,6 +581,73 @@ exec "$python_bin" {shlex.quote(str(runtime / "update_plugin.py"))} --plugin-roo
 """
 
 
+def presence_runner_script(*, resident_root: Path, codex_home: Path) -> str:
+    managed_script = (
+        resident_root
+        / "marketplace"
+        / "current"
+        / "plugins"
+        / "codex-session-logging"
+        / "scripts"
+        / "publish_presence.py"
+    )
+    return f"""#!/bin/sh
+set -eu
+umask 077
+PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin
+export PATH
+export CODEX_HOME={shlex.quote(str(codex_home))}
+python_bin=$(command -v python3 || true)
+[ -n "$python_bin" ] || exit 0
+script={shlex.quote(str(managed_script))}
+if [ ! -f "$script" ]; then
+  cache_parent={shlex.quote(str(codex_home / "plugins" / "cache" / MARKETPLACE_NAME / "codex-session-logging"))}
+  script=$("$python_bin" - "$cache_parent" <<'PY'
+import json
+import re
+import sys
+from pathlib import Path
+
+parent = Path(sys.argv[1])
+candidates = []
+for manifest in parent.glob("*/.codex-plugin/plugin.json"):
+    try:
+        payload = json.loads(manifest.read_text(encoding="utf-8"))
+        version = str(payload["version"])
+        if payload.get("name") != "codex-session-logging" or manifest.parents[1].name != version:
+            continue
+        script = manifest.parents[1] / "scripts" / "publish_presence.py"
+        if not script.is_file():
+            continue
+        match = re.fullmatch(r"(\\d+)\\.(\\d+)\\.(\\d+)(?:-([0-9A-Za-z.-]+))?(?:\\+[0-9A-Za-z.-]+)?", version)
+        if match is None:
+            continue
+        prerelease = match.group(4)
+        prerelease_key = tuple(
+            (0, int(part)) if part.isdigit() else (1, part.lower())
+            for part in (prerelease or "").split(".")
+            if part
+        )
+        key = (
+            int(match.group(1)),
+            int(match.group(2)),
+            int(match.group(3)),
+            prerelease is None,
+            prerelease_key,
+        )
+        candidates.append((key, str(script)))
+    except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError):
+        continue
+if candidates:
+    print(max(candidates)[1])
+PY
+  )
+fi
+[ -n "$script" ] && [ -f "$script" ] || exit 0
+exec "$python_bin" "$script" --quiet
+"""
+
+
 def write_if_changed(path: Path, content: bytes, *, mode: int | None = None) -> bool:
     try:
         if path.read_bytes() == content:
@@ -609,6 +680,160 @@ def launch_agent_payload(*, runner_path: Path, resident_root: Path) -> bytes:
     return plistlib.dumps(payload, fmt=plistlib.FMT_XML, sort_keys=True)
 
 
+def presence_launch_agent_payload(*, runner_path: Path, resident_root: Path) -> bytes:
+    logs = resident_root / "logs"
+    payload = {
+        "Label": PRESENCE_SERVICE_LABEL,
+        "ProgramArguments": [str(runner_path)],
+        "RunAtLoad": True,
+        "StartInterval": PRESENCE_INTERVAL_SECONDS,
+        "ProcessType": "Background",
+        "StandardOutPath": str(logs / "presence.log"),
+        "StandardErrorPath": str(logs / "presence.log"),
+    }
+    return plistlib.dumps(payload, fmt=plistlib.FMT_XML, sort_keys=True)
+
+
+def schedule_launch_agent(
+    *,
+    label: str,
+    plist_path: Path,
+    plist_existed: bool,
+    plist_changed: bool,
+    runner: Callable[..., Any],
+) -> tuple[bool, str]:
+    domain = f"gui/{os.getuid()}"
+    reload_required = plist_existed and plist_changed
+    if reload_required:
+        try:
+            bootout = runner(
+                ["launchctl", "bootout", f"{domain}/{label}"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+            )
+            unloaded = bootout.returncode == 0
+            error = "" if unloaded else (bootout.stderr or bootout.stdout or "launchctl bootout failed").strip()
+            if not unloaded:
+                probe = runner(
+                    ["launchctl", "print", f"{domain}/{label}"],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    check=False,
+                )
+                unloaded = probe.returncode != 0
+            if not unloaded:
+                return False, error
+        except (FileNotFoundError, OSError) as exc:
+            return False, str(exc)
+
+    command = (
+        ["launchctl", "bootstrap", domain, str(plist_path)]
+        if plist_changed or not plist_existed
+        else ["launchctl", "kickstart", "-k", f"{domain}/{label}"]
+    )
+    try:
+        completed = runner(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False)
+        if completed.returncode == 0:
+            return True, ""
+        error = (completed.stderr or completed.stdout or "launchctl failed").strip()
+        if plist_changed:
+            return False, error
+        fallback = runner(
+            ["launchctl", "bootstrap", domain, str(plist_path)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+        )
+        if fallback.returncode == 0:
+            return True, ""
+        return False, (fallback.stderr or fallback.stdout or error).strip()
+    except (FileNotFoundError, OSError) as exc:
+        return False, str(exc)
+
+
+def ensure_presence_publisher(
+    *,
+    codex_home: str | Path,
+    resident_root: str | Path,
+    launch_agents_dir: str | Path | None = None,
+    platform: str | None = None,
+    runner: Callable[..., Any] = subprocess.run,
+) -> JsonDict:
+    codex = Path(codex_home).expanduser().resolve()
+    resident = Path(resident_root).expanduser().resolve()
+    runner_path = resident / "presence.sh"
+    runner_changed = write_if_changed(
+        runner_path,
+        presence_runner_script(resident_root=resident, codex_home=codex).encode("utf-8"),
+        mode=0o755,
+    )
+    (resident / "logs").mkdir(parents=True, exist_ok=True)
+    current_platform = platform or sys.platform
+    if current_platform != "darwin":
+        return {
+            "installed": True,
+            "scheduled": False,
+            "reason": "unsupported_platform",
+            "changed": runner_changed,
+            "runner": str(runner_path),
+        }
+
+    agents = Path(launch_agents_dir or Path.home() / "Library" / "LaunchAgents").expanduser().resolve()
+    plist_path = agents / f"{PRESENCE_SERVICE_LABEL}.plist"
+    plist_existed = plist_path.exists()
+    plist_changed = write_if_changed(
+        plist_path,
+        presence_launch_agent_payload(runner_path=runner_path, resident_root=resident),
+        mode=0o644,
+    )
+    service_stamp = resident / "presence-service-active"
+    domain = f"gui/{os.getuid()}"
+    if not plist_changed and service_stamp.exists():
+        try:
+            probe = runner(
+                ["launchctl", "print", f"{domain}/{PRESENCE_SERVICE_LABEL}"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+            )
+        except (FileNotFoundError, OSError):
+            probe = None
+        if probe is not None and probe.returncode == 0:
+            return {
+                "installed": True,
+                "scheduled": True,
+                "changed": runner_changed,
+                "runner": str(runner_path),
+                "plist": str(plist_path),
+            }
+
+    service_stamp.unlink(missing_ok=True)
+    scheduled, error = schedule_launch_agent(
+        label=PRESENCE_SERVICE_LABEL,
+        plist_path=plist_path,
+        plist_existed=plist_existed,
+        plist_changed=plist_changed,
+        runner=runner,
+    )
+    if scheduled:
+        write_if_changed(service_stamp, b"active\n", mode=0o600)
+    result: JsonDict = {
+        "installed": True,
+        "scheduled": scheduled,
+        "changed": bool(runner_changed or plist_changed),
+        "runner": str(runner_path),
+        "plist": str(plist_path),
+    }
+    if error:
+        result["error"] = error
+    return result
+
+
 def persist_environment_opt_out() -> bool:
     value = os.environ.get("LINEAR_SYNC_AUTO_UPDATE", "").strip().lower()
     if value not in {"0", "false", "no", "off"}:
@@ -631,6 +856,19 @@ def persist_environment_opt_out() -> bool:
     state["enabled"] = False
     content = (json.dumps(state, indent=2, sort_keys=True) + "\n").encode("utf-8")
     return write_if_changed(state_path, content, mode=0o600)
+
+
+def migrate_session_upload_preference(*, codex_home: Path, resident_root: Path) -> bool:
+    preference_path = codex_home / "session-logging" / "preferences.json"
+    explicit = os.environ.get("CODEX_SESSION_LOG_AUTO_UPLOAD")
+    if explicit is None:
+        return False
+    enabled = explicit.strip().lower() not in {"0", "false", "no", "off"}
+    payload = (
+        json.dumps({"enabled": enabled, "migrated_from": "environment"}, indent=2, sort_keys=True)
+        + "\n"
+    ).encode()
+    return write_if_changed(preference_path, payload, mode=0o600)
 
 
 def ensure_resident_updater(
@@ -693,14 +931,33 @@ def ensure_resident_updater(
     logs = resident / "logs"
     logs.mkdir(parents=True, exist_ok=True)
     current_platform = platform or sys.platform
+    upload_preference_changed = migrate_session_upload_preference(
+        codex_home=codex,
+        resident_root=resident,
+    )
+    presence = ensure_presence_publisher(
+        codex_home=codex,
+        resident_root=resident,
+        launch_agents_dir=launch_agents_dir,
+        platform=current_platform,
+        runner=runner,
+    )
     if current_platform != "darwin":
         return {
             "installed": True,
             "scheduled": False,
             "reason": "unsupported_platform",
-            "changed": bool(preference_changed or runtime["changed"] or repaired_caches or runner_changed),
+            "changed": bool(
+                preference_changed
+                or runtime["changed"]
+                or repaired_caches
+                or runner_changed
+                or upload_preference_changed
+                or presence["changed"]
+            ),
             "runtime": str(runtime["path"]),
             "repaired_caches": repaired_caches,
+            "presence": presence,
         }
 
     agents = Path(launch_agents_dir or Path.home() / "Library" / "LaunchAgents").expanduser().resolve()
@@ -728,64 +985,48 @@ def ensure_resident_updater(
             return {
                 "installed": True,
                 "scheduled": True,
-                "changed": bool(preference_changed or runtime["changed"] or repaired_caches or runner_changed),
+                "changed": bool(
+                    preference_changed
+                    or runtime["changed"]
+                    or repaired_caches
+                    or runner_changed
+                    or upload_preference_changed
+                    or presence["changed"]
+                ),
                 "runtime": str(runtime["path"]),
                 "plist": str(plist_path),
                 "repaired_caches": repaired_caches,
+                "presence": presence,
             }
     try:
         service_stamp.unlink()
     except FileNotFoundError:
         pass
-    if plist_existed and plist_changed:
-        try:
-            runner(
-                ["launchctl", "bootout", f"{domain}/{SERVICE_LABEL}"],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                check=False,
-            )
-        except (FileNotFoundError, OSError):
-            pass
-        command = ["launchctl", "bootstrap", domain, str(plist_path)]
-    elif not plist_existed:
-        command = ["launchctl", "bootstrap", domain, str(plist_path)]
-    else:
-        command = ["launchctl", "kickstart", "-k", f"{domain}/{SERVICE_LABEL}"]
-    try:
-        completed = runner(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False)
-        scheduled = completed.returncode == 0
-        error = "" if scheduled else (completed.stderr or completed.stdout or "launchctl failed").strip()
-        if not scheduled:
-            fallback_command = (
-                ["launchctl", "kickstart", "-k", f"{domain}/{SERVICE_LABEL}"]
-                if command[1] == "bootstrap"
-                else ["launchctl", "bootstrap", domain, str(plist_path)]
-            )
-            fallback = runner(
-                fallback_command,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                check=False,
-            )
-            scheduled = fallback.returncode == 0
-            error = "" if scheduled else (fallback.stderr or fallback.stdout or error).strip()
-    except (FileNotFoundError, OSError) as exc:
-        scheduled = False
-        error = str(exc)
+    scheduled, error = schedule_launch_agent(
+        label=SERVICE_LABEL,
+        plist_path=plist_path,
+        plist_existed=plist_existed,
+        plist_changed=plist_changed,
+        runner=runner,
+    )
     if scheduled:
         write_if_changed(service_stamp, b"active\n", mode=0o600)
     result: JsonDict = {
         "installed": True,
         "scheduled": scheduled,
         "changed": bool(
-            preference_changed or runtime["changed"] or repaired_caches or runner_changed or plist_changed
+            preference_changed
+            or runtime["changed"]
+            or repaired_caches
+            or runner_changed
+            or plist_changed
+            or upload_preference_changed
+            or presence["changed"]
         ),
         "runtime": str(runtime["path"]),
         "plist": str(plist_path),
         "repaired_caches": repaired_caches,
+        "presence": presence,
     }
     if error:
         result["error"] = error
@@ -967,6 +1208,10 @@ def doctor(
         )
         if linear_source is not None and not runtime_matches_plugin(linear_source, runtime):
             issues.append("resident updater runtime content is incomplete or corrupt")
+    presence_runner = resident / "presence.sh"
+    result["presence_runner"] = str(presence_runner)
+    if not presence_runner.is_file() or not (presence_runner.stat().st_mode & 0o111):
+        issues.append("resident session presence runner is missing or not executable")
     cache_versions: dict[str, list[str]] = {}
     cache_root = codex / "plugins" / "cache" / MARKETPLACE_NAME
     for plugin in plugins:
@@ -1006,6 +1251,74 @@ def doctor(
             result["launch_agent_loaded"] = loaded
             if not loaded:
                 issues.append("resident updater LaunchAgent is installed but not loaded")
+        presence_plist = agents / f"{PRESENCE_SERVICE_LABEL}.plist"
+        result["presence_launch_agent"] = str(presence_plist)
+        if not presence_plist.is_file():
+            issues.append("resident session presence LaunchAgent is not installed")
+        else:
+            domain = f"gui/{os.getuid()}"
+            try:
+                presence_probe = runner(
+                    ["launchctl", "print", f"{domain}/{PRESENCE_SERVICE_LABEL}"],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    check=False,
+                )
+                presence_loaded = presence_probe.returncode == 0
+            except (FileNotFoundError, OSError):
+                presence_loaded = False
+            result["presence_launch_agent_loaded"] = presence_loaded
+            if not presence_loaded:
+                issues.append("resident session presence LaunchAgent is installed but not loaded")
+            else:
+                state_path = codex / "coreedge" / "presence" / "state.json"
+                result["presence_state"] = str(state_path)
+                try:
+                    presence_state = json.loads(state_path.read_text(encoding="utf-8"))
+                    if not isinstance(presence_state, dict):
+                        raise ValueError("state is not a JSON object")
+                except FileNotFoundError:
+                    presence_state = None
+                    stamp = resident / "presence-service-active"
+                    installed_at = max(
+                        path.stat().st_mtime
+                        for path in (stamp, presence_plist)
+                        if path.exists()
+                    )
+                    if datetime.now(timezone.utc).timestamp() - installed_at > PRESENCE_HEALTH_GRACE_SECONDS:
+                        issues.append("resident session presence has not produced health state")
+                except (OSError, ValueError, json.JSONDecodeError) as exc:
+                    presence_state = None
+                    issues.append(f"resident session presence state is invalid: {exc}")
+                if presence_state is not None:
+                    result["presence_status"] = presence_state
+                    last_result = presence_state.get("last_result")
+                    last_checked = presence_state.get("last_checked_at")
+                    if last_result != "disabled":
+                        try:
+                            checked_at = datetime.fromisoformat(str(last_checked))
+                            if checked_at.tzinfo is None:
+                                checked_at = checked_at.replace(tzinfo=timezone.utc)
+                            age = (datetime.now(timezone.utc) - checked_at.astimezone(timezone.utc)).total_seconds()
+                            if age > PRESENCE_HEALTH_GRACE_SECONDS:
+                                issues.append("resident session presence health state is stale")
+                        except (TypeError, ValueError):
+                            issues.append("resident session presence health state has no valid check time")
+                        if last_result in {"unavailable", "retrying"} or presence_state.get("last_error"):
+                            issues.append(
+                                f"resident session presence is unhealthy: {presence_state.get('last_error') or last_result}"
+                            )
+                dead_letter = codex / "session-logging" / "presence-queue" / "dead-letter"
+                pending = codex / "session-logging" / "presence-queue" / "pending"
+                pending_records = len(list(pending.glob("*.json"))) if pending.is_dir() else 0
+                dead_letters = len(list(dead_letter.glob("*.json"))) if dead_letter.is_dir() else 0
+                result["presence_pending"] = pending_records
+                result["presence_dead_letters"] = dead_letters
+                if pending_records and (presence_state or {}).get("last_result") != "disabled":
+                    issues.append(f"resident session presence has {pending_records} pending record(s)")
+                if dead_letters:
+                    issues.append(f"resident session presence has {dead_letters} dead-letter record(s)")
     result["issues"] = issues
     result["healthy"] = not issues
     return result

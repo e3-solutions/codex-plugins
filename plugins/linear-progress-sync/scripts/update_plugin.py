@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib.util
 import json
 import os
 import shutil
@@ -558,6 +559,7 @@ def run_update(
     now: datetime | None = None,
     install_hooks: bool = True,
     use_lock: bool = True,
+    resident: bool = False,
 ) -> JsonDict:
     root = Path(current_plugin_root or globals()["current_plugin_root"]()).resolve()
     state_file = Path(state_path or update_state_path())
@@ -654,6 +656,12 @@ def run_update(
                     cache_root=cache_root,
                     install_service=False,
                 )
+                if resident:
+                    service = repair_resident_services(resident_result)
+                    resident_result["service"] = service
+                    resident_result["changed"] = bool(
+                        resident_result.get("changed") or service.get("changed")
+                    )
                 installed_plugins.extend(resident_result.get("installed_plugins", []))
                 for item in resident_result.get("plugins", []):
                     plugin_path = cache_root / str(item["name"]) / str(item["version"])
@@ -741,6 +749,39 @@ def maybe_spawn_auto_update(
     return {"spawned": True}
 
 
+def repair_resident_services(
+    activation: JsonDict,
+    *,
+    platform: str | None = None,
+    runner: Any = subprocess.run,
+    launch_agents_dir: str | Path | None = None,
+) -> JsonDict:
+    """Repair services with the runtime that was just activated, not this old process's module."""
+    runtime = activation.get("runtime")
+    runtime_value = runtime.get("path") if isinstance(runtime, dict) else None
+    marketplace = activation.get("marketplace")
+    if not isinstance(runtime_value, str) or not runtime_value or not marketplace:
+        raise ValueError("resident activation did not return runtime and marketplace paths")
+    runtime_path = Path(runtime_value)
+    module_path = runtime_path / "resident_updater.py"
+    spec = importlib.util.spec_from_file_location(
+        f"coreedge_resident_updater_{uuid.uuid4().hex}",
+        module_path,
+    )
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"could not load activated resident updater at {module_path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    plugin_root = Path(str(marketplace)) / "plugins" / PLUGIN_NAME
+    return module.ensure_resident_updater(
+        plugin_root,
+        resident_root=runtime_path.parents[2],
+        launch_agents_dir=launch_agents_dir,
+        platform=platform,
+        runner=runner,
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Update the installed Linear Progress Sync plugin cache.")
     parser.add_argument("--plugin-root", default=str(current_plugin_root()), help="Currently running plugin root.")
@@ -793,6 +834,7 @@ def main() -> None:
         manifest_url=args.manifest_url,
         state_path=args.state_path,
         force=args.force,
+        resident=args.resident,
     )
     if args.json:
         print(json.dumps(result, indent=2, sort_keys=True))

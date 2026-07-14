@@ -2085,6 +2085,107 @@ def test_update_plugin_syncs_default_marketplace_plugins_and_hooks_when_bootstra
     assert {plugin["registration"] for plugin in result["hooks"]} == {"plugin-native"}
 
 
+def test_legacy_upgrade_installs_presence_on_next_automatic_resident_cycle(tmp_path, monkeypatch):
+    codex_home = tmp_path / "codex"
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    monkeypatch.setenv("LINEAR_SYNC_CONFIG_DIR", str(tmp_path / "config"))
+    cache_parent = codex_home / "plugins" / "cache" / "coreedge-local" / "linear-progress-sync"
+    write_minimal_plugin(cache_parent, directory_name="0.3.0", version="0.3.0")
+    repo_root = tmp_path / "payload" / "codex-plugins-main"
+    shutil.copytree(ROOT / ".agents", repo_root / ".agents")
+    for name in ("linear-progress-sync", "codex-session-logging"):
+        shutil.copytree(ROOT / "plugins" / name, repo_root / "plugins" / name)
+    archive = tmp_path / "marketplace.zip"
+    with zipfile.ZipFile(archive, "w") as zip_file:
+        for path in repo_root.rglob("*"):
+            zip_file.write(path, path.relative_to(tmp_path / "payload"))
+    manifest = tmp_path / "latest.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "version": "0.3.1",
+                "archive_url": archive.as_uri(),
+                "sha256": hashlib.sha256(archive.read_bytes()).hexdigest(),
+                "plugin_subdir": "plugins/linear-progress-sync",
+            }
+        ),
+        encoding="utf-8",
+    )
+    legacy_runtime = tmp_path / "legacy-runtime"
+    legacy_runtime.mkdir()
+    for name in ("linear_sync.py", "resident_updater.py", "update_plugin.py"):
+        source = subprocess.run(
+            ["git", "show", f"d0e6f65:{'plugins/linear-progress-sync/scripts'}/{name}"],
+            cwd=ROOT,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=True,
+        ).stdout
+        (legacy_runtime / name).write_text(source, encoding="utf-8")
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_launchctl = fake_bin / "launchctl"
+    fake_launchctl.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    fake_launchctl.chmod(0o755)
+    home = tmp_path / "home"
+    environment = {
+        **os.environ,
+        "HOME": str(home),
+        "CODEX_HOME": str(codex_home),
+        "LINEAR_SYNC_CONFIG_DIR": str(tmp_path / "config"),
+        "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
+    }
+    common_args = [
+        "--cache-parent",
+        str(cache_parent),
+        "--manifest-url",
+        manifest.as_uri(),
+        "--state-path",
+        str(tmp_path / "update.json"),
+        "--force",
+        "--resident",
+        "--json",
+    ]
+
+    first_cycle = subprocess.run(
+        [sys.executable, str(legacy_runtime / "update_plugin.py"), "--plugin-root", str(cache_parent / "0.3.0"), *common_args],
+        env=environment,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    resident_root = codex_home / "coreedge"
+
+    assert first_cycle.returncode == 0, first_cycle.stderr
+    assert json.loads(first_cycle.stdout)["resident"]["version"] == "0.3.1"
+    assert (resident_root / "runtime" / "current").resolve().name == "0.3.1"
+    assert not (home / "Library" / "LaunchAgents" / "com.coreedge.codex-session-presence.plist").exists()
+
+    second_cycle = subprocess.run(
+        [
+            sys.executable,
+            str(resident_root / "runtime" / "current" / "update_plugin.py"),
+            "--plugin-root",
+            str(resident_root / "marketplace" / "current" / "plugins" / "linear-progress-sync"),
+            *common_args,
+        ],
+        env=environment,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    result = json.loads(second_cycle.stdout)
+
+    assert second_cycle.returncode == 0, second_cycle.stderr
+    assert result["updated"] is True
+    assert result["resident"]["service"]["presence"]["scheduled"] is True
+    assert (resident_root / "presence.sh").is_file()
+    assert (home / "Library" / "LaunchAgents" / "com.coreedge.codex-session-presence.plist").is_file()
+
+
 def test_legacy_updater_merge_requires_followup_native_cleanup():
     update_plugin = load_update_plugin()
     plugin_config = linear_sync.read_plugin_hooks_config(ROOT, "codex-session-logging")
@@ -2879,12 +2980,12 @@ def test_real_marketplace_activates_in_isolated_codex_home_and_passes_doctor(tmp
         platform="linux",
     )
 
-    assert activation["version"] == "0.3.0"
+    assert activation["version"] == "0.3.1"
     assert health["healthy"] is True
     assert health["issues"] == []
     assert health["cache_versions"] == {
-        "codex-session-logging": ["0.2.2"],
-        "linear-progress-sync": ["0.3.0"],
+        "codex-session-logging": ["0.2.3"],
+        "linear-progress-sync": ["0.3.1"],
     }
     assert subprocess.run(["sh", "-n", str(resident_root / "run.sh")], check=False).returncode == 0
 
@@ -2901,7 +3002,7 @@ def test_resident_hook_repairs_matching_cache_and_runtime_corruption_from_manage
         platform="linux",
     )
     managed = resident_root / "marketplace/current/plugins/linear-progress-sync"
-    cache = codex_home / "plugins/cache/coreedge-local/linear-progress-sync/0.3.0"
+    cache = codex_home / "plugins/cache/coreedge-local/linear-progress-sync/0.3.1"
     runtime = resident_root / "runtime/current"
     corrupt_content = (managed / "scripts/linear_sync.py").read_bytes()
     (cache / "scripts/update_plugin.py").write_bytes(corrupt_content)
@@ -2964,6 +3065,7 @@ def test_resident_runtime_and_launch_agent_are_idempotent(tmp_path, monkeypatch)
 
     runtime_current = tmp_path / "resident" / "runtime" / "current"
     plist = tmp_path / "LaunchAgents" / "com.coreedge.codex-plugins-updater.plist"
+    presence_plist = tmp_path / "LaunchAgents" / "com.coreedge.codex-session-presence.plist"
     assert runtime_current.is_symlink()
     assert (runtime_current / "update_plugin.py").exists()
     assert (runtime_current / "linear_sync.py").exists()
@@ -2978,11 +3080,25 @@ def test_resident_runtime_and_launch_agent_are_idempotent(tmp_path, monkeypatch)
     assert "StartInterval" in plist_text
     assert "1800" in plist_text
     assert "com.coreedge.codex-plugins-updater" in plist_text
+    presence_text = presence_plist.read_text(encoding="utf-8")
+    assert "RunAtLoad" in presence_text
+    assert "StartInterval" in presence_text
+    assert "60" in presence_text
+    assert "com.coreedge.codex-session-presence" in presence_text
+    assert (tmp_path / "resident" / "presence.sh").stat().st_mode & 0o111
+    assert subprocess.run(
+        ["sh", "-n", str(tmp_path / "resident" / "presence.sh")],
+        check=False,
+    ).returncode == 0
     assert first["changed"] is True
     assert second["changed"] is False
-    assert len(calls) == 2
+    assert first["presence"]["scheduled"] is True
+    assert second["presence"]["scheduled"] is True
+    assert len(calls) == 4
     assert calls[0][0][:3] == ["launchctl", "bootstrap", "gui/501"]
-    assert calls[1][0][:3] == ["launchctl", "print", "gui/501/com.coreedge.codex-plugins-updater"]
+    assert calls[1][0][:3] == ["launchctl", "bootstrap", "gui/501"]
+    assert calls[2][0][:3] == ["launchctl", "print", "gui/501/com.coreedge.codex-session-presence"]
+    assert calls[3][0][:3] == ["launchctl", "print", "gui/501/com.coreedge.codex-plugins-updater"]
 
 
 def test_resident_runner_bootstraps_from_cached_plugin_before_managed_marketplace_exists(tmp_path):
@@ -3015,6 +3131,7 @@ def test_resident_runner_bootstraps_from_cached_plugin_before_managed_marketplac
 
     assert completed.returncode == 0
     assert args[args.index("--plugin-root") + 1] == str(plugin_root.resolve())
+    assert "--resident" in args
     assert not (resident_root / "marketplace" / "current").exists()
 
 
@@ -3056,7 +3173,229 @@ def test_resident_runner_discovers_surviving_cache_when_fixed_bootstrap_disappea
 
     assert completed.returncode == 0
     assert args[args.index("--plugin-root") + 1] == str(surviving_cache.resolve())
+    assert "--resident" in args
     assert not (resident_root / "marketplace" / "current").exists()
+
+
+def test_presence_runner_follows_managed_marketplace_without_hook_reload(tmp_path):
+    resident = load_resident_updater()
+    plugin_root = write_minimal_plugin(
+        tmp_path / "bootstrap plugins",
+        name="linear-progress-sync",
+        version="0.3.0",
+    )
+    codex_home = tmp_path / "codex home"
+    resident_root = tmp_path / "resident home"
+    resident.ensure_resident_updater(
+        plugin_root,
+        codex_home=codex_home,
+        resident_root=resident_root,
+        platform="linux",
+    )
+    capture = tmp_path / "presence-ran"
+    managed_script = (
+        resident_root
+        / "marketplace"
+        / "current"
+        / "plugins"
+        / "codex-session-logging"
+        / "scripts"
+        / "publish_presence.py"
+    )
+    managed_script.parent.mkdir(parents=True)
+    managed_script.write_text(
+        "import os\nfrom pathlib import Path\nPath(os.environ['PRESENCE_CAPTURE']).write_text('managed')\n",
+        encoding="utf-8",
+    )
+
+    completed = subprocess.run(
+        [str(resident_root / "presence.sh")],
+        env={**os.environ, "PRESENCE_CAPTURE": str(capture)},
+        check=False,
+    )
+
+    assert completed.returncode == 0
+    assert capture.read_text(encoding="utf-8") == "managed"
+
+
+def test_presence_runner_discovers_cached_logger_before_managed_marketplace_exists(tmp_path):
+    resident = load_resident_updater()
+    plugin_root = write_minimal_plugin(
+        tmp_path / "bootstrap plugins",
+        name="linear-progress-sync",
+        version="0.3.0",
+    )
+    codex_home = tmp_path / "codex home"
+    resident_root = tmp_path / "resident home"
+    resident.ensure_resident_updater(
+        plugin_root,
+        codex_home=codex_home,
+        resident_root=resident_root,
+        platform="linux",
+    )
+    capture = tmp_path / "presence-ran"
+    cached_script = (
+        codex_home
+        / "plugins"
+        / "cache"
+        / "coreedge-local"
+        / "codex-session-logging"
+        / "0.2.3"
+        / "scripts"
+        / "publish_presence.py"
+    )
+    cached_script.parent.mkdir(parents=True)
+    cached_manifest = cached_script.parents[1] / ".codex-plugin" / "plugin.json"
+    cached_manifest.parent.mkdir(parents=True)
+    cached_manifest.write_text(
+        json.dumps({"name": "codex-session-logging", "version": "0.2.3"}),
+        encoding="utf-8",
+    )
+    cached_script.write_text(
+        "import os\nfrom pathlib import Path\nPath(os.environ['PRESENCE_CAPTURE']).write_text('cache')\n",
+        encoding="utf-8",
+    )
+
+    completed = subprocess.run(
+        [str(resident_root / "presence.sh")],
+        env={**os.environ, "PRESENCE_CAPTURE": str(capture)},
+        check=False,
+    )
+
+    assert completed.returncode == 0
+    assert capture.read_text(encoding="utf-8") == "cache"
+
+
+def test_presence_runner_uses_semantic_coreedge_cache_and_rejects_other_marketplaces(tmp_path):
+    resident = load_resident_updater()
+    plugin_root = write_minimal_plugin(tmp_path / "bootstrap", version="0.3.0")
+    codex_home = tmp_path / "codex"
+    resident_root = tmp_path / "resident"
+    resident.ensure_resident_updater(
+        plugin_root,
+        codex_home=codex_home,
+        resident_root=resident_root,
+        platform="linux",
+    )
+    for marketplace, version, marker in (
+        ("coreedge-local", "0.2.9", "old"),
+        ("coreedge-local", "0.2.10", "new"),
+        ("zzz-untrusted", "99.0.0", "untrusted"),
+    ):
+        root = codex_home / "plugins" / "cache" / marketplace / "codex-session-logging" / version
+        manifest = root / ".codex-plugin" / "plugin.json"
+        manifest.parent.mkdir(parents=True)
+        manifest.write_text(
+            json.dumps({"name": "codex-session-logging", "version": version}),
+            encoding="utf-8",
+        )
+        script = root / "scripts" / "publish_presence.py"
+        script.parent.mkdir(parents=True)
+        script.write_text(
+            f"import os\nfrom pathlib import Path\nPath(os.environ['PRESENCE_CAPTURE']).write_text({marker!r})\n",
+            encoding="utf-8",
+        )
+    capture = tmp_path / "capture"
+
+    completed = subprocess.run(
+        [str(resident_root / "presence.sh")],
+        env={**os.environ, "PRESENCE_CAPTURE": str(capture)},
+        check=False,
+    )
+
+    assert completed.returncode == 0
+    assert capture.read_text(encoding="utf-8") == "new"
+
+
+def test_presence_runner_honors_persisted_opt_out_without_shell_environment(tmp_path):
+    resident = load_resident_updater()
+    plugin_root = write_minimal_plugin(tmp_path / "bootstrap", version="0.3.0")
+    codex_home = tmp_path / "codex"
+    resident_root = tmp_path / "resident"
+    resident.ensure_resident_updater(
+        plugin_root,
+        codex_home=codex_home,
+        resident_root=resident_root,
+        platform="linux",
+    )
+    cached_plugin = codex_home / "plugins" / "cache" / "coreedge-local" / "codex-session-logging" / "0.2.3"
+    cached_plugin.parent.mkdir(parents=True)
+    shutil.copytree(ROOT / "plugins" / "codex-session-logging", cached_plugin)
+    preference = codex_home / "session-logging" / "preferences.json"
+    preference.parent.mkdir(parents=True, exist_ok=True)
+    preference.write_text(json.dumps({"enabled": False}), encoding="utf-8")
+    environment = {key: value for key, value in os.environ.items() if key != "CODEX_SESSION_LOG_AUTO_UPLOAD"}
+
+    completed = subprocess.run(
+        [str(resident_root / "presence.sh")],
+        env=environment,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    state = json.loads(
+        (codex_home / "coreedge" / "presence" / "state.json").read_text(encoding="utf-8")
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert state["last_result"] == "disabled"
+    assert state.get("database") is None
+
+
+def test_resident_persists_only_explicit_upload_opt_out(tmp_path, monkeypatch):
+    resident = load_resident_updater()
+    codex_home = tmp_path / "codex"
+    resident_root = tmp_path / "resident"
+    pending = codex_home / "session-logging" / "queue" / "record.json"
+    pending.parent.mkdir(parents=True)
+    pending.write_text("{}", encoding="utf-8")
+    preference_path = codex_home / "session-logging" / "preferences.json"
+    preference_path.parent.mkdir(parents=True, exist_ok=True)
+    preference_path.write_text(json.dumps({"enabled": True}), encoding="utf-8")
+    monkeypatch.setenv("CODEX_SESSION_LOG_AUTO_UPLOAD", "0")
+
+    changed = resident.migrate_session_upload_preference(
+        codex_home=codex_home,
+        resident_root=resident_root,
+    )
+    preference = json.loads(preference_path.read_text(encoding="utf-8"))
+
+    assert changed is True
+    assert preference == {"enabled": False, "migrated_from": "environment"}
+    monkeypatch.setenv("CODEX_SESSION_LOG_AUTO_UPLOAD", "1")
+    reenabled = resident.migrate_session_upload_preference(
+        codex_home=codex_home,
+        resident_root=resident_root,
+    )
+    unchanged = resident.migrate_session_upload_preference(
+        codex_home=codex_home,
+        resident_root=resident_root,
+    )
+    assert reenabled is True
+    assert unchanged is False
+    assert json.loads(preference_path.read_text(encoding="utf-8")) == {
+        "enabled": True,
+        "migrated_from": "environment",
+    }
+
+
+def test_resident_does_not_treat_transient_queue_as_upload_opt_out(tmp_path, monkeypatch):
+    resident = load_resident_updater()
+    codex_home = tmp_path / "codex"
+    resident_root = tmp_path / "resident"
+    pending = codex_home / "session-logging" / "queue" / "pending" / "record.json"
+    pending.parent.mkdir(parents=True)
+    pending.write_text("{}", encoding="utf-8")
+    monkeypatch.delenv("CODEX_SESSION_LOG_AUTO_UPLOAD", raising=False)
+
+    changed = resident.migrate_session_upload_preference(
+        codex_home=codex_home,
+        resident_root=resident_root,
+    )
+
+    assert changed is False
+    assert not (codex_home / "session-logging" / "preferences.json").exists()
 
 
 def test_environment_opt_out_is_persisted_for_resident_launches(tmp_path, monkeypatch):
@@ -3147,9 +3486,43 @@ def test_resident_launch_agent_recovers_when_plist_exists_but_job_is_unloaded(tm
     )
 
     assert result["scheduled"] is True
-    assert calls[0][:3] == ["launchctl", "print", "gui/501/com.coreedge.codex-plugins-updater"]
-    assert calls[1][1] == "kickstart"
-    assert calls[2][:3] == ["launchctl", "bootstrap", "gui/501"]
+    updater_calls = [call for call in calls if "codex-plugins-updater" in " ".join(call)]
+    assert updater_calls[0][:3] == ["launchctl", "print", "gui/501/com.coreedge.codex-plugins-updater"]
+    assert updater_calls[1][1] == "kickstart"
+    assert updater_calls[2][:3] == ["launchctl", "bootstrap", "gui/501"]
+
+
+def test_changed_launch_agent_is_not_marked_active_when_old_job_cannot_unload(tmp_path, monkeypatch):
+    resident = load_resident_updater()
+    calls = []
+
+    class Completed:
+        stdout = ""
+        stderr = "still loaded"
+
+        def __init__(self, returncode):
+            self.returncode = returncode
+
+    def runner(args, **_kwargs):
+        calls.append(args)
+        if args[1] == "bootout":
+            return Completed(1)
+        if args[1] == "print":
+            return Completed(0)
+        return Completed(0)
+
+    monkeypatch.setattr(resident.os, "getuid", lambda: 501)
+    scheduled, error = resident.schedule_launch_agent(
+        label=resident.PRESENCE_SERVICE_LABEL,
+        plist_path=tmp_path / "presence.plist",
+        plist_existed=True,
+        plist_changed=True,
+        runner=runner,
+    )
+
+    assert scheduled is False
+    assert error == "still loaded"
+    assert [call[1] for call in calls] == ["bootout", "print"]
 
 
 def test_marketplace_config_migration_supports_quoted_section_and_preserves_comments(tmp_path):
@@ -3220,6 +3593,8 @@ def test_resident_doctor_reports_activation_drift(tmp_path):
     assert "managed marketplace pointer is missing or broken" in result["issues"]
     assert "marketplace config does not point at the managed current release" in result["issues"]
     assert "resident updater LaunchAgent is not installed" in result["issues"]
+    assert "resident session presence runner is missing or not executable" in result["issues"]
+    assert "resident session presence LaunchAgent is not installed" in result["issues"]
 
 
 def test_resident_doctor_reports_content_corruption_and_unloaded_service(tmp_path, monkeypatch):
@@ -3250,7 +3625,7 @@ def test_resident_doctor_reports_content_corruption_and_unloaded_service(tmp_pat
     broken_cache_script = (
         cache_root
         / "linear-progress-sync"
-        / "0.3.0"
+        / "0.3.1"
         / "scripts"
         / "update_plugin.py"
     )
@@ -3272,6 +3647,61 @@ def test_resident_doctor_reports_content_corruption_and_unloaded_service(tmp_pat
     assert result["healthy"] is False
     assert "linear-progress-sync cache content is incomplete or corrupt" in result["issues"]
     assert "resident updater LaunchAgent is installed but not loaded" in result["issues"]
+    assert "resident session presence LaunchAgent is installed but not loaded" in result["issues"]
+
+
+def test_resident_doctor_reports_stale_failed_presence_and_queue(tmp_path, monkeypatch):
+    resident = load_resident_updater()
+    codex_home = tmp_path / "codex"
+    resident_root = tmp_path / "resident"
+    launch_agents = tmp_path / "LaunchAgents"
+
+    class Completed:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    monkeypatch.setattr(resident.os, "getuid", lambda: 501)
+    resident.activate_release(
+        ROOT,
+        codex_home=codex_home,
+        resident_root=resident_root,
+        launch_agents_dir=launch_agents,
+        platform="darwin",
+        runner=lambda *_args, **_kwargs: Completed(),
+    )
+    state_path = codex_home / "coreedge" / "presence" / "state.json"
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    state_path.write_text(
+        json.dumps(
+            {
+                "last_checked_at": "2020-01-01T00:00:00+00:00",
+                "last_result": "retrying",
+                "last_error": "network unavailable",
+            }
+        ),
+        encoding="utf-8",
+    )
+    pending = codex_home / "session-logging" / "presence-queue" / "pending" / "event.json"
+    pending.parent.mkdir(parents=True)
+    pending.write_text("{}", encoding="utf-8")
+    dead = codex_home / "session-logging" / "presence-queue" / "dead-letter" / "bad.json"
+    dead.parent.mkdir(parents=True)
+    dead.write_text("{}", encoding="utf-8")
+
+    result = resident.doctor(
+        codex_home=codex_home,
+        resident_root=resident_root,
+        launch_agents_dir=launch_agents,
+        platform="darwin",
+        runner=lambda *_args, **_kwargs: Completed(),
+    )
+
+    assert result["healthy"] is False
+    assert "resident session presence health state is stale" in result["issues"]
+    assert "resident session presence is unhealthy: network unavailable" in result["issues"]
+    assert "resident session presence has 1 pending record(s)" in result["issues"]
+    assert "resident session presence has 1 dead-letter record(s)" in result["issues"]
 
 
 def test_update_lock_reclaims_dead_process(tmp_path, monkeypatch):
@@ -3437,7 +3867,8 @@ def test_readmes_register_linear_mcp_before_linear_login():
         assert "saves it in `~/.codex/linear-sync/repos.json`" in text
         assert "update_plugin.py --force" in text
         assert "update_plugin.py --doctor" in text
-        assert "before `0.3.0`" in text
+        assert "`0.3.1`" in text
+        assert "one-minute task-presence publisher" in text
         assert "renewal thread" in text
         assert "every 30 minutes" in text
         assert "historical backfills disabled" in text

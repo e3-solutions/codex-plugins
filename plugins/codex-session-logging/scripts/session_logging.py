@@ -38,7 +38,7 @@ DEFAULT_INGEST_URL = f"{DEFAULT_SUPABASE_URL}/functions/v1/codex-session-ingest"
 DEFAULT_BUCKET = "codex-sessions"
 ALLOWED_GITHUB_ORG = "e3-solutions"
 EXCERPT_BYTES = 4096
-PLUGIN_VERSION = "0.2.2"
+PLUGIN_VERSION = "0.2.3"
 PERMANENT_HTTP_STATUSES = {400, 413, 415, 422}
 
 
@@ -552,7 +552,8 @@ def state_dir() -> Path:
     override = os.environ.get(STATE_DIR_ENV)
     if override:
         return Path(override).expanduser().resolve()
-    return Path.home() / ".codex" / "session-logging"
+    codex_home = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex")
+    return codex_home.expanduser().resolve() / "session-logging"
 
 
 def next_sequence(base: Path, session_id: str) -> int:
@@ -809,8 +810,33 @@ def upload_configured() -> bool:
 
 
 def auto_upload_enabled() -> bool:
-    value = os.environ.get(AUTO_UPLOAD_ENV, "1").strip().lower()
-    return value not in {"0", "false", "no", "off"}
+    explicit = os.environ.get(AUTO_UPLOAD_ENV)
+    if explicit is not None:
+        enabled = explicit.strip().lower() not in {"0", "false", "no", "off"}
+        persist_auto_upload_preference(enabled)
+        return enabled
+    try:
+        preference = read_json_file(auto_upload_preference_path()).get("enabled")
+    except (FileNotFoundError, OSError, ValueError, json.JSONDecodeError):
+        preference = None
+    return preference if isinstance(preference, bool) else True
+
+
+def auto_upload_preference_path() -> Path:
+    codex_home = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex").expanduser().resolve()
+    return codex_home / "session-logging" / "preferences.json"
+
+
+def persist_auto_upload_preference(enabled: bool) -> None:
+    path = auto_upload_preference_path()
+    try:
+        existing = read_json_file(path)
+    except (FileNotFoundError, OSError, ValueError, json.JSONDecodeError):
+        existing = {}
+    if existing.get("enabled") is enabled:
+        return
+    write_json_atomic(path, {"enabled": enabled})
+    os.chmod(path, 0o600)
 
 
 def spawn_drain() -> None:

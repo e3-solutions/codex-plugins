@@ -19,7 +19,8 @@ MODULE_PATH = ROOT / "plugins" / "codex-session-logging" / "scripts" / "session_
 
 
 @pytest.fixture(autouse=True)
-def disable_background_uploads_by_default(monkeypatch):
+def disable_background_uploads_by_default(monkeypatch, tmp_path):
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex-home"))
     monkeypatch.setenv("CODEX_SESSION_LOG_AUTO_UPLOAD", "0")
 
 
@@ -949,6 +950,7 @@ def test_plugin_packaging_and_supabase_migration_are_present():
     assert (ROOT / "plugins" / "codex-session-logging" / "scripts" / "session_start.py").exists()
     assert (ROOT / "plugins" / "codex-session-logging" / "scripts" / "pre_tool_use.py").exists()
     assert (ROOT / "plugins" / "codex-session-logging" / "scripts" / "post_tool_use.py").exists()
+    assert (ROOT / "plugins" / "codex-session-logging" / "scripts" / "publish_presence.py").exists()
     session_logging_plugin = next(
         plugin for plugin in marketplace["plugins"] if plugin["name"] == "codex-session-logging"
     )
