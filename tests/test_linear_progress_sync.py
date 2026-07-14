@@ -3018,6 +3018,47 @@ def test_resident_runner_bootstraps_from_cached_plugin_before_managed_marketplac
     assert not (resident_root / "marketplace" / "current").exists()
 
 
+def test_resident_runner_discovers_surviving_cache_when_fixed_bootstrap_disappears(tmp_path):
+    resident = load_resident_updater()
+    bootstrap_root = write_minimal_plugin(
+        tmp_path / "bootstrap plugins",
+        name="linear-progress-sync",
+        version="0.3.0",
+    )
+    capture_path = tmp_path / "runner-fallback-args.json"
+    (bootstrap_root / "scripts" / "update_plugin.py").write_text(
+        "import json, os, sys\n"
+        "open(os.environ['RUNNER_CAPTURE'], 'w', encoding='utf-8').write(json.dumps(sys.argv[1:]))\n",
+        encoding="utf-8",
+    )
+    codex_home = tmp_path / "codex home"
+    resident_root = tmp_path / "resident home"
+    resident.ensure_resident_updater(
+        bootstrap_root,
+        codex_home=codex_home,
+        resident_root=resident_root,
+        platform="linux",
+    )
+    surviving_cache = write_minimal_plugin(
+        codex_home / "plugins" / "cache" / "coreedge-local" / "linear-progress-sync",
+        directory_name="0.2.1",
+        name="linear-progress-sync",
+        version="0.2.1",
+    )
+    shutil.rmtree(bootstrap_root)
+
+    completed = subprocess.run(
+        [str(resident_root / "run.sh")],
+        env={**os.environ, "RUNNER_CAPTURE": str(capture_path)},
+        check=False,
+    )
+    args = json.loads(capture_path.read_text(encoding="utf-8"))
+
+    assert completed.returncode == 0
+    assert args[args.index("--plugin-root") + 1] == str(surviving_cache.resolve())
+    assert not (resident_root / "marketplace" / "current").exists()
+
+
 def test_environment_opt_out_is_persisted_for_resident_launches(tmp_path, monkeypatch):
     resident = load_resident_updater()
     update_plugin = load_update_plugin()
