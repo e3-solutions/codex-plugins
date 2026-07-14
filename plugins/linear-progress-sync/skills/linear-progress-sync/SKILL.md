@@ -77,13 +77,16 @@ codex mcp login linear
 
 This repository is a Codex plugin marketplace, not a single plugin source. Do not tell teammates or agents to run `codex plugin add` with the GitHub URL or repository root directly; that can skip marketplace registration, default plugin installation, legacy hook cleanup, and Linear MCP registration.
 
-Setup installs a resident updater under `~/.codex/coreedge`. On macOS it checks at login and every 30 minutes, validates and stages the current `main.zip`, atomically switches the managed marketplace, selects one cache version per default plugin, and retains rollback copies outside Codex's cache scan. SessionStart and PreToolUse self-heal a missing service. Disable network checks with:
+Setup installs a resident updater under `~/.codex/coreedge`. On macOS it checks at login and every 30 minutes, validates and stages the current `main.zip`, atomically switches the managed marketplace, selects one cache version per default plugin, and retains rollback copies outside Codex's cache scan. SessionStart and PreToolUse self-heal a missing service. Persistently disable or re-enable network checks with:
 
-Existing installations before `0.3.0` download `0.3.0` during ordinary Codex use and install the resident service on a following normal hook invocation. Do not ask teammates to run an update command, deliberately restart Codex, or create a renewal thread. Fresh setup installs and schedules the current plugins immediately.
+Existing installations before `0.3.0` download `0.3.0` during ordinary Codex use. A following normal hook invocation launches the resident updater from that cached plugin even before the managed marketplace exists; it does not require another SessionStart or renewal task. Do not ask teammates to run an update command, deliberately restart Codex, or create a renewal thread. Fresh setup installs and schedules the current plugins immediately.
 
 ```bash
-LINEAR_SYNC_AUTO_UPDATE=0
+python3 ~/.codex/coreedge/runtime/current/update_plugin.py --disable-auto-update
+python3 ~/.codex/coreedge/runtime/current/update_plugin.py --enable-auto-update
 ```
+
+`LINEAR_SYNC_AUTO_UPDATE=0` is also honored and is persisted when setup or a self-healing hook observes it.
 
 Force a manual update check when needed:
 

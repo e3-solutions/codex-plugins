@@ -11,6 +11,7 @@ import sys
 import tarfile
 import tempfile
 import urllib.request
+import uuid
 import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
@@ -24,6 +25,7 @@ from linear_sync import (
     remove_plugin_hooks,
     write_json_atomic,
 )
+from resident_updater import plugin_tree_matches
 
 
 JsonDict = dict[str, Any]
@@ -101,6 +103,15 @@ def auto_update_enabled(state: JsonDict | None = None) -> bool:
         return False
     config = state or {}
     return config.get("enabled") is not False
+
+
+def set_auto_update_enabled(enabled: bool, *, state_path: str | Path | None = None) -> JsonDict:
+    path = Path(state_path or update_state_path())
+    state = read_update_state(path)
+    state["enabled"] = enabled
+    state["preference_updated_at"] = now_iso()
+    write_update_state(path, state)
+    return {"enabled": enabled, "state_path": str(path)}
 
 
 def version_parts(version: str) -> tuple[int, ...]:
@@ -324,9 +335,18 @@ def install_plugin_dir(source: Path, *, cache_parent: Path, version: str) -> Pat
     try:
         shutil.copytree(source, temp_target)
         touch_tree(temp_target)
+        previous: Path | None = None
         if target.exists():
-            shutil.rmtree(target)
-        shutil.move(str(temp_target), str(target))
+            previous = cache_parent / f".{version}.{uuid.uuid4().hex}.previous"
+            target.replace(previous)
+        try:
+            temp_target.replace(target)
+        except Exception:
+            if previous is not None and previous.exists():
+                previous.replace(target)
+            raise
+        if previous is not None:
+            shutil.rmtree(previous, ignore_errors=True)
     finally:
         shutil.rmtree(temp_parent, ignore_errors=True)
     return target
@@ -364,7 +384,11 @@ def install_plugin_if_needed(source: Path, *, cache_root: Path) -> JsonDict:
     target = parent / version
     if has_plugin_manifest(target):
         try:
-            if plugin_name(target) == name and plugin_version(target) == version:
+            if (
+                plugin_name(target) == name
+                and plugin_version(target) == version
+                and plugin_tree_matches(source, target)
+            ):
                 return {"name": name, "version": version, "path": str(target), "installed": False}
         except (OSError, ValueError, json.JSONDecodeError):
             pass
@@ -598,7 +622,8 @@ def run_update(
                     "manifest_url": str(url),
                 }
             )
-            if version_is_newer(latest_version, current_version):
+            # Reinstall equal versions when their content differs, but never downgrade.
+            if not version_is_newer(current_version, latest_version):
                 bootstrap_result = install_plugin_if_needed(bootstrap_source, cache_root=cache_root)
                 bootstrap_path = Path(str(bootstrap_result["path"]))
                 bootstrap_installed = bool(bootstrap_result.get("installed"))
@@ -716,8 +741,28 @@ def main() -> None:
     parser.add_argument("--force", action="store_true", help="Check even when the throttle interval has not elapsed.")
     parser.add_argument("--resident", action="store_true", help="Run from the installed resident updater service.")
     parser.add_argument("--doctor", action="store_true", help="Inspect updater activation and scheduling health.")
+    preference = parser.add_mutually_exclusive_group()
+    preference.add_argument(
+        "--disable-auto-update",
+        action="store_true",
+        help="Persistently disable automatic network update checks.",
+    )
+    preference.add_argument(
+        "--enable-auto-update",
+        action="store_true",
+        help="Re-enable automatic network update checks.",
+    )
     parser.add_argument("--json", action="store_true", help="Print machine-readable output.")
     args = parser.parse_args()
+
+    if args.disable_auto_update or args.enable_auto_update:
+        result = set_auto_update_enabled(not args.disable_auto_update, state_path=args.state_path)
+        if args.json:
+            print(json.dumps(result, indent=2, sort_keys=True))
+        else:
+            status = "enabled" if result["enabled"] else "disabled"
+            print(f"Automatic Core Edge plugin updates are {status}.")
+        return
 
     if args.doctor:
         from resident_updater import doctor

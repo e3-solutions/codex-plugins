@@ -2131,6 +2131,79 @@ def test_install_plugin_refreshes_installed_file_mtimes_for_hook_selection(tmp_p
     assert installed_script.stat().st_mtime > old_timestamp
 
 
+def test_install_plugin_repairs_corrupt_same_version_cache(tmp_path):
+    update_plugin = load_update_plugin()
+    source = write_minimal_plugin(
+        tmp_path / "source",
+        name="linear-progress-sync",
+        version="0.3.0",
+    )
+    cache_root = tmp_path / "cache"
+
+    first = update_plugin.install_plugin_if_needed(source, cache_root=cache_root)
+    installed_script = Path(first["path"]) / "scripts" / "update_plugin.py"
+    installed_script.unlink()
+
+    repaired = update_plugin.install_plugin_if_needed(source, cache_root=cache_root)
+    current = update_plugin.install_plugin_if_needed(source, cache_root=cache_root)
+
+    assert repaired["installed"] is True
+    assert installed_script.read_bytes() == (source / "scripts" / "update_plugin.py").read_bytes()
+    assert current["installed"] is False
+
+
+def test_run_update_repairs_corrupt_same_version_bootstrap_cache(tmp_path, monkeypatch):
+    update_plugin = load_update_plugin()
+    codex_home = tmp_path / "codex"
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    monkeypatch.setenv("LINEAR_SYNC_CONFIG_DIR", str(tmp_path / "config"))
+    cache_root = tmp_path / "cache" / "coreedge-local"
+    cache_parent = cache_root / "linear-progress-sync"
+    current = write_minimal_plugin(
+        cache_parent,
+        directory_name="0.3.0",
+        version="0.3.0",
+        hook_events=("SessionStart", "PreToolUse"),
+    )
+    damaged_script = current / "scripts" / "update_plugin.py"
+    damaged_script.unlink()
+    archive, digest = make_marketplace_archive(tmp_path, bootstrap_version="0.3.0")
+    manifest = tmp_path / "latest.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "version": "0.3.0",
+                "archive_url": archive.as_uri(),
+                "sha256": digest,
+                "plugin_subdir": "plugins/linear-progress-sync",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = update_plugin.run_update(
+        current_plugin_root=current,
+        cache_parent=cache_parent,
+        manifest_url=manifest.as_uri(),
+        state_path=tmp_path / "update-state.json",
+        force=True,
+        install_hooks=False,
+    )
+    second = update_plugin.run_update(
+        current_plugin_root=current,
+        cache_parent=cache_parent,
+        manifest_url=manifest.as_uri(),
+        state_path=tmp_path / "update-state.json",
+        force=True,
+        install_hooks=False,
+    )
+
+    assert result["updated"] is True
+    assert "linear-progress-sync" in {item["name"] for item in result["installed_plugins"]}
+    assert damaged_script.exists()
+    assert second["updated"] is False
+
+
 def test_update_plugin_rejects_archive_with_wrong_sha(tmp_path, monkeypatch):
     update_plugin = load_update_plugin()
     monkeypatch.setenv("LINEAR_SYNC_CONFIG_DIR", str(tmp_path / "config"))
@@ -2387,6 +2460,78 @@ def test_resident_activation_rolls_back_cache_config_and_pointer_on_failure(tmp_
     assert (cache_root / "linear-progress-sync" / "0.3.0").exists()
 
 
+def test_cache_activation_validates_every_plugin_before_moving_any_cache(tmp_path):
+    resident = load_resident_updater()
+    source_root = tmp_path / "source"
+    linear_source = write_minimal_plugin(
+        source_root,
+        name="linear-progress-sync",
+        version="0.3.0",
+    )
+    logging_source = write_minimal_plugin(
+        source_root,
+        name="codex-session-logging",
+        version="0.2.1",
+    )
+    cache_root = tmp_path / "cache"
+    write_minimal_plugin(
+        cache_root / "linear-progress-sync",
+        directory_name="0.2.11",
+        version="0.2.11",
+    )
+    shutil.copytree(linear_source, cache_root / "linear-progress-sync" / "0.3.0")
+
+    with pytest.raises(FileNotFoundError):
+        resident.activate_plugin_caches(
+            [
+                {"name": "linear-progress-sync", "version": "0.3.0", "source": linear_source},
+                {"name": "codex-session-logging", "version": "0.2.1", "source": logging_source},
+            ],
+            cache_root=cache_root,
+            rollback_root=tmp_path / "rollback",
+        )
+
+    assert (cache_root / "linear-progress-sync" / "0.2.11").exists()
+    assert not (tmp_path / "rollback" / "linear-progress-sync" / "0.2.11").exists()
+
+
+def test_cache_activation_restores_partial_moves_after_filesystem_failure(tmp_path, monkeypatch):
+    resident = load_resident_updater()
+    source_root = tmp_path / "source"
+    cache_root = tmp_path / "cache"
+    plugins = []
+    for name, old_version, version in (
+        ("linear-progress-sync", "0.2.11", "0.3.0"),
+        ("codex-session-logging", "0.1.0", "0.2.1"),
+    ):
+        source = write_minimal_plugin(source_root, name=name, version=version)
+        write_minimal_plugin(cache_root / name, name=name, directory_name=old_version, version=old_version)
+        shutil.copytree(source, cache_root / name / version)
+        plugins.append({"name": name, "version": version, "source": source})
+
+    original_move = resident.shutil.move
+    move_calls = 0
+
+    def fail_second_move(source, destination):
+        nonlocal move_calls
+        move_calls += 1
+        if move_calls == 2:
+            raise OSError("simulated cache move failure")
+        return original_move(source, destination)
+
+    monkeypatch.setattr(resident.shutil, "move", fail_second_move)
+    with pytest.raises(OSError, match="simulated cache move failure"):
+        resident.activate_plugin_caches(
+            plugins,
+            cache_root=cache_root,
+            rollback_root=tmp_path / "rollback",
+        )
+
+    assert (cache_root / "linear-progress-sync" / "0.2.11").exists()
+    assert (cache_root / "codex-session-logging" / "0.1.0").exists()
+    assert not (tmp_path / "rollback" / "linear-progress-sync" / "0.2.11").exists()
+
+
 def test_resident_activation_repairs_corrupt_managed_release_and_runtime(tmp_path):
     resident = load_resident_updater()
     repo = tmp_path / "repo"
@@ -2430,8 +2575,18 @@ def test_resident_activation_repairs_corrupt_managed_release_and_runtime(tmp_pat
         / "marketplace.json"
     )
     runtime_script = resident_root / "runtime" / "releases" / "0.3.0" / "update_plugin.py"
-    managed_manifest.write_text("not json", encoding="utf-8")
-    runtime_script.write_text("def broken(:\n", encoding="utf-8")
+    managed_hook = (
+        resident_root
+        / "marketplace"
+        / "releases"
+        / "0.3.0"
+        / "plugins"
+        / "linear-progress-sync"
+        / "hooks"
+        / "hooks.json"
+    )
+    runtime_script.write_text("VERSION = 'valid but corrupt'\n", encoding="utf-8")
+    managed_hook.write_text("{}\n", encoding="utf-8")
 
     result = resident.activate_release(
         repo,
@@ -2442,7 +2597,8 @@ def test_resident_activation_repairs_corrupt_managed_release_and_runtime(tmp_pat
 
     assert result["changed"] is True
     assert json.loads(managed_manifest.read_text(encoding="utf-8"))["name"] == "coreedge-local"
-    compile(runtime_script.read_text(encoding="utf-8"), str(runtime_script), "exec")
+    assert runtime_script.read_bytes() == (repo / "plugins" / "linear-progress-sync" / "scripts" / "update_plugin.py").read_bytes()
+    assert managed_hook.read_bytes() == (repo / "plugins" / "linear-progress-sync" / "hooks" / "hooks.json").read_bytes()
 
 
 def test_resident_marketplace_rejects_source_path_escape(tmp_path):
@@ -2560,6 +2716,86 @@ def test_resident_runtime_and_launch_agent_are_idempotent(tmp_path, monkeypatch)
     assert second["changed"] is False
     assert len(calls) == 1
     assert calls[0][0][:3] == ["launchctl", "bootstrap", "gui/501"]
+
+
+def test_resident_runner_bootstraps_from_cached_plugin_before_managed_marketplace_exists(tmp_path):
+    resident = load_resident_updater()
+    plugin_root = write_minimal_plugin(
+        tmp_path / "cached $plugins",
+        name="linear-progress-sync",
+        version="0.3.0",
+    )
+    capture_path = tmp_path / "runner-args.json"
+    (plugin_root / "scripts" / "update_plugin.py").write_text(
+        "import json, os, sys\n"
+        "open(os.environ['RUNNER_CAPTURE'], 'w', encoding='utf-8').write(json.dumps(sys.argv[1:]))\n",
+        encoding="utf-8",
+    )
+    resident_root = tmp_path / "resident $home"
+    resident.ensure_resident_updater(
+        plugin_root,
+        codex_home=tmp_path / "codex $home",
+        resident_root=resident_root,
+        platform="linux",
+    )
+
+    completed = subprocess.run(
+        [str(resident_root / "run.sh")],
+        env={**os.environ, "RUNNER_CAPTURE": str(capture_path)},
+        check=False,
+    )
+    args = json.loads(capture_path.read_text(encoding="utf-8"))
+
+    assert completed.returncode == 0
+    assert args[args.index("--plugin-root") + 1] == str(plugin_root.resolve())
+    assert not (resident_root / "marketplace" / "current").exists()
+
+
+def test_environment_opt_out_is_persisted_for_resident_launches(tmp_path, monkeypatch):
+    resident = load_resident_updater()
+    update_plugin = load_update_plugin()
+    plugin_root = write_minimal_plugin(
+        tmp_path / "plugins",
+        name="linear-progress-sync",
+        version="0.3.0",
+    )
+    config_dir = tmp_path / "linear config"
+    monkeypatch.setenv("LINEAR_SYNC_AUTO_UPDATE", "0")
+    monkeypatch.setenv("LINEAR_SYNC_CONFIG_DIR", str(config_dir))
+
+    resident.ensure_resident_updater(
+        plugin_root,
+        codex_home=tmp_path / "codex",
+        resident_root=tmp_path / "resident",
+        platform="linux",
+    )
+    state = json.loads((config_dir / "update.json").read_text(encoding="utf-8"))
+    monkeypatch.delenv("LINEAR_SYNC_AUTO_UPDATE")
+
+    assert state["enabled"] is False
+    assert update_plugin.auto_update_enabled(state) is False
+
+
+def test_auto_update_preference_cli_round_trips_without_network(tmp_path):
+    state_path = tmp_path / "update.json"
+    commands = (
+        ("--disable-auto-update", False),
+        ("--enable-auto-update", True),
+    )
+
+    for flag, expected in commands:
+        completed = subprocess.run(
+            [sys.executable, str(UPDATE_PATH), "--state-path", str(state_path), flag, "--json"],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        payload = json.loads(completed.stdout)
+
+        assert completed.returncode == 0, completed.stderr
+        assert payload["enabled"] is expected
+        assert json.loads(state_path.read_text(encoding="utf-8"))["enabled"] is expected
 
 
 def test_resident_launch_agent_recovers_when_plist_exists_but_job_is_unloaded(tmp_path, monkeypatch):

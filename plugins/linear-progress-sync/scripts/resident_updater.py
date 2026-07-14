@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import plistlib
 import re
+import shlex
 import shutil
 import stat
 import subprocess
@@ -21,6 +23,7 @@ DEFAULT_INSTALL_POLICY = "INSTALLED_BY_DEFAULT"
 SERVICE_LABEL = "com.coreedge.codex-plugins-updater"
 UPDATE_INTERVAL_SECONDS = 1800
 RUNTIME_SCRIPTS = ("linear_sync.py", "resident_updater.py", "update_plugin.py")
+IGNORED_TREE_NAMES = {".DS_Store", "__pycache__"}
 
 
 def default_codex_home() -> Path:
@@ -47,6 +50,36 @@ def plugin_metadata(plugin_root: str | Path) -> JsonDict:
     if not isinstance(version, str) or not version.strip():
         raise ValueError(f"{path} missing plugin version")
     return data
+
+
+def plugin_tree_digest(plugin_root: str | Path) -> str:
+    root = Path(plugin_root).expanduser().resolve()
+    if not root.is_dir():
+        raise FileNotFoundError(f"plugin directory is missing: {root}")
+    digest = hashlib.sha256()
+    for path in sorted(root.rglob("*"), key=lambda item: item.relative_to(root).as_posix()):
+        relative = path.relative_to(root)
+        if any(part in IGNORED_TREE_NAMES for part in relative.parts) or path.suffix == ".pyc":
+            continue
+        encoded = relative.as_posix().encode("utf-8")
+        if path.is_symlink():
+            digest.update(b"L\0" + encoded + b"\0" + os.readlink(path).encode("utf-8") + b"\0")
+        elif path.is_dir():
+            digest.update(b"D\0" + encoded + b"\0")
+        elif path.is_file():
+            digest.update(b"F\0" + encoded + b"\0")
+            with path.open("rb") as handle:
+                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                    digest.update(chunk)
+            digest.update(b"\0")
+    return digest.hexdigest()
+
+
+def plugin_tree_matches(source: str | Path, target: str | Path) -> bool:
+    try:
+        return plugin_tree_digest(source) == plugin_tree_digest(target)
+    except (FileNotFoundError, OSError):
+        return False
 
 
 def safe_relative_path(root: Path, value: str) -> Path:
@@ -119,11 +152,22 @@ def copy_marketplace_release(repo_root: str | Path, *, resident_root: str | Path
     target = releases / str(linear_version)
     if target.exists():
         try:
-            marketplace_plugins(target)
+            managed_plugins = marketplace_plugins(target)
+            managed_by_name = {str(item["name"]): item for item in managed_plugins}
+            marketplace_matches = (
+                (root / ".agents" / "plugins" / "marketplace.json").read_bytes()
+                == (target / ".agents" / "plugins" / "marketplace.json").read_bytes()
+            )
+            plugins_match = len(managed_by_name) == len(plugins) and all(
+                str(plugin["name"]) in managed_by_name
+                and plugin_tree_matches(plugin["source"], managed_by_name[str(plugin["name"])]["source"])
+                for plugin in plugins
+            )
         except (OSError, ValueError, json.JSONDecodeError):
             pass
         else:
-            return {"changed": False, "path": target, "version": linear_version, "plugins": plugins}
+            if marketplace_matches and plugins_match:
+                return {"changed": False, "path": target, "version": linear_version, "plugins": plugins}
 
     releases.mkdir(parents=True, exist_ok=True)
     temporary = Path(tempfile.mkdtemp(prefix=f".{linear_version}.", dir=str(releases)))
@@ -285,6 +329,8 @@ def activate_plugin_caches(
     cache = Path(cache_root).expanduser().resolve()
     rollback = Path(rollback_root).expanduser().resolve()
     moved: list[tuple[Path, Path]] = []
+
+    # Validate the complete activation set before changing any visible cache.
     for plugin in plugins:
         name = str(plugin["name"])
         version = str(plugin["version"])
@@ -293,21 +339,33 @@ def activate_plugin_caches(
         metadata = plugin_metadata(desired)
         if metadata["name"] != name or metadata["version"] != version:
             raise ValueError(f"installed plugin cache does not match {name} {version}: {desired}")
-        for candidate in sorted(parent.iterdir()):
-            if candidate.name.startswith(".") or candidate.name == version or not candidate.is_dir():
-                continue
-            try:
-                candidate_metadata = plugin_metadata(candidate)
-            except (FileNotFoundError, OSError, ValueError, json.JSONDecodeError):
-                continue
-            if candidate_metadata.get("name") != name:
-                continue
-            destination = rollback / name / candidate.name
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            if destination.exists():
-                shutil.rmtree(destination)
-            shutil.move(str(candidate), str(destination))
-            moved.append((candidate, destination))
+        source = Path(plugin["source"])
+        if not plugin_tree_matches(source, desired):
+            raise ValueError(f"installed plugin cache is incomplete or corrupt for {name} {version}: {desired}")
+
+    try:
+        for plugin in plugins:
+            name = str(plugin["name"])
+            version = str(plugin["version"])
+            parent = cache / name
+            for candidate in sorted(parent.iterdir()):
+                if candidate.name.startswith(".") or candidate.name == version or not candidate.is_dir():
+                    continue
+                try:
+                    candidate_metadata = plugin_metadata(candidate)
+                except (FileNotFoundError, OSError, ValueError, json.JSONDecodeError):
+                    continue
+                if candidate_metadata.get("name") != name:
+                    continue
+                destination = rollback / name / candidate.name
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                if destination.exists():
+                    shutil.rmtree(destination)
+                shutil.move(str(candidate), str(destination))
+                moved.append((candidate, destination))
+    except Exception:
+        restore_plugin_caches(moved)
+        raise
     return moved
 
 
@@ -334,9 +392,12 @@ def install_runtime(plugin_root: str | Path, *, resident_root: str | Path) -> Js
         try:
             for script_name in RUNTIME_SCRIPTS:
                 script = target / script_name
-                compile(script.read_text(encoding="utf-8"), str(script), "exec")
+                content = script.read_text(encoding="utf-8")
+                compile(content, str(script), "exec")
+                if script.read_bytes() != (plugin / "scripts" / script_name).read_bytes():
+                    raise ValueError(f"resident runtime differs from plugin source: {script}")
             valid_target = True
-        except (FileNotFoundError, OSError, SyntaxError, UnicodeError):
+        except (FileNotFoundError, OSError, SyntaxError, UnicodeError, ValueError):
             valid_target = False
     if not valid_target:
         releases.mkdir(parents=True, exist_ok=True)
@@ -369,17 +430,21 @@ def install_runtime(plugin_root: str | Path, *, resident_root: str | Path) -> Js
     return {"changed": changed or pointer_changed, "path": target, "version": version}
 
 
-def runner_script(*, resident_root: Path, codex_home: Path) -> str:
+def runner_script(*, resident_root: Path, codex_home: Path, bootstrap_plugin_root: Path) -> str:
     runtime = resident_root / "runtime" / "current"
-    plugin_root = resident_root / "marketplace" / "current" / "plugins" / "linear-progress-sync"
+    managed_plugin_root = resident_root / "marketplace" / "current" / "plugins" / "linear-progress-sync"
     return f"""#!/bin/sh
 set -eu
 PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin
 export PATH
-export CODEX_HOME={toml_string(str(codex_home))}
+export CODEX_HOME={shlex.quote(str(codex_home))}
 python_bin=$(command -v python3 || true)
 [ -n "$python_bin" ] || exit 0
-exec "$python_bin" {toml_string(str(runtime / "update_plugin.py"))} --plugin-root {toml_string(str(plugin_root))} --force --resident
+plugin_root={shlex.quote(str(managed_plugin_root))}
+if [ ! -f "$plugin_root/.codex-plugin/plugin.json" ]; then
+  plugin_root={shlex.quote(str(bootstrap_plugin_root))}
+fi
+exec "$python_bin" {shlex.quote(str(runtime / "update_plugin.py"))} --plugin-root "$plugin_root" --force --resident
 """
 
 
@@ -415,6 +480,30 @@ def launch_agent_payload(*, runner_path: Path, resident_root: Path) -> bytes:
     return plistlib.dumps(payload, fmt=plistlib.FMT_XML, sort_keys=True)
 
 
+def persist_environment_opt_out() -> bool:
+    value = os.environ.get("LINEAR_SYNC_AUTO_UPDATE", "").strip().lower()
+    if value not in {"0", "false", "no", "off"}:
+        return False
+    config_override = os.environ.get("LINEAR_SYNC_CONFIG_DIR")
+    config_dir = (
+        Path(config_override).expanduser().resolve()
+        if config_override
+        else Path.home() / ".codex" / "linear-sync"
+    )
+    state_path = config_dir / "update.json"
+    try:
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, OSError, json.JSONDecodeError):
+        state = {}
+    if not isinstance(state, dict):
+        state = {}
+    if state.get("enabled") is False:
+        return False
+    state["enabled"] = False
+    content = (json.dumps(state, indent=2, sort_keys=True) + "\n").encode("utf-8")
+    return write_if_changed(state_path, content, mode=0o600)
+
+
 def ensure_resident_updater(
     plugin_root: str | Path,
     *,
@@ -426,11 +515,16 @@ def ensure_resident_updater(
 ) -> JsonDict:
     codex = Path(codex_home or default_codex_home()).expanduser().resolve()
     resident = Path(resident_root or default_resident_root(codex)).expanduser().resolve()
+    preference_changed = persist_environment_opt_out()
     runtime = install_runtime(plugin_root, resident_root=resident)
     runner_path = resident / "run.sh"
     runner_changed = write_if_changed(
         runner_path,
-        runner_script(resident_root=resident, codex_home=codex).encode("utf-8"),
+        runner_script(
+            resident_root=resident,
+            codex_home=codex,
+            bootstrap_plugin_root=Path(plugin_root).expanduser().resolve(),
+        ).encode("utf-8"),
         mode=0o755,
     )
     logs = resident / "logs"
@@ -441,7 +535,7 @@ def ensure_resident_updater(
             "installed": True,
             "scheduled": False,
             "reason": "unsupported_platform",
-            "changed": bool(runtime["changed"] or runner_changed),
+            "changed": bool(preference_changed or runtime["changed"] or runner_changed),
             "runtime": str(runtime["path"]),
         }
 
@@ -459,7 +553,7 @@ def ensure_resident_updater(
         return {
             "installed": True,
             "scheduled": True,
-            "changed": bool(runtime["changed"] or runner_changed),
+            "changed": bool(preference_changed or runtime["changed"] or runner_changed),
             "runtime": str(runtime["path"]),
             "plist": str(plist_path),
         }
@@ -511,7 +605,7 @@ def ensure_resident_updater(
     result: JsonDict = {
         "installed": True,
         "scheduled": scheduled,
-        "changed": bool(runtime["changed"] or runner_changed or plist_changed),
+        "changed": bool(preference_changed or runtime["changed"] or runner_changed or plist_changed),
         "runtime": str(runtime["path"]),
         "plist": str(plist_path),
     }
