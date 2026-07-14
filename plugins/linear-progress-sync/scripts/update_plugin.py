@@ -11,6 +11,7 @@ import sys
 import tarfile
 import tempfile
 import urllib.request
+import uuid
 import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
@@ -24,6 +25,7 @@ from linear_sync import (
     remove_plugin_hooks,
     write_json_atomic,
 )
+from resident_updater import plugin_tree_matches
 
 
 JsonDict = dict[str, Any]
@@ -101,6 +103,15 @@ def auto_update_enabled(state: JsonDict | None = None) -> bool:
         return False
     config = state or {}
     return config.get("enabled") is not False
+
+
+def set_auto_update_enabled(enabled: bool, *, state_path: str | Path | None = None) -> JsonDict:
+    path = Path(state_path or update_state_path())
+    state = read_update_state(path)
+    state["enabled"] = enabled
+    state["preference_updated_at"] = now_iso()
+    write_update_state(path, state)
+    return {"enabled": enabled, "state_path": str(path)}
 
 
 def version_parts(version: str) -> tuple[int, ...]:
@@ -324,9 +335,18 @@ def install_plugin_dir(source: Path, *, cache_parent: Path, version: str) -> Pat
     try:
         shutil.copytree(source, temp_target)
         touch_tree(temp_target)
+        previous: Path | None = None
         if target.exists():
-            shutil.rmtree(target)
-        shutil.move(str(temp_target), str(target))
+            previous = cache_parent / f".{version}.{uuid.uuid4().hex}.previous"
+            target.replace(previous)
+        try:
+            temp_target.replace(target)
+        except Exception:
+            if previous is not None and previous.exists():
+                previous.replace(target)
+            raise
+        if previous is not None:
+            shutil.rmtree(previous, ignore_errors=True)
     finally:
         shutil.rmtree(temp_parent, ignore_errors=True)
     return target
@@ -364,7 +384,11 @@ def install_plugin_if_needed(source: Path, *, cache_root: Path) -> JsonDict:
     target = parent / version
     if has_plugin_manifest(target):
         try:
-            if plugin_name(target) == name and plugin_version(target) == version:
+            if (
+                plugin_name(target) == name
+                and plugin_version(target) == version
+                and plugin_tree_matches(source, target)
+            ):
                 return {"name": name, "version": version, "path": str(target), "installed": False}
         except (OSError, ValueError, json.JSONDecodeError):
             pass
@@ -474,11 +498,45 @@ def update_lock_path(state_path: Path) -> Path:
     return state_path.with_suffix(state_path.suffix + ".lock")
 
 
+def process_is_running(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
 def acquire_lock(lock_path: Path) -> int:
     lock_path.parent.mkdir(parents=True, exist_ok=True)
-    fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
-    os.write(fd, str(os.getpid()).encode("utf-8"))
-    return fd
+    for attempt in range(2):
+        try:
+            fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+        except FileExistsError:
+            try:
+                raw_pid = lock_path.read_text(encoding="utf-8").strip()
+                pid = int(raw_pid)
+            except (FileNotFoundError, OSError, ValueError):
+                try:
+                    age = max(0.0, utc_now().timestamp() - lock_path.stat().st_mtime)
+                except FileNotFoundError:
+                    continue
+                if age < 30:
+                    raise FileExistsError(lock_path)
+                pid = -1
+            if process_is_running(pid) or attempt:
+                raise FileExistsError(lock_path)
+            try:
+                lock_path.unlink()
+            except FileNotFoundError:
+                pass
+            continue
+        os.write(fd, str(os.getpid()).encode("utf-8"))
+        return fd
+    raise FileExistsError(lock_path)
 
 
 def release_lock(fd: int | None, lock_path: Path) -> None:
@@ -522,6 +580,7 @@ def run_update(
         installed_plugins: list[JsonDict] = []
         hook_results: list[JsonDict] = []
         hook_roots: list[Path] = []
+        resident_result: JsonDict = {}
         bootstrap_path: Path = root
         bootstrap_installed = False
 
@@ -555,6 +614,11 @@ def run_update(
             latest_version = str(manifest.get("version") or "").strip()
             if not latest_version:
                 raise ValueError("update manifest requires version")
+            archive_version = plugin_version(bootstrap_source)
+            if archive_version != latest_version:
+                raise ValueError(
+                    f"update manifest version {latest_version} does not match archive plugin {archive_version}"
+                )
             next_state = dict(state)
             next_state.update(
                 {
@@ -563,7 +627,44 @@ def run_update(
                     "manifest_url": str(url),
                 }
             )
-            if version_is_newer(latest_version, current_version):
+            if version_is_newer(current_version, latest_version):
+                next_state["last_result"] = "newer_current"
+                next_state["installed_plugins"] = []
+                next_state.pop("last_error", None)
+                write_update_state(state_file, next_state)
+                return {
+                    "updated": False,
+                    "current_version": current_version,
+                    "latest_version": latest_version,
+                    "installed_plugins": [],
+                    "hooks": [],
+                    "resident": {},
+                    "skipped": "newer_current",
+                }
+
+            marketplace_path = find_marketplace_path(
+                extract_dir,
+                str(manifest.get("marketplace_path") or manifest.get("marketplace_subdir") or "").strip() or None,
+            )
+            if marketplace_path:
+                from resident_updater import activate_release
+
+                resident_result = activate_release(
+                    marketplace_repo_root(marketplace_path),
+                    cache_root=cache_root,
+                    install_service=False,
+                )
+                installed_plugins.extend(resident_result.get("installed_plugins", []))
+                for item in resident_result.get("plugins", []):
+                    plugin_path = cache_root / str(item["name"]) / str(item["version"])
+                    if item["name"] == PLUGIN_NAME:
+                        bootstrap_path = plugin_path
+                        bootstrap_installed = any(
+                            installed["name"] == PLUGIN_NAME for installed in installed_plugins
+                        )
+                    if install_hooks:
+                        hook_roots.append(plugin_path)
+            else:
                 bootstrap_result = install_plugin_if_needed(bootstrap_source, cache_root=cache_root)
                 bootstrap_path = Path(str(bootstrap_result["path"]))
                 bootstrap_installed = bool(bootstrap_result.get("installed"))
@@ -575,39 +676,15 @@ def run_update(
                             "path": bootstrap_result["path"],
                         }
                     )
-
-            if install_hooks:
-                hook_roots.append(bootstrap_path)
-
-            marketplace_path = find_marketplace_path(
-                extract_dir,
-                str(manifest.get("marketplace_path") or manifest.get("marketplace_subdir") or "").strip() or None,
-            )
-            if marketplace_path:
-                synced_names = {PLUGIN_NAME}
-                for plugin_dir in read_default_marketplace_plugins(marketplace_path):
-                    name = plugin_name(plugin_dir)
-                    if name in synced_names:
-                        continue
-                    synced_names.add(name)
-                    plugin_result = install_plugin_if_needed(plugin_dir, cache_root=cache_root)
-                    plugin_path = Path(str(plugin_result["path"]))
-                    if plugin_result.get("installed"):
-                        installed_plugins.append(
-                            {
-                                "name": plugin_result["name"],
-                                "version": plugin_result["version"],
-                                "path": plugin_result["path"],
-                            }
-                        )
-                    if install_hooks:
-                        hook_roots.append(plugin_path)
+                if install_hooks:
+                    hook_roots.append(bootstrap_path)
 
         hook_summary = refresh_plugins_hooks(hook_roots) if install_hooks else {"changed": False, "plugins": []}
         hook_results = hook_summary["plugins"]
         hooks_changed = bool(hook_summary.get("changed"))
-        updated = bool(installed_plugins or hooks_changed)
+        updated = bool(installed_plugins or hooks_changed or resident_result.get("changed"))
         next_state["last_result"] = "updated" if updated else "current"
+        next_state.pop("last_error", None)
         if bootstrap_installed:
             next_state["installed_version"] = latest_version
         next_state["installed_plugins"] = [
@@ -621,6 +698,7 @@ def run_update(
             "latest_version": latest_version,
             "installed_plugins": installed_plugins,
             "hooks": hook_results,
+            "resident": resident_result,
         }
         if bootstrap_installed:
             result["installed_version"] = latest_version
@@ -670,8 +748,44 @@ def main() -> None:
     parser.add_argument("--manifest-url", help="Override update manifest URL.")
     parser.add_argument("--state-path", help="Override update state path.")
     parser.add_argument("--force", action="store_true", help="Check even when the throttle interval has not elapsed.")
+    parser.add_argument("--resident", action="store_true", help="Run from the installed resident updater service.")
+    parser.add_argument("--doctor", action="store_true", help="Inspect updater activation and scheduling health.")
+    preference = parser.add_mutually_exclusive_group()
+    preference.add_argument(
+        "--disable-auto-update",
+        action="store_true",
+        help="Persistently disable automatic network update checks.",
+    )
+    preference.add_argument(
+        "--enable-auto-update",
+        action="store_true",
+        help="Re-enable automatic network update checks.",
+    )
     parser.add_argument("--json", action="store_true", help="Print machine-readable output.")
     args = parser.parse_args()
+
+    if args.disable_auto_update or args.enable_auto_update:
+        result = set_auto_update_enabled(not args.disable_auto_update, state_path=args.state_path)
+        if args.json:
+            print(json.dumps(result, indent=2, sort_keys=True))
+        else:
+            status = "enabled" if result["enabled"] else "disabled"
+            print(f"Automatic Core Edge plugin updates are {status}.")
+        return
+
+    if args.doctor:
+        from resident_updater import doctor
+
+        result = doctor()
+        if args.json:
+            print(json.dumps(result, indent=2, sort_keys=True))
+        elif result["healthy"]:
+            print(f"Core Edge updater is healthy at {result['marketplace']}.")
+        else:
+            print("Core Edge updater needs repair:")
+            for issue in result["issues"]:
+                print(f"- {issue}")
+        raise SystemExit(0 if result["healthy"] else 1)
 
     result = run_update(
         current_plugin_root=args.plugin_root,

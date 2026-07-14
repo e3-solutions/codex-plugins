@@ -13,7 +13,7 @@ Current behavior:
 - Enforcement is scoped to git repos whose `origin` remote is under `e3-solutions/*`.
 - Repos with no `origin` remote, no git repo, or a non-E3 origin are out of scope and file edits are allowed without Linear kickoff.
 - Before kickoff in scoped repos, only file edits, write-like Bash commands, and branch creation are blocked. Read-only inspection and non-mutating commands are allowed.
-- Installed plugin caches auto-check for updates on every Codex `SessionStart`, install newer plugin versions from the current `main` archive, sync default marketplace plugins, and remove legacy duplicate global hook registrations.
+- A resident updater checks at macOS login and every 30 minutes, atomically activates newer default marketplace plugins, and retains `SessionStart` as a self-healing fallback.
 
 ## Setup
 
@@ -60,14 +60,29 @@ Before kickoff, file edits, write-like Bash commands, and branch creation wait u
 
 After kickoff, Codex writes and standard Codex commits are synced back to the active Linear issue automatically.
 
-Installed plugin caches check for updates during every `SessionStart`. The updater downloads the current `main.zip` archive, reads the plugin manifest from that archive, installs newer bootstrap versions into `~/.codex/plugins/cache/coreedge-local/linear-progress-sync/<version>/`, syncs coreedge-local marketplace plugins marked `INSTALLED_BY_DEFAULT`, and removes legacy global copies of native plugin hooks. Set `LINEAR_SYNC_AUTO_UPDATE=0` to disable automatic checks.
+Setup installs a resident updater under `~/.codex/coreedge`. On macOS it runs at login and every 30 minutes, independently of Codex tasks. It downloads the current `main.zip`, validates and stages the default marketplace plugins, switches `~/.codex/coreedge/marketplace/current` atomically, points the registered marketplace at that stable path, and leaves only the selected version visible in each Codex plugin cache. Previous versions move to `~/.codex/coreedge/rollback/cache` so a failed activation can restore the prior state. `SessionStart` and `PreToolUse` repair a missing resident service without delaying or blocking Codex.
 
-Existing installations before `0.2.12` install `0.2.12` on the next SessionStart; the following SessionStart installs the updated session logger with historical backfills disabled. Fresh setup installs the current plugins immediately.
+Existing installations before `0.3.0` download `0.3.0` during ordinary Codex use. The next normal hook invocation installs and launches the resident updater from that cached plugin, even before the managed marketplace exists, so no additional `SessionStart` or renewal task is needed. The managed activation also installs Codex Session Logging 0.2.2 with historical backfills disabled. Fresh setup installs and schedules the current plugins immediately. An already-running task keeps the skill text it loaded at creation, while hook implementations switch to the selected cache automatically.
+
+Persistently disable or re-enable automatic network update checks with:
+
+```bash
+python3 ~/.codex/coreedge/runtime/current/update_plugin.py --disable-auto-update
+python3 ~/.codex/coreedge/runtime/current/update_plugin.py --enable-auto-update
+```
+
+`LINEAR_SYNC_AUTO_UPDATE=0` is also honored. When setup or a self-healing hook observes it, the opt-out is saved for future resident launches that do not inherit the shell environment.
 
 To force a manual update check:
 
 ```bash
-python3 ~/.codex/plugins/cache/coreedge-local/linear-progress-sync/0.2.12/scripts/update_plugin.py --force
+python3 ~/.codex/coreedge/runtime/current/update_plugin.py --force
+```
+
+Inspect updater health and activation drift:
+
+```bash
+python3 ~/.codex/coreedge/runtime/current/update_plugin.py --doctor
 ```
 
 ## Rolling Out Updates
@@ -83,7 +98,7 @@ To roll out a new default plugin or extension:
 5. Bump `plugins/linear-progress-sync/.codex-plugin/plugin.json` and `plugins/linear-progress-sync/update-manifest.json`.
 6. Merge to `main`.
 
-After an updater release, the first new Codex thread or session installs the newer plugin. The following SessionStart runs that installed updater and removes legacy Core Edge entries from `~/.codex/hooks.json` so native plugin hooks run once.
+After the one-time setup, releases are staged and activated by the resident service. No teammate reinstall, update command, or renewal thread is part of the rollout. A normal future task naturally picks up changed skill text; existing hook events use the sole selected cache version.
 
 ## Optional
 

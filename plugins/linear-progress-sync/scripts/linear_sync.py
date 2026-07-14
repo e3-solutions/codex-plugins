@@ -1124,6 +1124,20 @@ def setup_plan(
                 str(plugin_root),
             ]
         ),
+        shlex.join(
+            [
+                sys.executable,
+                str(
+                    plugin_root
+                    / "plugins"
+                    / "linear-progress-sync"
+                    / "scripts"
+                    / "install_resident_updater.py"
+                ),
+                "--plugin-root",
+                str(plugin_root),
+            ]
+        ),
         shlex.join(["codex", "mcp", "add", "linear", "--url", LINEAR_MCP_URL]),
     ]
     if with_git_hook:
@@ -1143,10 +1157,12 @@ def setup_plan(
             "First use lists Linear users, asks which user to save, and stores it in ~/.codex/linear-sync/user.json for all repos.",
             "First use in a repo lists Linear teams/projects, asks which project to save, and stores it in ~/.codex/linear-sync/repos.json.",
             "Repos that should not use Linear sync can be opted out with linear_start.py configure-repo --disable-linear-sync.",
-            "Installed plugins check for updates on every SessionStart; set LINEAR_SYNC_AUTO_UPDATE=0 to disable.",
+            "Resident updates run at login and every 30 minutes; teammates need no renewal thread or update command.",
+            "SessionStart remains a self-healing fallback; use update_plugin.py --disable-auto-update for a persistent opt-out.",
+            "LINEAR_SYNC_AUTO_UPDATE=0 is also persisted when setup or a self-healing hook observes it.",
             "Before kickoff, file edits, write-like Bash commands, and branch creation wait for active Linear state.",
             "Per-repo Git hook setup is optional and only needed to sync commits made outside Codex.",
-            "Start a new Codex thread after installing or updating the plugin so hooks and skills reload.",
+            "Start a new Codex thread after the first installation; routine updates need no deliberate restart.",
         ],
     }
 
@@ -2645,7 +2661,7 @@ def command_tokens_are_write_like(tokens: list[str]) -> bool:
         return has_short_option(tokens[1:], {"i"}) or has_long_option(tokens[1:], {"--in-place"})
     if executable in {"perl", "ruby"}:
         return in_place_script_tokens_are_write_like(tokens)
-    if executable in {"python", "python3"}:
+    if is_python_executable_name(executable):
         return python_tokens_are_write_like(tokens)
     return False
 
@@ -2813,6 +2829,10 @@ def safe_shlex_split(value: str) -> list[str]:
         return shlex.split(value)
     except ValueError:
         return []
+
+
+def is_python_executable_name(executable: str) -> bool:
+    return bool(re.fullmatch(r"python(?:\d+(?:\.\d+)*)?", executable))
 
 
 def git_tokens_are_read_only(tokens: list[str]) -> bool:
@@ -2992,7 +3012,7 @@ def linear_start_subcommand_from_tokens(tokens: list[str]) -> str | None:
         return None
     executable = Path(tokens[0]).name
     script_index = 0
-    if executable in {"python", "python3"}:
+    if is_python_executable_name(executable):
         if len(tokens) < 2:
             return None
         script_index = 1

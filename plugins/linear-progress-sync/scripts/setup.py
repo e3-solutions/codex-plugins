@@ -116,8 +116,10 @@ def print_summary(result: dict) -> None:
         print("- GitHub auth is checked by setup; run gh auth login if that step failed.")
         print("- Linear auth is manual; setup registers the MCP server but does not log you in.")
         print("- Repos can opt out with linear_start.py configure-repo --disable-linear-sync.")
-        print("- Codex Session Logging is installed during setup and updated with default marketplace plugins on SessionStart.")
-        print("- Installed plugins check for updates on SessionStart; set LINEAR_SYNC_AUTO_UPDATE=0 to disable.")
+        print("- Codex Session Logging is installed during setup and maintained by the resident updater.")
+        print("- The resident updater checks at login and every 30 minutes; normal updates need no renewal thread.")
+        print("- SessionStart remains a self-healing fallback; use update_plugin.py --disable-auto-update for a persistent opt-out.")
+        print("- LINEAR_SYNC_AUTO_UPDATE=0 is also persisted when setup or a self-healing hook observes it.")
         print("- Before Linear kickoff, file edits, write-like Bash commands, and branch creation wait for active Linear state.")
         print("- No per-repo setup is needed unless you want the optional outside-Codex Git commit hook.")
 
