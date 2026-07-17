@@ -29,16 +29,6 @@
           }
         ]
       }
-    ],
-    "Stop": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "sh -c 'script=$(ls -td \"$HOME\"/.codex/plugins/cache/*/linear-progress-sync/*/scripts/stop_progress.py 2>/dev/null | head -n 1); [ -n \"$script\" ] && exec python3 \"$script\" || exit 0'"
-          }
-        ]
-      }
     ]
   }
 }
