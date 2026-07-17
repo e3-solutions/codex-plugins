@@ -53,8 +53,8 @@ The human should not need to remember `/linear-start`; use it as the explicit/ma
 - Normal progress sync must use the active Linear issue first; branch/commit/fuzzy inference is legacy fallback only.
 - If confidence is below `0.8`, do not write to Linear.
 - If confidence is between `0.5` and `0.8`, write only to `.codex/linear-sync/review_queue.jsonl`.
+- Only post-commit events may create Linear progress comments.
 - Deduplicate post-commit updates by commit SHA and issue key.
-- Throttle session-progress comments to one per issue every 30 minutes.
 - Use the existing Linear MCP/app connection through Codex. Do not add a direct Linear API client.
 
 ## Useful Commands
@@ -79,7 +79,7 @@ This repository is a Codex plugin marketplace, not a single plugin source. Do no
 
 Setup installs a resident updater under `~/.codex/coreedge`. On macOS it checks at login and every 30 minutes, validates and stages the current `main.zip`, atomically switches the managed marketplace, selects one cache version per default plugin, and retains rollback copies outside Codex's cache scan. SessionStart and PreToolUse self-heal a missing service. Persistently disable or re-enable network checks with:
 
-Existing 0.3.0 installations activate `0.3.1` with historical backfills disabled during one ordinary resident check. The next successful scheduled check, normally within 30 minutes while the Mac is logged in and awake, runs the new updater runtime and installs the separate one-minute metadata-only task-presence publisher. Both checks are automatic; presence does not depend on an already-running Codex process reloading hooks. Do not ask teammates to run an update command, deliberately restart Codex, or create a renewal thread. Fresh setup installs and schedules the current plugins immediately.
+Existing installations activate `0.3.2` during one ordinary resident check. The release preserves historical-backfill protections and the separate one-minute task-presence publisher, which reads metadata only, while making Linear progress comments commit-only. Updates are automatic; presence does not depend on an already-running Codex process reloading hooks. Do not ask teammates to run an update command, deliberately restart Codex, or create a renewal thread. Fresh setup installs and schedules the current plugins immediately.
 
 ```bash
 python3 ~/.codex/coreedge/runtime/current/update_plugin.py --disable-auto-update
