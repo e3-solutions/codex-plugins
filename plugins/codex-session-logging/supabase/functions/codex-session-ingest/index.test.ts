@@ -602,6 +602,160 @@ Deno.test("sanitizeEventPayload strips secret-bearing setup snapshot fields", ()
   assertNotIncludes(serialized, "approval_policy");
 });
 
+Deno.test("handleRequest stamps the claude agent and end time onto the session", async () => {
+  const requests: Array<{ url: string; body: JsonObject | null }> = [];
+  const originalFetch = globalThis.fetch;
+  const previousUrl = Deno.env.get("SUPABASE_URL");
+  const previousServiceRole = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
+
+  Deno.env.set("SUPABASE_URL", "https://project.supabase.co");
+  Deno.env.set("SUPABASE_SERVICE_ROLE_KEY", "service-role-key");
+  globalThis.fetch = async (input, init = {}) => {
+    const url = input instanceof Request
+      ? input.url
+      : input instanceof URL
+      ? input.toString()
+      : input;
+    const requestInit = init as { body?: BodyInit | null };
+    const body = typeof requestInit.body === "string"
+      ? JSON.parse(requestInit.body) as JsonObject
+      : null;
+    requests.push({ url, body });
+    if (url.includes("/rest/v1/codex_sessions?select=")) {
+      return new Response(JSON.stringify([]), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    }
+    return new Response("", { status: 201 });
+  };
+
+  try {
+    const response = await handleRequest(
+      new Request("https://example.test/codex-session-ingest", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          version: 1,
+          record: {
+            id: "b04fd832-7779-4665-9bec-2f10462c721b",
+            type: "event",
+            session_id: "claude-session-end",
+            seq: 9,
+            event_type: "thread_stopped",
+            hook_event_name: "Stop",
+            created_at: "2026-07-16T00:00:00.000Z",
+            ended_at: "2026-07-16T00:00:00.000Z",
+            metadata: {
+              cwd: "/repo",
+              platform: "claude-code",
+              agent: "claude",
+              thread_event: "stopped",
+            },
+          },
+          event: {
+            metadata: {
+              cwd: "/repo",
+              platform: "claude-code",
+              agent: "claude",
+              thread_event: "stopped",
+            },
+          },
+          client: {
+            repo_remote: "https://github.com/e3-solutions/codex-plugins.git",
+            installation_id: "install-1",
+          },
+        }),
+      }),
+    );
+    const sessionUpsert = requests.find((request) =>
+      request.url.includes("/rest/v1/codex_sessions?on_conflict=")
+    );
+    const sessionMetadata = sessionUpsert?.body?.metadata as
+      | JsonObject
+      | undefined;
+
+    assertEquals(response.status, 200);
+    assertEquals(sessionMetadata?.agent, "claude");
+    assertEquals(sessionUpsert?.body?.ended_at, "2026-07-16T00:00:00.000Z");
+  } finally {
+    globalThis.fetch = originalFetch;
+    restoreEnv("SUPABASE_URL", previousUrl);
+    restoreEnv("SUPABASE_SERVICE_ROLE_KEY", previousServiceRole);
+  }
+});
+
+Deno.test("handleRequest defaults agent to codex and clears ended_at on live events", async () => {
+  const requests: Array<{ url: string; body: JsonObject | null }> = [];
+  const originalFetch = globalThis.fetch;
+  const previousUrl = Deno.env.get("SUPABASE_URL");
+  const previousServiceRole = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
+
+  Deno.env.set("SUPABASE_URL", "https://project.supabase.co");
+  Deno.env.set("SUPABASE_SERVICE_ROLE_KEY", "service-role-key");
+  globalThis.fetch = async (input, init = {}) => {
+    const url = input instanceof Request
+      ? input.url
+      : input instanceof URL
+      ? input.toString()
+      : input;
+    const requestInit = init as { body?: BodyInit | null };
+    const body = typeof requestInit.body === "string"
+      ? JSON.parse(requestInit.body) as JsonObject
+      : null;
+    requests.push({ url, body });
+    if (url.includes("/rest/v1/codex_sessions?select=")) {
+      return new Response(JSON.stringify([]), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    }
+    return new Response("", { status: 201 });
+  };
+
+  try {
+    const response = await handleRequest(
+      new Request("https://example.test/codex-session-ingest", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          version: 1,
+          record: {
+            id: "c04fd832-7779-4665-9bec-2f10462c721b",
+            type: "event",
+            session_id: "codex-session-live",
+            seq: 3,
+            event_type: "tool_call_started",
+            created_at: "2026-07-16T00:00:00.000Z",
+            metadata: { cwd: "/repo", tool_name: "shell", tool_phase: "started" },
+          },
+          event: {
+            metadata: { tool_name: "shell", tool_phase: "started" },
+          },
+          client: {
+            repo_remote: "https://github.com/e3-solutions/codex-plugins.git",
+            installation_id: "install-1",
+          },
+        }),
+      }),
+    );
+    const sessionUpsert = requests.find((request) =>
+      request.url.includes("/rest/v1/codex_sessions?on_conflict=")
+    );
+    const sessionMetadata = sessionUpsert?.body?.metadata as
+      | JsonObject
+      | undefined;
+
+    assertEquals(response.status, 200);
+    assertEquals(sessionMetadata?.agent, "codex");
+    assertEquals(sessionUpsert?.body?.ended_at, null);
+  } finally {
+    globalThis.fetch = originalFetch;
+    restoreEnv("SUPABASE_URL", previousUrl);
+    restoreEnv("SUPABASE_SERVICE_ROLE_KEY", previousServiceRole);
+  }
+});
+
 function assertEquals(actual: unknown, expected: unknown): void {
   const actualJson = JSON.stringify(actual, null, 2);
   const expectedJson = JSON.stringify(expected, null, 2);
