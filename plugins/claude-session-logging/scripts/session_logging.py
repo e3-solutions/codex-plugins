@@ -34,6 +34,13 @@ DEFAULT_ALLOWED_GITHUB_ORG = "e3-solutions"
 PLUGIN_NAME = "claude-session-logging"
 PLUGIN_VERSION = "git"
 PLATFORM = "claude-code"
+# Coding-agent family stamped on every payload so the ingest, heartbeat
+# dashboard, and codestat can label/classify Claude sessions. Codex uses "codex".
+AGENT = "claude"
+# Event types that mark the end of a session. These carry ``ended_at`` so the
+# ingest can set codex_sessions.ended_at; every other event clears it (see the
+# ingest upsertSession branch).
+END_EVENT_TYPES = frozenset({"thread_stopped", "thread_ended"})
 PERMANENT_HTTP_STATUSES = {400, 403, 413, 415, 422}
 
 
@@ -178,6 +185,11 @@ def capture_metadata_event(
         "created_at": created_at,
         "uploaded_at": None,
     }
+    if event_type in END_EVENT_TYPES:
+        # Stop / SessionEnd end the session; the ingest persists this as
+        # codex_sessions.ended_at. A later prompt, tool call, or presence tick
+        # clears it again, so a resumed session lights back up.
+        event["ended_at"] = created_at
     append_jsonl(base / "events.jsonl", event)
     enqueue_record(base, event)
     try_auto_drain()
@@ -185,7 +197,7 @@ def capture_metadata_event(
 
 
 def metadata_from_payload(payload: JsonDict) -> JsonDict:
-    metadata: JsonDict = {"platform": PLATFORM}
+    metadata: JsonDict = {"platform": PLATFORM, "agent": AGENT}
     cwd = first_string(payload, "cwd") or os.getcwd()
     if cwd:
         metadata["cwd"] = cwd
