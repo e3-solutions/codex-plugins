@@ -12,7 +12,7 @@ import sys
 import time
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
@@ -35,18 +35,10 @@ STATE_DIR_ENV = "LINEAR_SYNC_STATE_DIR"
 CONFIG_DIR_ENV = "LINEAR_SYNC_CONFIG_DIR"
 DRY_RUN_ENV = "LINEAR_SYNC_DRY_RUN"
 CODEX_COMMAND_ENV = "LINEAR_SYNC_CODEX_COMMAND"
-THROTTLE_SECONDS = 30 * 60
 ALLOWED_GITHUB_ORG = "e3-solutions"
 LINEAR_MCP_URL = "https://mcp.linear.app/mcp"
-LINEAR_HOOK_EVENTS = ("SessionStart", "PreToolUse", "PostToolUse", "Stop")
+LINEAR_HOOK_EVENTS = ("SessionStart", "PreToolUse", "PostToolUse")
 NATIVE_HOOK_PLUGINS = ("linear-progress-sync", "codex-session-logging")
-IGNORED_FILE_PREFIXES = (
-    ".codex/linear-sync/",
-    ".git/",
-)
-IGNORED_FILE_NAMES = {
-    ".DS_Store",
-}
 READ_ONLY_BASH_EXECUTABLES = {
     "basename",
     "cat",
@@ -159,7 +151,6 @@ def default_state() -> JsonDict:
         "processed_event_ids": [],
         "synced_commit_shas": [],
         "issue_keys_by_commit": {},
-        "last_session_progress_at": {},
         "stale_issue_cache": {
             "updated_at": None,
             "issues": [],
@@ -647,6 +638,13 @@ def hook_entry_mentions_plugin(entry: Any, plugin_name: str) -> bool:
     return plugin_name in text
 
 
+def hook_entry_is_legacy_plugin_hook(entry: Any, plugin_name: str) -> bool:
+    return any(
+        plugin_name in command and "/plugins/cache/" in command and "/scripts/" in command
+        for command in hook_entry_command_signature(entry)
+    )
+
+
 def hook_entry_command_signature(entry: Any) -> tuple[str, ...]:
     commands: list[str] = []
 
@@ -693,6 +691,7 @@ def remove_plugin_hooks(existing: JsonDict, *, plugin_name: str, plugin_config: 
         replacement = [
             entry for entry in current
             if hook_entry_command_signature(entry) not in signatures
+            and not hook_entry_is_legacy_plugin_hook(entry, plugin_name)
         ]
         if replacement:
             merged_hooks[event] = replacement
@@ -1478,23 +1477,6 @@ def increment_failure(state: JsonDict, event_id: str, message: str) -> None:
     entry["last_failed_at"] = now_iso()
 
 
-def should_throttle_session_progress(state: JsonDict, issue_key: str, *, now: datetime | None = None) -> bool:
-    last_raw = (state.get("last_session_progress_at") or {}).get(issue_key.upper())
-    if not last_raw:
-        return False
-    try:
-        last = datetime.fromisoformat(last_raw)
-    except ValueError:
-        return False
-    current = now or datetime.now(timezone.utc)
-    return current - last < timedelta(seconds=THROTTLE_SECONDS)
-
-
-def mark_session_progress(state: JsonDict, issue_key: str, *, now: datetime | None = None) -> None:
-    timestamps = state.setdefault("last_session_progress_at", {})
-    timestamps[issue_key.upper()] = (now or datetime.now(timezone.utc)).isoformat()
-
-
 def write_review_queue(event: JsonDict, inference: IssueInference, reason: str, *, root: str | Path | None = None) -> None:
     base = ensure_state(root)
     append_jsonl(
@@ -1548,6 +1530,18 @@ def drain_once(
     reviewed = 0
     skipped = 0
     events = load_events(root)
+    commit_events: list[tuple[Path, JsonDict]] = []
+    for path, event in events:
+        if event.get("type") == "post_commit":
+            commit_events.append((path, event))
+            continue
+        event_id = str(event.get("id") or path.stem)
+        if event_id not in set(local_state.get("processed_event_ids") or []):
+            log_noop(local_state, event, "only post-commit events sync to Linear")
+            mark_processed(local_state, event_id)
+            skipped += 1
+        safe_unlink(path)
+    events = commit_events
     if linear_guard_disabled(root=root):
         for path, event in events:
             event_id = str(event.get("id") or path.stem)
@@ -1605,18 +1599,8 @@ def drain_once(
             safe_unlink(path)
             skipped += 1
             continue
-        if event.get("type") == "session_progress" and should_throttle_session_progress(
-            local_state,
-            inference.issue_key,
-            now=now,
-        ):
-            log_noop(local_state, event, "session progress throttled", inference)
-            mark_processed(local_state, event_id)
-            safe_unlink(path)
-            skipped += 1
-            continue
         commit_sha = str(event.get("commit_sha") or "")
-        if event.get("type") == "post_commit" and already_synced_commit(local_state, commit_sha, inference.issue_key):
+        if already_synced_commit(local_state, commit_sha, inference.issue_key):
             log_noop(local_state, event, "duplicate commit/issue update skipped", inference)
             mark_processed(local_state, event_id)
             safe_unlink(path)
@@ -1632,10 +1616,7 @@ def drain_once(
         result = (executor or run_codex_update)(prompt, event, inference)
         if result.ok:
             mark_processed(local_state, event_id)
-            if event.get("type") == "post_commit":
-                mark_commit_synced(local_state, commit_sha, inference.issue_key)
-            if event.get("type") == "session_progress":
-                mark_session_progress(local_state, inference.issue_key, now=now)
+            mark_commit_synced(local_state, commit_sha, inference.issue_key)
             safe_unlink(path)
             processed += 1
         else:
@@ -1659,24 +1640,6 @@ def safe_unlink(path: Path) -> None:
 
 
 def build_linear_comment(event: JsonDict, *, now: datetime | None = None) -> str:
-    if event.get("type") == "session_progress":
-        summary = str(event.get("summary") or "Codex made meaningful local progress.")
-        current_state = str(event.get("diff_stat") or "Local files changed; inspect repo diff for details.")
-        return with_codex_attribution(
-            "\n".join(
-                [
-                    "Codex session progress update",
-                    "",
-                    "Summary:",
-                    f"- {summary}",
-                    "",
-                    "Current state:",
-                    f"- {current_state}",
-                ]
-            ),
-            now=now,
-        )
-
     short_sha = str(event.get("short_sha") or str(event.get("commit_sha") or "")[:7] or "unknown")
     subject = str(event.get("commit_subject") or "Commit progress")
     changed = [str(path) for path in event.get("changed_files") or [] if str(path).strip()]
@@ -1775,6 +1738,9 @@ def foreground_sync_plan(
         if event_id in set(local_state.get("processed_event_ids") or []):
             skipped.append({**item, "reason": "already processed locally"})
             continue
+        if event.get("type") != "post_commit":
+            skipped.append({**item, "reason": "only post-commit events sync to Linear"})
+            continue
         if inference.confidence < 0.5 or not inference.issue_key:
             skipped.append({**item, "reason": "issue inference confidence below 0.5"})
             continue
@@ -1784,15 +1750,8 @@ def foreground_sync_plan(
         if is_terminal_status(inference.status):
             skipped.append({**item, "reason": f"cached issue status is terminal: {inference.status}"})
             continue
-        if event.get("type") == "session_progress" and should_throttle_session_progress(
-            local_state,
-            inference.issue_key,
-            now=now,
-        ):
-            skipped.append({**item, "reason": "session progress throttled"})
-            continue
         commit_sha = str(event.get("commit_sha") or "")
-        if event.get("type") == "post_commit" and already_synced_commit(local_state, commit_sha, inference.issue_key):
+        if already_synced_commit(local_state, commit_sha, inference.issue_key):
             skipped.append({**item, "reason": "duplicate commit/issue update already synced locally"})
             continue
         eligible.append(
@@ -1878,8 +1837,6 @@ def ack_foreground_event(
     mark_processed(local_state, event_id)
     if matched_event.get("type") == "post_commit":
         mark_commit_synced(local_state, commit_sha or matched_event.get("commit_sha"), issue_key)
-    if matched_event.get("type") == "session_progress":
-        mark_session_progress(local_state, issue_key, now=now)
     local_state.setdefault("failures", {}).pop(event_id, None)
     safe_unlink(matched_path)
     save_state(local_state, root)
@@ -1914,16 +1871,7 @@ def skip_foreground_event(
 def build_codex_prompt(event: JsonDict, inference: IssueInference, *, now: datetime | None = None) -> str:
     event_json = json.dumps(event, indent=2, sort_keys=True)
     comment_now = now or datetime.now(timezone.utc)
-    if event.get("type") == "session_progress":
-        comment_template = """Codex session progress update
-
-Summary:
-- <1-3 bullets summarizing meaningful progress since last update>
-
-Current state:
-- <tests run / files changed / unresolved work if known>"""
-    else:
-        comment_template = """Codex progress update
+    comment_template = """Codex progress update
 
 Commit: `<short_sha>` — <commit subject>
 
@@ -2359,19 +2307,6 @@ def handle_post_tool_use(payload: JsonDict, *, root: str | Path | None = None) -
             queued = enqueue_event("post_commit", event, root=root)
             spawn_drain(root=root)
             return queued
-    if tool_requires_active_state(payload, tool.lower()):
-        paths = changed_paths_from_payload(payload)
-        meaningful = [path for path in paths if meaningful_file(path)]
-        if meaningful:
-            return enqueue_event(
-                "file_change",
-                {
-                    "source": f"PostToolUse:{tool}",
-                    "changed_files": meaningful,
-                    "summary": "Codex made meaningful local file edits.",
-                },
-                root=root,
-            )
     return None
 
 
@@ -3040,83 +2975,11 @@ def linear_start_subcommand_from_tokens(tokens: list[str]) -> str | None:
 
 
 
-def changed_paths_from_payload(payload: JsonDict) -> list[str]:
-    paths: list[str] = []
-    for key in ("file_path", "path", "filename"):
-        value = payload.get(key) or nested(payload, "tool_input", key) or nested(payload, "input", key)
-        if isinstance(value, str):
-            paths.append(value)
-    for key in ("changed_files", "files"):
-        value = payload.get(key)
-        if isinstance(value, list):
-            paths.extend(str(item) for item in value)
-    if tool_name(payload).lower() == "apply_patch":
-        paths.extend(paths_from_apply_patch_command(tool_command(payload)))
-    return sorted({normalize_repo_path(path) for path in paths if path})
-
-
-def paths_from_apply_patch_command(command: str) -> list[str]:
-    paths: list[str] = []
-    for raw_line in command.splitlines():
-        line = raw_line.strip()
-        for prefix in (
-            "*** Add File: ",
-            "*** Update File: ",
-            "*** Delete File: ",
-            "*** Move to: ",
-        ):
-            if line.startswith(prefix):
-                paths.append(line[len(prefix) :].strip())
-                break
-    return paths
-
-
 def normalize_repo_path(path: str) -> str:
     normalized = path.replace("\\", "/")
     while normalized.startswith("./"):
         normalized = normalized[2:]
     return normalized
-
-
-def meaningful_file(path: str) -> bool:
-    normalized = normalize_repo_path(path)
-    if not normalized or normalized in IGNORED_FILE_NAMES:
-        return False
-    if any(normalized.startswith(prefix) for prefix in IGNORED_FILE_PREFIXES):
-        return False
-    if normalized.endswith((".pyc", ".log", ".tmp", ".swp")):
-        return False
-    return True
-
-
-def session_progress_payload(hook_payload: JsonDict, *, root: str | Path | None = None) -> JsonDict | None:
-    changed_files = current_changed_files(root=root)
-    meaningful = [path for path in changed_files if meaningful_file(path)]
-    if not meaningful:
-        return None
-    return {
-        "source": "Stop",
-        "branch": current_branch(root),
-        "changed_files": meaningful[:50],
-        "diff_stat": git_output(["diff", "--stat"], root=root),
-        "last_assistant_message": last_assistant_message(hook_payload),
-        "summary": "Codex made meaningful local progress without a commit in this turn.",
-    }
-
-
-def current_changed_files(*, root: str | Path | None = None) -> list[str]:
-    tracked = git_output(["diff", "--name-only"], root=root).splitlines()
-    staged = git_output(["diff", "--cached", "--name-only"], root=root).splitlines()
-    untracked = git_output(["ls-files", "--others", "--exclude-standard"], root=root).splitlines()
-    return sorted({normalize_repo_path(path) for path in [*tracked, *staged, *untracked] if path.strip()})
-
-
-def last_assistant_message(payload: JsonDict) -> str | None:
-    for key in ("last_assistant_message", "lastAssistantMessage", "assistant_message", "message"):
-        value = payload.get(key)
-        if isinstance(value, str) and value.strip():
-            return value.strip()
-    return None
 
 
 def spawn_drain(*, root: str | Path | None = None) -> None:

@@ -306,6 +306,12 @@ async function upsertSession(
     }`,
     metadata: sessionMetadata,
     started_at: requireString(record.created_at, "record.created_at"),
+    // Persist an explicit session end when the client sends one (Claude Stop /
+    // SessionEnd, or an idle-timeout presence tick). Absent on ordinary events,
+    // in which case we clear ended_at so a resumed session lights up again.
+    // Codex never sends ended_at, so this stays null for Codex — behavior
+    // unchanged.
+    ended_at: optionalString(record.ended_at),
     updated_at: new Date().toISOString(),
   };
   await restUpsert("codex_sessions", row, "id");
@@ -351,6 +357,12 @@ async function sessionMetadataForUpsert(
       nextMetadata[field] = existingMetadata[field];
     }
   }
+  // Stamp the coding-agent family onto the session row so downstream consumers
+  // (heartbeat dashboard, codestat) can label sessions without heuristics.
+  // Sticky: once a session is seen as "claude" it stays "claude" even if a later
+  // event omits the tag. Defaults to "codex" to preserve existing rows.
+  nextMetadata.agent = optionalString(metadata.agent) ??
+    optionalString(existingMetadata.agent) ?? "codex";
   return {
     ...nextMetadata,
     client,

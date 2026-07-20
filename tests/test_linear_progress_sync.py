@@ -1028,6 +1028,34 @@ def test_opted_out_repo_does_not_drain_or_prepare_linear_sync(tmp_path, monkeypa
     assert remaining_events == []
 
 
+def test_stop_hook_is_noop_for_active_repo_with_uncommitted_changes(tmp_path, monkeypatch):
+    state_dir = tmp_path / "state"
+    config_dir = tmp_path / "config"
+    monkeypatch.setenv("LINEAR_SYNC_STATE_DIR", str(state_dir))
+    monkeypatch.setenv("LINEAR_SYNC_CONFIG_DIR", str(config_dir))
+    repo = init_git_repo(tmp_path / "repo", branch="arya/cor-124-commit-only")
+    linear_sync.save_linear_user_profile(linear_name="Arya G")
+    linear_sync.write_active_issue(
+        active_payload(repo, issue_key="COR-124", branch="arya/cor-124-commit-only", pr_number=124),
+        root=repo,
+    )
+    (repo / "app.py").write_text("print('uncommitted')\n", encoding="utf-8")
+
+    result = subprocess.run(
+        [sys.executable, str(ROOT / "plugins" / "linear-progress-sync" / "scripts" / "stop_progress.py")],
+        input="{}\n",
+        cwd=repo,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+
+    assert result.returncode == 0
+    assert result.stdout == ""
+    assert list((state_dir / "events").glob("*.json")) == []
+
+
 def test_pre_tool_guard_blocks_apply_patch_without_active_state(tmp_path, monkeypatch):
     state_dir = tmp_path / "state"
     config_dir = tmp_path / "config"
@@ -1050,29 +1078,7 @@ def test_pre_tool_guard_blocks_apply_patch_without_active_state(tmp_path, monkey
     assert all("No Linear team/project is saved for this repo" in decision.message for decision in decisions)
 
 
-def test_changed_paths_from_apply_patch_command_includes_added_files():
-    paths = linear_sync.changed_paths_from_payload(
-        {
-            "tool_name": "apply_patch",
-            "tool_input": {
-                "command": """*** Begin Patch
-*** Add File: src/new_module.py
-+print("hello")
-*** Update File: src/existing.py
-@@
--old
-+new
-*** Delete File: obsolete.py
-*** End Patch
-""",
-            },
-        }
-    )
-
-    assert paths == ["obsolete.py", "src/existing.py", "src/new_module.py"]
-
-
-def test_handle_post_tool_use_queues_apply_patch_added_file(tmp_path, monkeypatch):
+def test_handle_post_tool_use_does_not_queue_apply_patch_added_file(tmp_path, monkeypatch):
     state_dir = tmp_path / "state"
     config_dir = tmp_path / "config"
     monkeypatch.setenv("LINEAR_SYNC_STATE_DIR", str(state_dir))
@@ -1107,8 +1113,37 @@ def test_handle_post_tool_use_queues_apply_patch_added_file(tmp_path, monkeypatc
         root=repo,
     )
 
+    assert queued is None
+    assert list((state_dir / "events").glob("*.json")) == []
+
+
+def test_handle_post_tool_use_queues_successful_git_commit(tmp_path, monkeypatch):
+    state_dir = tmp_path / "state"
+    monkeypatch.setenv("LINEAR_SYNC_STATE_DIR", str(state_dir))
+    repo = init_git_repo(tmp_path / "repo", branch="arya/cor-56-work")
+    monkeypatch.setattr(
+        linear_sync,
+        "collect_commit_event",
+        lambda *, root=None: {
+            "commit_sha": "abc123",
+            "short_sha": "abc123",
+            "commit_subject": "COR-56 commit-only progress",
+            "changed_files": ["src/app.py"],
+            "branch": "arya/cor-56-work",
+        },
+    )
+    drain_roots = []
+    monkeypatch.setattr(linear_sync, "spawn_drain", lambda *, root=None: drain_roots.append(root))
+
+    queued = linear_sync.handle_post_tool_use(
+        {"tool_name": "Bash", "command": "git commit -m 'COR-56 work'", "exit_code": 0},
+        root=repo,
+    )
+
     assert queued is not None
-    assert queued["changed_files"] == ["src/new_module.py"]
+    assert queued["type"] == "post_commit"
+    assert queued["commit_sha"] == "abc123"
+    assert drain_roots == [repo]
 
 
 def test_pre_tool_guard_allows_unbound_repo_read_only_commands(tmp_path, monkeypatch):
@@ -1591,9 +1626,22 @@ def test_enqueue_event_carries_active_issue_key(tmp_path, monkeypatch):
         root=repo,
     )
 
-    event = linear_sync.enqueue_event("file_change", {"changed_files": ["app.py"]}, root=repo)
+    event = linear_sync.enqueue_event(
+        "post_commit",
+        {"commit_sha": "abc123", "commit_subject": "COR-38 commit-only progress"},
+        root=repo,
+    )
 
     assert event["issue_key"] == "COR-38"
+
+
+def test_linear_progress_hooks_do_not_register_stop_event():
+    for relative_path in (
+        "plugins/linear-progress-sync/hooks.json",
+        "plugins/linear-progress-sync/hooks/hooks.json",
+    ):
+        config = json.loads((ROOT / relative_path).read_text(encoding="utf-8"))
+        assert "Stop" not in config["hooks"]
 
 
 def test_linear_start_dry_run_plan_contains_git_and_gh_commands(tmp_path):
@@ -2107,7 +2155,7 @@ def test_legacy_upgrade_installs_presence_on_next_automatic_resident_cycle(tmp_p
     manifest.write_text(
         json.dumps(
             {
-                "version": "0.3.2",
+                "version": "0.3.3",
                 "archive_url": archive.as_uri(),
                 "sha256": hashlib.sha256(archive.read_bytes()).hexdigest(),
                 "plugin_subdir": "plugins/linear-progress-sync",
@@ -2163,8 +2211,8 @@ def test_legacy_upgrade_installs_presence_on_next_automatic_resident_cycle(tmp_p
     resident_root = codex_home / "coreedge"
 
     assert first_cycle.returncode == 0, first_cycle.stderr
-    assert json.loads(first_cycle.stdout)["resident"]["version"] == "0.3.2"
-    assert (resident_root / "runtime" / "current").resolve().name == "0.3.2"
+    assert json.loads(first_cycle.stdout)["resident"]["version"] == "0.3.3"
+    assert (resident_root / "runtime" / "current").resolve().name == "0.3.3"
     assert not (home / "Library" / "LaunchAgents" / "com.coreedge.codex-session-presence.plist").exists()
 
     second_cycle = subprocess.run(
@@ -2984,12 +3032,12 @@ def test_real_marketplace_activates_in_isolated_codex_home_and_passes_doctor(tmp
         platform="unsupported",
     )
 
-    assert activation["version"] == "0.3.2"
+    assert activation["version"] == "0.3.3"
     assert health["healthy"] is True
     assert health["issues"] == []
     assert health["cache_versions"] == {
         "codex-session-logging": ["0.2.3"],
-        "linear-progress-sync": ["0.3.2"],
+        "linear-progress-sync": ["0.3.3"],
     }
     assert subprocess.run(["sh", "-n", str(resident_root / "run.sh")], check=False).returncode == 0
 
@@ -3006,7 +3054,7 @@ def test_resident_hook_repairs_matching_cache_and_runtime_corruption_from_manage
         platform="unsupported",
     )
     managed = resident_root / "marketplace/current/plugins/linear-progress-sync"
-    cache = codex_home / "plugins/cache/coreedge-local/linear-progress-sync/0.3.2"
+    cache = codex_home / "plugins/cache/coreedge-local/linear-progress-sync/0.3.3"
     runtime = resident_root / "runtime/current"
     corrupt_content = (managed / "scripts/linear_sync.py").read_bytes()
     (cache / "scripts/update_plugin.py").write_bytes(corrupt_content)
@@ -3850,7 +3898,7 @@ def test_resident_doctor_reports_content_corruption_and_unloaded_service(tmp_pat
     broken_cache_script = (
         cache_root
         / "linear-progress-sync"
-        / "0.3.2"
+        / "0.3.3"
         / "scripts"
         / "update_plugin.py"
     )
@@ -3988,7 +4036,17 @@ def test_install_codex_hooks_removes_legacy_plugin_hooks_and_preserves_user_hook
                     ],
                     "Stop": [
                         {"hooks": [{"type": "command", "command": "/tmp/notify.sh"}]},
-                        linear_config["hooks"]["Stop"][0],
+                        {
+                            "hooks": [
+                                {
+                                    "type": "command",
+                                    "command": (
+                                        "python3 ~/.codex/plugins/cache/coreedge-local/"
+                                        "linear-progress-sync/0.3.1/scripts/stop_progress.py"
+                                    ),
+                                }
+                            ]
+                        },
                         logging_config["hooks"]["Stop"][0],
                     ],
                 }
@@ -4092,11 +4150,11 @@ def test_readmes_register_linear_mcp_before_linear_login():
         assert "saves it in `~/.codex/linear-sync/repos.json`" in text
         assert "update_plugin.py --force" in text
         assert "update_plugin.py --doctor" in text
-        assert "`0.3.2`" in text
+        assert "`0.3.3`" in text
         assert "one-minute task-presence publisher" in text
         assert "renewal thread" in text
         assert "every 30 minutes" in text
-        assert "historical backfills disabled" in text
+        assert "historical-backfill protections" in text
         assert "LINEAR_SYNC_AUTO_UPDATE=0" in text
         assert "not a single plugin source" in text
         assert "Do not install the GitHub URL or repository root directly with `codex plugin add`" in text
@@ -4134,25 +4192,26 @@ def test_setup_run_step_does_not_treat_auth_failure_as_idempotent_success(monkey
     assert "gh auth login" in result["message"]
 
 
-def test_session_progress_throttling_works(tmp_path, monkeypatch):
+def test_non_commit_events_are_discarded_without_linear_updates(tmp_path, monkeypatch):
     monkeypatch.setenv("LINEAR_SYNC_STATE_DIR", str(tmp_path))
-    state = linear_sync.default_state()
-    now = datetime(2026, 7, 1, 12, 0, tzinfo=timezone.utc)
-    linear_sync.mark_session_progress(state, "COR-5", now=now)
-    linear_sync.save_state(state, tmp_path)
-    linear_sync.enqueue_event(
-        "session_progress",
-        {
-            "id": "evt-session",
-            "branch": "nitish/cor-5-progress",
-            "changed_files": ["training/tool_rlvr.py"],
-        },
-        root=tmp_path,
-    )
+    for event_type in ("file_change", "session_progress"):
+        linear_sync.enqueue_event(
+            event_type,
+            {
+                "id": f"evt-{event_type}",
+                "branch": "nitish/cor-5-progress",
+                "changed_files": ["training/tool_rlvr.py"],
+            },
+            root=tmp_path,
+        )
     calls = []
-    result = linear_sync.drain_once(root=tmp_path, executor=lambda *_: calls.append(True), now=now)
-    assert result["skipped"] == 1
+    result = linear_sync.drain_once(root=tmp_path, executor=lambda *_: calls.append(True))
+    state = linear_sync.read_state(tmp_path)
+
+    assert result["skipped"] == 2
     assert calls == []
+    assert set(state["processed_event_ids"]) == {"evt-file_change", "evt-session_progress"}
+    assert not list((tmp_path / "events").glob("*.json"))
 
 
 def test_post_commit_hook_returns_quickly():
@@ -4366,6 +4425,30 @@ def test_foreground_prepare_returns_eligible_event_without_mutation(tmp_path, mo
     assert "foreground_sync.py ack" in plan["eligible"][0]["ack_command"]
     assert "evt-fg" not in state["processed_event_ids"]
     assert list((state_dir / "events").glob("*.json"))
+
+
+def test_foreground_prepare_rejects_legacy_non_commit_event(tmp_path, monkeypatch):
+    state_dir = tmp_path / "state"
+    monkeypatch.setenv("LINEAR_SYNC_STATE_DIR", str(state_dir))
+    repo = init_git_repo(tmp_path / "repo", branch="arya/cor-10-commit-only")
+    linear_sync.write_active_issue(
+        active_payload(repo, issue_key="COR-10", branch="arya/cor-10-commit-only", pr_number=10),
+        root=repo,
+    )
+    linear_sync.enqueue_event(
+        "file_change",
+        {
+            "id": "evt-legacy-edit",
+            "branch": "arya/cor-10-commit-only",
+            "changed_files": ["app.py"],
+        },
+        root=repo,
+    )
+
+    plan = linear_sync.foreground_sync_plan(root=repo)
+
+    assert plan["eligible"] == []
+    assert plan["skipped"][0]["reason"] == "only post-commit events sync to Linear"
 
 
 def test_foreground_ack_marks_synced_and_removes_event(tmp_path, monkeypatch):

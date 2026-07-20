@@ -39,6 +39,9 @@ function sanitizeEventMetadata(
     "source",
     "platform",
     "permission_mode",
+    // Coding-agent family ("codex" | "claude"). Metadata-only label used to
+    // classify the session downstream; carries no user content.
+    "agent",
   ]);
 
   if (eventType === "environment_snapshot") {

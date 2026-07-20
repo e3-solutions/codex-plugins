@@ -53,8 +53,8 @@ The human should not need to remember `/linear-start`; use it as the explicit/ma
 - Normal progress sync must use the active Linear issue first; branch/commit/fuzzy inference is legacy fallback only.
 - If confidence is below `0.8`, do not write to Linear.
 - If confidence is between `0.5` and `0.8`, write only to `.codex/linear-sync/review_queue.jsonl`.
+- Only post-commit events may create Linear progress comments.
 - Deduplicate post-commit updates by commit SHA and issue key.
-- Throttle session-progress comments to one per issue every 30 minutes.
 - Use the existing Linear MCP/app connection through Codex. Do not add a direct Linear API client.
 
 ## Useful Commands
@@ -79,7 +79,7 @@ This repository is a Codex plugin marketplace, not a single plugin source. Do no
 
 Setup installs a resident updater under `~/.codex/coreedge`. It checks at login and every 30 minutes through a macOS LaunchAgent or Linux systemd user timer, validates and stages the current `main.zip`, atomically switches the managed marketplace, selects one cache version per default plugin, and retains rollback copies outside Codex's cache scan. Linux VMs use user units under `$XDG_CONFIG_HOME/systemd/user` when that variable is set and `~/.config/systemd/user` otherwise. Headless VMs need `loginctl enable-linger <user>` if the timers must continue after logout. SessionStart and PreToolUse self-heal a missing service. Persistently disable or re-enable network checks with:
 
-Existing macOS installations activate `0.3.2` during an ordinary resident check. Linux installations from before `0.3.2` had no resident scheduler and require the repository setup flow once; after that, routine updates are automatic. Presence does not depend on an already-running Codex process reloading hooks. Do not ask teammates to run an update command, deliberately restart Codex, or create a renewal thread for normal updates. Fresh setup installs and schedules the current plugins immediately.
+Existing macOS installations activate `0.3.3` during one ordinary resident check. The release preserves historical-backfill protections, the metadata-only one-minute task-presence publisher, and commit-only Linear progress comments while adding Linux systemd user timers. Linux installations from before `0.3.3` had no resident scheduler and require the repository setup flow once; after that, routine updates are automatic. Presence does not depend on an already-running Codex process reloading hooks. Do not ask teammates to run an update command, deliberately restart Codex, or create a renewal thread for normal updates. Fresh setup installs and schedules the current plugins immediately.
 
 ```bash
 python3 ~/.codex/coreedge/runtime/current/update_plugin.py --disable-auto-update

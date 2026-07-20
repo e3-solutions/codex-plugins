@@ -1,32 +1,13 @@
 #!/usr/bin/env python3
-from __future__ import annotations
+"""Legacy Stop hook entrypoint.
 
-import json
-
-from linear_sync import (
-    enqueue_event,
-    first_issue_key,
-    linear_guard_disabled,
-    read_state,
-    read_stdin_json,
-    session_progress_payload,
-    should_throttle_session_progress,
-    spawn_drain,
-)
+Linear progress updates are commit-driven. Keep this file as a no-op so stale
+hook registrations from older plugin releases cannot publish edit-only updates.
+"""
 
 
 def main() -> None:
-    if linear_guard_disabled():
-        return
-    payload = session_progress_payload(read_stdin_json())
-    if payload is None:
-        return
-    branch_key = first_issue_key(str(payload.get("branch") or ""))
-    if branch_key and should_throttle_session_progress(read_state(), branch_key):
-        return
-    event = enqueue_event("session_progress", payload)
-    spawn_drain()
-    print(json.dumps({"queued": event["id"], "type": event["type"]}))
+    return
 
 
 if __name__ == "__main__":
