@@ -29,6 +29,7 @@ from typing import Any, Iterator
 
 import publish_presence
 import session_logging
+import transcript_sync
 
 JsonDict = dict[str, Any]
 
@@ -189,6 +190,22 @@ def import_transcript(path: Path, *, base: Path, dry_run: bool) -> JsonDict:
         )
         session_logging.enqueue_record(base, ended)
     queued += 2
+
+    # Replay prompt/response/tool bodies + token usage from the transcript too
+    # (FULL CODEX PARITY), reusing the live sync. Tagged historical_transcript so
+    # the ingest holds them until server-side historical ingestion is enabled —
+    # identical posture to the lifecycle events above. A dedicated backfill cursor
+    # keeps this from suppressing live capture of an still-active session.
+    if not dry_run:
+        replay = transcript_sync.sync_transcript_records(
+            str(target["session_id"]),
+            path,
+            base=base,
+            auto_drain=False,
+            source="historical_transcript",
+            cursor_scope="backfill",
+        )
+        queued += int(replay.get("queued", 0))
     return {"status": "complete", "queued": queued, "session_id": target["session_id"]}
 
 
