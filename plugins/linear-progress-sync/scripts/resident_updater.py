@@ -666,6 +666,112 @@ def write_if_changed(path: Path, content: bytes, *, mode: int | None = None) -> 
     return True
 
 
+def default_systemd_user_dir() -> Path:
+    config_home = os.environ.get("XDG_CONFIG_HOME")
+    root = Path(config_home).expanduser() if config_home else Path.home() / ".config"
+    return (root / "systemd" / "user").resolve()
+
+
+def systemd_quote(value: str | Path) -> str:
+    escaped = (
+        str(value)
+        .replace("\\", "\\\\")
+        .replace('"', '\\"')
+        .replace("\n", "\\n")
+        .replace("\r", "\\r")
+        .replace("\t", "\\t")
+        .replace("%", "%%")
+    )
+    return f'"{escaped}"'
+
+
+def systemd_service_payload(*, description: str, runner_path: Path) -> bytes:
+    return (
+        "[Unit]\n"
+        f"Description={description}\n"
+        "\n"
+        "[Service]\n"
+        "Type=oneshot\n"
+        f"ExecStart={systemd_quote(runner_path)}\n"
+    ).encode("utf-8")
+
+
+def systemd_timer_payload(*, label: str, description: str, interval_seconds: int) -> bytes:
+    return (
+        "[Unit]\n"
+        f"Description={description}\n"
+        "\n"
+        "[Timer]\n"
+        "OnActiveSec=1s\n"
+        f"OnUnitActiveSec={interval_seconds}s\n"
+        "AccuracySec=1s\n"
+        f"Unit={label}.service\n"
+        "\n"
+        "[Install]\n"
+        "WantedBy=timers.target\n"
+    ).encode("utf-8")
+
+
+def systemd_user_timer_active(*, label: str, runner: Callable[..., Any]) -> bool:
+    try:
+        probe = runner(
+            ["systemctl", "--user", "is-active", "--quiet", f"{label}.timer"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+        )
+    except (FileNotFoundError, OSError):
+        return False
+    return probe.returncode == 0
+
+
+def systemd_user_timer_enabled(*, label: str, runner: Callable[..., Any]) -> bool:
+    try:
+        probe = runner(
+            ["systemctl", "--user", "is-enabled", "--quiet", f"{label}.timer"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+        )
+    except (FileNotFoundError, OSError):
+        return False
+    return probe.returncode == 0
+
+
+def schedule_systemd_user_timer(
+    *,
+    label: str,
+    units_changed: bool,
+    runner: Callable[..., Any],
+) -> tuple[bool, str]:
+    commands = []
+    if units_changed:
+        commands.append(["systemctl", "--user", "daemon-reload"])
+    commands.extend(
+        [
+            ["systemctl", "--user", "enable", f"{label}.timer"],
+            ["systemctl", "--user", "restart", f"{label}.timer"],
+        ]
+    )
+    for command in commands:
+        try:
+            completed = runner(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+            )
+        except (FileNotFoundError, OSError) as exc:
+            return False, str(exc)
+        if completed.returncode != 0:
+            error = (completed.stderr or completed.stdout or "systemctl failed").strip()
+            return False, error
+    return True, ""
+
+
 def launch_agent_payload(*, runner_path: Path, resident_root: Path) -> bytes:
     logs = resident_root / "logs"
     payload = {
@@ -760,6 +866,7 @@ def ensure_presence_publisher(
     codex_home: str | Path,
     resident_root: str | Path,
     launch_agents_dir: str | Path | None = None,
+    systemd_user_dir: str | Path | None = None,
     platform: str | None = None,
     runner: Callable[..., Any] = subprocess.run,
 ) -> JsonDict:
@@ -773,6 +880,63 @@ def ensure_presence_publisher(
     )
     (resident / "logs").mkdir(parents=True, exist_ok=True)
     current_platform = platform or sys.platform
+    if current_platform.startswith("linux"):
+        units = Path(systemd_user_dir or default_systemd_user_dir()).expanduser().resolve()
+        service_path = units / f"{PRESENCE_SERVICE_LABEL}.service"
+        timer_path = units / f"{PRESENCE_SERVICE_LABEL}.timer"
+        service_changed = write_if_changed(
+            service_path,
+            systemd_service_payload(
+                description="Publish Core Edge Codex task presence",
+                runner_path=runner_path,
+            ),
+            mode=0o644,
+        )
+        timer_changed = write_if_changed(
+            timer_path,
+            systemd_timer_payload(
+                label=PRESENCE_SERVICE_LABEL,
+                description="Publish Core Edge Codex task presence every minute",
+                interval_seconds=PRESENCE_INTERVAL_SECONDS,
+            ),
+            mode=0o644,
+        )
+        units_changed = bool(service_changed or timer_changed)
+        service_stamp = resident / "presence-service-active"
+        if (
+            not units_changed
+            and service_stamp.exists()
+            and systemd_user_timer_active(label=PRESENCE_SERVICE_LABEL, runner=runner)
+            and systemd_user_timer_enabled(label=PRESENCE_SERVICE_LABEL, runner=runner)
+        ):
+            return {
+                "installed": True,
+                "scheduled": True,
+                "changed": runner_changed,
+                "runner": str(runner_path),
+                "systemd_service": str(service_path),
+                "systemd_timer": str(timer_path),
+            }
+        service_stamp.unlink(missing_ok=True)
+        scheduled, error = schedule_systemd_user_timer(
+            label=PRESENCE_SERVICE_LABEL,
+            units_changed=units_changed,
+            runner=runner,
+        )
+        if scheduled:
+            write_if_changed(service_stamp, b"active\n", mode=0o600)
+        result: JsonDict = {
+            "installed": True,
+            "scheduled": scheduled,
+            "changed": bool(runner_changed or units_changed),
+            "runner": str(runner_path),
+            "systemd_service": str(service_path),
+            "systemd_timer": str(timer_path),
+        }
+        if error:
+            result["error"] = error
+        return result
+
     if current_platform != "darwin":
         return {
             "installed": True,
@@ -877,6 +1041,7 @@ def ensure_resident_updater(
     codex_home: str | Path | None = None,
     resident_root: str | Path | None = None,
     launch_agents_dir: str | Path | None = None,
+    systemd_user_dir: str | Path | None = None,
     platform: str | None = None,
     runner: Callable[..., Any] = subprocess.run,
 ) -> JsonDict:
@@ -939,9 +1104,86 @@ def ensure_resident_updater(
         codex_home=codex,
         resident_root=resident,
         launch_agents_dir=launch_agents_dir,
+        systemd_user_dir=systemd_user_dir,
         platform=current_platform,
         runner=runner,
     )
+    if current_platform.startswith("linux"):
+        units = Path(systemd_user_dir or default_systemd_user_dir()).expanduser().resolve()
+        service_path = units / f"{SERVICE_LABEL}.service"
+        timer_path = units / f"{SERVICE_LABEL}.timer"
+        service_changed = write_if_changed(
+            service_path,
+            systemd_service_payload(
+                description="Update Core Edge Codex plugins",
+                runner_path=runner_path,
+            ),
+            mode=0o644,
+        )
+        timer_changed = write_if_changed(
+            timer_path,
+            systemd_timer_payload(
+                label=SERVICE_LABEL,
+                description="Update Core Edge Codex plugins every 30 minutes",
+                interval_seconds=UPDATE_INTERVAL_SECONDS,
+            ),
+            mode=0o644,
+        )
+        units_changed = bool(service_changed or timer_changed)
+        service_stamp = resident / "service-active"
+        if (
+            not units_changed
+            and service_stamp.exists()
+            and systemd_user_timer_active(label=SERVICE_LABEL, runner=runner)
+            and systemd_user_timer_enabled(label=SERVICE_LABEL, runner=runner)
+        ):
+            return {
+                "installed": True,
+                "scheduled": True,
+                "changed": bool(
+                    preference_changed
+                    or runtime["changed"]
+                    or repaired_caches
+                    or runner_changed
+                    or upload_preference_changed
+                    or presence["changed"]
+                ),
+                "runtime": str(runtime["path"]),
+                "systemd_service": str(service_path),
+                "systemd_timer": str(timer_path),
+                "repaired_caches": repaired_caches,
+                "presence": presence,
+            }
+        service_stamp.unlink(missing_ok=True)
+        scheduled, error = schedule_systemd_user_timer(
+            label=SERVICE_LABEL,
+            units_changed=units_changed,
+            runner=runner,
+        )
+        if scheduled:
+            write_if_changed(service_stamp, b"active\n", mode=0o600)
+        result: JsonDict = {
+            "installed": True,
+            "scheduled": scheduled,
+            "changed": bool(
+                preference_changed
+                or runtime["changed"]
+                or repaired_caches
+                or runner_changed
+                or units_changed
+                or upload_preference_changed
+                or presence["changed"]
+            ),
+            "runtime": str(runtime["path"]),
+            "systemd_service": str(service_path),
+            "systemd_timer": str(timer_path),
+            "repaired_caches": repaired_caches,
+            "presence": presence,
+        }
+        if error:
+            result["error"] = error
+        return result
+
     if current_platform != "darwin":
         return {
             "installed": True,
@@ -1041,6 +1283,7 @@ def activate_release(
     resident_root: str | Path | None = None,
     install_service: bool = True,
     launch_agents_dir: str | Path | None = None,
+    systemd_user_dir: str | Path | None = None,
     platform: str | None = None,
     runner: Callable[..., Any] = subprocess.run,
 ) -> JsonDict:
@@ -1105,6 +1348,7 @@ def activate_release(
                 codex_home=codex,
                 resident_root=resident,
                 launch_agents_dir=launch_agents_dir,
+                systemd_user_dir=systemd_user_dir,
                 platform=platform,
                 runner=runner,
             )
@@ -1163,11 +1407,69 @@ def activate_release(
     }
 
 
+def inspect_presence_health(
+    *,
+    codex: Path,
+    resident: Path,
+    service_paths: tuple[Path, ...],
+    result: JsonDict,
+    issues: list[str],
+) -> None:
+    state_path = codex / "coreedge" / "presence" / "state.json"
+    result["presence_state"] = str(state_path)
+    try:
+        presence_state = json.loads(state_path.read_text(encoding="utf-8"))
+        if not isinstance(presence_state, dict):
+            raise ValueError("state is not a JSON object")
+    except FileNotFoundError:
+        presence_state = None
+        stamp = resident / "presence-service-active"
+        installed_at = max(
+            path.stat().st_mtime
+            for path in (stamp, *service_paths)
+            if path.exists()
+        )
+        if datetime.now(timezone.utc).timestamp() - installed_at > PRESENCE_HEALTH_GRACE_SECONDS:
+            issues.append("resident session presence has not produced health state")
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        presence_state = None
+        issues.append(f"resident session presence state is invalid: {exc}")
+    if presence_state is not None:
+        result["presence_status"] = presence_state
+        last_result = presence_state.get("last_result")
+        last_checked = presence_state.get("last_checked_at")
+        if last_result != "disabled":
+            try:
+                checked_at = datetime.fromisoformat(str(last_checked))
+                if checked_at.tzinfo is None:
+                    checked_at = checked_at.replace(tzinfo=timezone.utc)
+                age = (datetime.now(timezone.utc) - checked_at.astimezone(timezone.utc)).total_seconds()
+                if age > PRESENCE_HEALTH_GRACE_SECONDS:
+                    issues.append("resident session presence health state is stale")
+            except (TypeError, ValueError):
+                issues.append("resident session presence health state has no valid check time")
+            if last_result in {"unavailable", "retrying"} or presence_state.get("last_error"):
+                issues.append(
+                    f"resident session presence is unhealthy: {presence_state.get('last_error') or last_result}"
+                )
+    dead_letter = codex / "session-logging" / "presence-queue" / "dead-letter"
+    pending = codex / "session-logging" / "presence-queue" / "pending"
+    pending_records = len(list(pending.glob("*.json"))) if pending.is_dir() else 0
+    dead_letters = len(list(dead_letter.glob("*.json"))) if dead_letter.is_dir() else 0
+    result["presence_pending"] = pending_records
+    result["presence_dead_letters"] = dead_letters
+    if pending_records and (presence_state or {}).get("last_result") != "disabled":
+        issues.append(f"resident session presence has {pending_records} pending record(s)")
+    if dead_letters:
+        issues.append(f"resident session presence has {dead_letters} dead-letter record(s)")
+
+
 def doctor(
     *,
     codex_home: str | Path | None = None,
     resident_root: str | Path | None = None,
     launch_agents_dir: str | Path | None = None,
+    systemd_user_dir: str | Path | None = None,
     platform: str | None = None,
     runner: Callable[..., Any] = subprocess.run,
 ) -> JsonDict:
@@ -1229,7 +1531,10 @@ def doctor(
         elif not plugin_tree_matches(Path(plugin["source"]), parent / str(plugin["version"])):
             issues.append(f"{plugin['name']} cache content is incomplete or corrupt")
     result["cache_versions"] = cache_versions
-    if (platform or sys.platform) == "darwin":
+    current_platform = platform or sys.platform
+    presence_service_active = False
+    presence_service_paths: tuple[Path, ...] = ()
+    if current_platform == "darwin":
         agents = Path(launch_agents_dir or Path.home() / "Library" / "LaunchAgents").expanduser().resolve()
         plist_path = agents / f"{SERVICE_LABEL}.plist"
         result["launch_agent"] = str(plist_path)
@@ -1252,6 +1557,7 @@ def doctor(
             if not loaded:
                 issues.append("resident updater LaunchAgent is installed but not loaded")
         presence_plist = agents / f"{PRESENCE_SERVICE_LABEL}.plist"
+        presence_service_paths = (presence_plist,)
         result["presence_launch_agent"] = str(presence_plist)
         if not presence_plist.is_file():
             issues.append("resident session presence LaunchAgent is not installed")
@@ -1271,54 +1577,66 @@ def doctor(
             result["presence_launch_agent_loaded"] = presence_loaded
             if not presence_loaded:
                 issues.append("resident session presence LaunchAgent is installed but not loaded")
-            else:
-                state_path = codex / "coreedge" / "presence" / "state.json"
-                result["presence_state"] = str(state_path)
-                try:
-                    presence_state = json.loads(state_path.read_text(encoding="utf-8"))
-                    if not isinstance(presence_state, dict):
-                        raise ValueError("state is not a JSON object")
-                except FileNotFoundError:
-                    presence_state = None
-                    stamp = resident / "presence-service-active"
-                    installed_at = max(
-                        path.stat().st_mtime
-                        for path in (stamp, presence_plist)
-                        if path.exists()
-                    )
-                    if datetime.now(timezone.utc).timestamp() - installed_at > PRESENCE_HEALTH_GRACE_SECONDS:
-                        issues.append("resident session presence has not produced health state")
-                except (OSError, ValueError, json.JSONDecodeError) as exc:
-                    presence_state = None
-                    issues.append(f"resident session presence state is invalid: {exc}")
-                if presence_state is not None:
-                    result["presence_status"] = presence_state
-                    last_result = presence_state.get("last_result")
-                    last_checked = presence_state.get("last_checked_at")
-                    if last_result != "disabled":
-                        try:
-                            checked_at = datetime.fromisoformat(str(last_checked))
-                            if checked_at.tzinfo is None:
-                                checked_at = checked_at.replace(tzinfo=timezone.utc)
-                            age = (datetime.now(timezone.utc) - checked_at.astimezone(timezone.utc)).total_seconds()
-                            if age > PRESENCE_HEALTH_GRACE_SECONDS:
-                                issues.append("resident session presence health state is stale")
-                        except (TypeError, ValueError):
-                            issues.append("resident session presence health state has no valid check time")
-                        if last_result in {"unavailable", "retrying"} or presence_state.get("last_error"):
-                            issues.append(
-                                f"resident session presence is unhealthy: {presence_state.get('last_error') or last_result}"
-                            )
-                dead_letter = codex / "session-logging" / "presence-queue" / "dead-letter"
-                pending = codex / "session-logging" / "presence-queue" / "pending"
-                pending_records = len(list(pending.glob("*.json"))) if pending.is_dir() else 0
-                dead_letters = len(list(dead_letter.glob("*.json"))) if dead_letter.is_dir() else 0
-                result["presence_pending"] = pending_records
-                result["presence_dead_letters"] = dead_letters
-                if pending_records and (presence_state or {}).get("last_result") != "disabled":
-                    issues.append(f"resident session presence has {pending_records} pending record(s)")
-                if dead_letters:
-                    issues.append(f"resident session presence has {dead_letters} dead-letter record(s)")
+            presence_service_active = presence_loaded
+    elif current_platform.startswith("linux"):
+        units = Path(systemd_user_dir or default_systemd_user_dir()).expanduser().resolve()
+        service_path = units / f"{SERVICE_LABEL}.service"
+        timer_path = units / f"{SERVICE_LABEL}.timer"
+        result["systemd_service"] = str(service_path)
+        result["systemd_timer"] = str(timer_path)
+        updater_units_installed = True
+        if not service_path.is_file():
+            updater_units_installed = False
+            issues.append("resident updater systemd user service is not installed")
+        if not timer_path.is_file():
+            updater_units_installed = False
+            issues.append("resident updater systemd user timer is not installed")
+        if updater_units_installed:
+            timer_enabled = systemd_user_timer_enabled(label=SERVICE_LABEL, runner=runner)
+            timer_active = systemd_user_timer_active(label=SERVICE_LABEL, runner=runner)
+            result["systemd_timer_enabled"] = timer_enabled
+            result["systemd_timer_active"] = timer_active
+            if not timer_enabled:
+                issues.append("resident updater systemd user timer is not enabled")
+            if not timer_active:
+                issues.append("resident updater systemd user timer is not active")
+
+        presence_service_path = units / f"{PRESENCE_SERVICE_LABEL}.service"
+        presence_timer_path = units / f"{PRESENCE_SERVICE_LABEL}.timer"
+        presence_service_paths = (presence_service_path, presence_timer_path)
+        result["presence_systemd_service"] = str(presence_service_path)
+        result["presence_systemd_timer"] = str(presence_timer_path)
+        presence_units_installed = True
+        if not presence_service_path.is_file():
+            presence_units_installed = False
+            issues.append("resident session presence systemd user service is not installed")
+        if not presence_timer_path.is_file():
+            presence_units_installed = False
+            issues.append("resident session presence systemd user timer is not installed")
+        if presence_units_installed:
+            presence_timer_enabled = systemd_user_timer_enabled(
+                label=PRESENCE_SERVICE_LABEL,
+                runner=runner,
+            )
+            presence_timer_active = systemd_user_timer_active(
+                label=PRESENCE_SERVICE_LABEL,
+                runner=runner,
+            )
+            result["presence_systemd_timer_enabled"] = presence_timer_enabled
+            result["presence_systemd_timer_active"] = presence_timer_active
+            if not presence_timer_enabled:
+                issues.append("resident session presence systemd user timer is not enabled")
+            if not presence_timer_active:
+                issues.append("resident session presence systemd user timer is not active")
+            presence_service_active = presence_timer_enabled and presence_timer_active
+    if presence_service_active:
+        inspect_presence_health(
+            codex=codex,
+            resident=resident,
+            service_paths=presence_service_paths,
+            result=result,
+            issues=issues,
+        )
     result["issues"] = issues
     result["healthy"] = not issues
     return result
