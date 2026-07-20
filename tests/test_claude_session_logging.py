@@ -657,6 +657,32 @@ def _write_claude_transcript(path: Path, repo: Path) -> None:
     path.write_text("\n".join(json.dumps(line) for line in lines) + "\n", encoding="utf-8")
 
 
+def _assistant_line(uuid: str, ts: str, repo: Path, *, text: str, usage: dict) -> dict:
+    return {
+        "type": "assistant",
+        "uuid": uuid,
+        "timestamp": ts,
+        "cwd": str(repo),
+        "message": {
+            "role": "assistant",
+            "model": "claude-opus-4-8",
+            "content": [{"type": "text", "text": text}],
+            "usage": usage,
+        },
+    }
+
+
+def _user_line(uuid: str, ts: str, repo: Path, text: str) -> dict:
+    return {
+        "type": "user",
+        "uuid": uuid,
+        "timestamp": ts,
+        "cwd": str(repo),
+        "gitBranch": "main",
+        "message": {"role": "user", "content": text},
+    }
+
+
 def _pending_records(session_logging, base: Path) -> list[dict]:
     return [session_logging.read_json_file(p) for p in session_logging.pending_queue_paths(base)]
 
@@ -741,6 +767,99 @@ def test_transcript_sync_is_idempotent(tmp_path, monkeypatch):
     assert second["queued"] == 0
     second_ids = {r["id"] for r in _pending_records(session_logging, base)}
     assert second_ids == first_ids
+
+
+def test_transcript_sync_usage_is_cumulative_session_total(tmp_path, monkeypatch):
+    monkeypatch.setenv("CLAUDE_SESSION_LOG_STATE_DIR", str(tmp_path / "state"))
+    session_logging = load_scripts_module("session_logging")
+    load_scripts_module("publish_presence")
+    transcript_sync = load_scripts_module("transcript_sync")
+
+    repo = init_git_repo(tmp_path / "repo", "https://github.com/e3-solutions/codex-plugins.git")
+    transcript = tmp_path / "projects" / "-slug" / "claude-multi.jsonl"
+    transcript.parent.mkdir(parents=True)
+    lines = [
+        _user_line("u1", "2026-07-16T00:00:00.000Z", repo, "First ask"),
+        _assistant_line(
+            "a1", "2026-07-16T00:00:05.000Z", repo, text="First answer",
+            usage={"input_tokens": 100, "output_tokens": 20, "cache_read_input_tokens": 30, "cache_creation_input_tokens": 10},
+        ),
+        _user_line("u2", "2026-07-16T00:00:10.000Z", repo, "Second ask"),
+        _assistant_line(
+            "a2", "2026-07-16T00:00:15.000Z", repo, text="Second answer",
+            usage={"input_tokens": 200, "output_tokens": 50, "cache_read_input_tokens": 60, "cache_creation_input_tokens": 5},
+        ),
+    ]
+    transcript.write_text("\n".join(json.dumps(line) for line in lines) + "\n", encoding="utf-8")
+
+    base = tmp_path / "state"
+    result = transcript_sync.sync_transcript_records("claude-multi", transcript)
+    # Two assistant turns with usage -> exactly ONE usage record.
+    assert result["usage"] == 1
+    usages = [r for r in _pending_records(session_logging, base) if r["type"] == "usage"]
+    assert len(usages) == 1
+
+    usage = session_logging.build_ingest_payload(usages[0], base=base)["usage"]
+    # Summed across both turns.
+    assert usage["output_tokens"] == 20 + 50
+    assert usage["input_tokens"] == 100 + 200
+    assert usage["cached_input_tokens"] == 30 + 60
+    assert usage["total_tokens"] == (100 + 200) + (20 + 50) + (10 + 5) + (30 + 60)
+    assert usages[0]["metadata"]["cache_creation_input_tokens"] == 10 + 5
+    assert usage["created_at"] == "2026-07-16T00:00:15.000Z"  # latest turn
+
+    # Re-running changes nothing: no new records, same row id, same totals.
+    usage_id = usages[0]["id"]
+    second = transcript_sync.sync_transcript_records("claude-multi", transcript)
+    assert second["queued"] == 0
+    usages_after = [r for r in _pending_records(session_logging, base) if r["type"] == "usage"]
+    assert len(usages_after) == 1
+    assert usages_after[0]["id"] == usage_id
+    assert session_logging.build_ingest_payload(usages_after[0], base=base)["usage"]["output_tokens"] == 70
+
+
+def test_transcript_sync_usage_accumulates_across_incremental_runs(tmp_path, monkeypatch):
+    monkeypatch.setenv("CLAUDE_SESSION_LOG_STATE_DIR", str(tmp_path / "state"))
+    session_logging = load_scripts_module("session_logging")
+    load_scripts_module("publish_presence")
+    transcript_sync = load_scripts_module("transcript_sync")
+
+    repo = init_git_repo(tmp_path / "repo", "https://github.com/e3-solutions/codex-plugins.git")
+    transcript = tmp_path / "projects" / "-slug" / "claude-live.jsonl"
+    transcript.parent.mkdir(parents=True)
+    base = tmp_path / "state"
+
+    # Turn 1 arrives; the Stop hook syncs.
+    turn1 = [
+        _user_line("u1", "2026-07-16T00:00:00.000Z", repo, "First ask"),
+        _assistant_line(
+            "a1", "2026-07-16T00:00:05.000Z", repo, text="First answer",
+            usage={"input_tokens": 100, "output_tokens": 20, "cache_read_input_tokens": 30, "cache_creation_input_tokens": 10},
+        ),
+    ]
+    transcript.write_text("\n".join(json.dumps(line) for line in turn1) + "\n", encoding="utf-8")
+    transcript_sync.sync_transcript_records("claude-live", transcript)
+    usage_after_1 = session_logging.build_ingest_payload(
+        next(r for r in _pending_records(session_logging, base) if r["type"] == "usage"), base=base
+    )["usage"]
+    assert usage_after_1["output_tokens"] == 20
+
+    # Turn 2 is appended; the next Stop hook syncs — usage must accumulate into
+    # the SAME row, not reset to just turn 2.
+    with transcript.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(_user_line("u2", "2026-07-16T00:00:10.000Z", repo, "Second ask")) + "\n")
+        handle.write(json.dumps(_assistant_line(
+            "a2", "2026-07-16T00:00:15.000Z", repo, text="Second answer",
+            usage={"input_tokens": 200, "output_tokens": 50, "cache_read_input_tokens": 60, "cache_creation_input_tokens": 5},
+        )) + "\n")
+    transcript_sync.sync_transcript_records("claude-live", transcript)
+
+    usages = [r for r in _pending_records(session_logging, base) if r["type"] == "usage"]
+    assert len(usages) == 1  # still one row (same deterministic id)
+    usage = session_logging.build_ingest_payload(usages[0], base=base)["usage"]
+    assert usage["output_tokens"] == 20 + 50
+    assert usage["input_tokens"] == 100 + 200
+    assert usage["total_tokens"] == 300 + 70 + 15 + 90
 
 
 def test_transcript_sync_skips_repos_outside_e3(tmp_path, monkeypatch):

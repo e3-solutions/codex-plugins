@@ -3,9 +3,10 @@
 
 Unlike the metadata-only presence/lifecycle path, this module reads the Claude
 Code transcript (``~/.claude/projects/<slug>/<sessionId>.jsonl``) — the source of
-truth for a session — and emits full-body ``message`` records and per-turn
-``usage`` records through the plugin's existing queue, mirroring
-``codex-session-logging``. This is the approved FULL CODEX PARITY behavior: the
+truth for a session — and emits full-body ``message`` records and a single
+cumulative-session-total ``usage`` record through the plugin's existing queue,
+mirroring ``codex-session-logging``. This is the approved FULL CODEX PARITY
+behavior: the
 prompt/response/tool bodies are stored so the shared ingest can populate
 ``codex_session_messages`` and ``codex_session_usage`` for Claude sessions, making
 the codestat ``token_usage_by_agent`` view agent-symmetric (COR-2786 / ATC).
@@ -71,10 +72,13 @@ def sync_transcript_records(
 ) -> JsonDict:
     """Emit message + usage records for transcript lines not yet processed.
 
-    Reads a per-session cursor (last processed line index), processes only newer
-    lines, emits one ``message`` record per user/assistant/tool turn and one
-    ``usage`` record per assistant turn carrying ``message.usage``, then persists
-    the cursor. Deterministic ids + cursor make re-runs a no-op.
+    Reads a per-session cursor (last processed line index + running token
+    totals), processes only newer lines, emits one ``message`` record per
+    user/assistant/tool turn, and — when this run added new assistant-turn
+    usage — emits exactly ONE ``usage`` record carrying the cumulative session
+    totals (deterministic id from the session id, so it upserts the same
+    codex_session_usage row every time). Then persists the cursor. Deterministic
+    ids + cursor make re-runs a no-op.
 
     ``source`` stamps ``metadata.source`` (live sync uses ``transcript_sync`` so
     the ingest writes the rows; the historical backfill passes
@@ -107,12 +111,17 @@ def sync_transcript_records(
 
         cursor = _read_cursor(base, cursor_key)
         last_index = int(cursor.get("index", -1)) if isinstance(cursor.get("index"), (int, float)) else -1
+        # Running cumulative token totals carried in the cursor so each sync adds
+        # only the newly-processed assistant turns and re-emits one session-total
+        # usage row (the ingest upserts codex_session_usage on session_id).
+        totals = _load_usage_totals(cursor.get("usage"))
 
         messages = 0
         usage_count = 0
         queued = 0
         highest_index = last_index
         last_uuid = cursor.get("uuid")
+        new_usage_turns = 0
 
         for index, envelope in _iter_transcript(path):
             highest_index = max(highest_index, index)
@@ -135,22 +144,32 @@ def sync_transcript_records(
                 messages += 1
                 queued += 1
 
-            usage_record = _usage_record(
-                envelope,
+            turn_usage = _extract_turn_usage(envelope)
+            if turn_usage is not None:
+                _accumulate_usage(totals, turn_usage)
+                new_usage_turns += 1
+
+        # Emit exactly ONE usage record carrying the running session totals when
+        # this run added new assistant-turn usage. Deterministic id from the
+        # session id alone -> it upserts the same row every time (idempotent).
+        if new_usage_turns:
+            usage_record = _cumulative_usage_record(
                 target=target,
                 base=base,
                 safe_session=safe_session,
-                seq=index,
-                line_uuid=line_uuid,
+                totals=totals,
                 source=source,
             )
-            if usage_record is not None:
-                session_logging.enqueue_record(base, usage_record)
-                usage_count += 1
-                queued += 1
+            session_logging.enqueue_record(base, usage_record)
+            usage_count += 1
+            queued += 1
 
-        if highest_index > last_index:
-            _write_cursor(base, cursor_key, {"index": highest_index, "uuid": last_uuid})
+        if highest_index > last_index or new_usage_turns:
+            _write_cursor(
+                base,
+                cursor_key,
+                {"index": highest_index, "uuid": last_uuid, "usage": totals},
+            )
 
     if queued and auto_drain:
         session_logging.try_auto_drain()
@@ -229,16 +248,9 @@ def _message_record(
     return record
 
 
-def _usage_record(
-    envelope: JsonDict,
-    *,
-    target: JsonDict,
-    base: Path,
-    safe_session: str,
-    seq: int,
-    line_uuid: str,
-    source: str = SYNC_SOURCE,
-) -> JsonDict | None:
+def _extract_turn_usage(envelope: JsonDict) -> JsonDict | None:
+    """Normalize a single assistant turn's ``message.usage`` into token ints
+    (or None if this line is not an assistant turn carrying usable usage)."""
     if _string(envelope.get("type")) != "assistant":
         return None
     message = envelope.get("message")
@@ -247,20 +259,65 @@ def _usage_record(
     usage = message.get("usage")
     if not isinstance(usage, dict):
         return None
-
     input_tokens = _non_negative_int(usage.get("input_tokens"))
     output_tokens = _non_negative_int(usage.get("output_tokens"))
     if input_tokens is None or output_tokens is None:
         return None
-    cache_read = _non_negative_int(usage.get("cache_read_input_tokens")) or 0
-    cache_creation = _non_negative_int(usage.get("cache_creation_input_tokens")) or 0
-    total_tokens = input_tokens + output_tokens + cache_creation + cache_read
+    return {
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "cache_read": _non_negative_int(usage.get("cache_read_input_tokens")) or 0,
+        "cache_creation": _non_negative_int(usage.get("cache_creation_input_tokens")) or 0,
+        "created_at": _string(envelope.get("timestamp")) or session_logging.now_iso(),
+        "model": _string(message.get("model")),
+        "service_tier": _string(usage.get("service_tier")),
+    }
 
+
+def _load_usage_totals(stored: object) -> JsonDict:
+    prior = stored if isinstance(stored, dict) else {}
+    return {
+        "input_tokens": _non_negative_int(prior.get("input_tokens")) or 0,
+        "output_tokens": _non_negative_int(prior.get("output_tokens")) or 0,
+        "cache_read": _non_negative_int(prior.get("cache_read")) or 0,
+        "cache_creation": _non_negative_int(prior.get("cache_creation")) or 0,
+        "created_at": _string(prior.get("created_at")),
+        "model": _string(prior.get("model")),
+        "service_tier": _string(prior.get("service_tier")),
+    }
+
+
+def _accumulate_usage(totals: JsonDict, turn: JsonDict) -> None:
+    totals["input_tokens"] += turn["input_tokens"]
+    totals["output_tokens"] += turn["output_tokens"]
+    totals["cache_read"] += turn["cache_read"]
+    totals["cache_creation"] += turn["cache_creation"]
+    # observed_at + model/service_tier follow the latest turn seen.
+    totals["created_at"] = turn["created_at"]
+    if turn["model"]:
+        totals["model"] = turn["model"]
+    if turn["service_tier"]:
+        totals["service_tier"] = turn["service_tier"]
+
+
+def _cumulative_usage_record(
+    *,
+    target: JsonDict,
+    base: Path,
+    safe_session: str,
+    totals: JsonDict,
+    source: str = SYNC_SOURCE,
+) -> JsonDict:
     session_id = str(target["session_id"])
     transcript_path = str(target["transcript_path"])
-    created_at = _string(envelope.get("timestamp")) or session_logging.now_iso()
-    model = _string(message.get("model"))
-    service_tier = _string(usage.get("service_tier"))
+    input_tokens = int(totals["input_tokens"])
+    output_tokens = int(totals["output_tokens"])
+    cache_read = int(totals["cache_read"])
+    cache_creation = int(totals["cache_creation"])
+    total_tokens = input_tokens + output_tokens + cache_creation + cache_read
+    created_at = totals.get("created_at") or session_logging.now_iso()
+    model = totals.get("model")
+    service_tier = totals.get("service_tier")
 
     metadata = _base_metadata(target, source)
     if model:
@@ -269,9 +326,12 @@ def _usage_record(
         metadata["service_tier"] = service_tier
     metadata["cache_creation_input_tokens"] = cache_creation
 
-    record_id = _record_id(session_id, line_uuid, "usage")
+    # Session-only id so re-emits upsert the same codex_session_usage row.
+    record_id = session_logging.deterministic_uuid(
+        f"claude-transcript-v{SYNC_VERSION}:{session_id}:usage"
+    )
     thread_id = session_logging.sha256_hex(transcript_path)
-    storage_path = f"users/local/sessions/{safe_session}/usage/{seq:06d}.json"
+    storage_path = f"users/local/sessions/{safe_session}/usage.json"
 
     detail: JsonDict = {
         "id": record_id,
@@ -290,12 +350,12 @@ def _usage_record(
         detail["model_context_window"] = context_window
     session_logging.write_json_atomic(base / storage_path, detail)
 
-    record: JsonDict = {
+    return {
         "id": record_id,
         "type": "usage",
         "session_id": session_id,
         "thread_id": thread_id,
-        "seq": seq,
+        "seq": 0,
         "created_at": created_at,
         "metadata": metadata,
         "storage_bucket": session_logging.bucket_name(),
@@ -303,7 +363,6 @@ def _usage_record(
         "local_content_path": storage_path,
         "uploaded_at": None,
     }
-    return record
 
 
 # --- transcript parsing ----------------------------------------------------
