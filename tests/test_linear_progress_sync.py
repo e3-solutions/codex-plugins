@@ -4,11 +4,12 @@ import importlib.util
 import hashlib
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import sys
 import zipfile
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -3161,6 +3162,7 @@ def test_resident_runtime_and_systemd_user_units_are_idempotent(tmp_path):
         version="0.3.0",
     )
     systemd_user_dir = tmp_path / "systemd" / "user"
+    resident_root = tmp_path / "resident $home %dir"
     calls = []
 
     class Completed:
@@ -3175,7 +3177,7 @@ def test_resident_runtime_and_systemd_user_units_are_idempotent(tmp_path):
     first = resident.ensure_resident_updater(
         plugin_root,
         codex_home=tmp_path / "codex home",
-        resident_root=tmp_path / "resident home",
+        resident_root=resident_root,
         systemd_user_dir=systemd_user_dir,
         platform="linux",
         runner=runner,
@@ -3183,7 +3185,7 @@ def test_resident_runtime_and_systemd_user_units_are_idempotent(tmp_path):
     second = resident.ensure_resident_updater(
         plugin_root,
         codex_home=tmp_path / "codex home",
-        resident_root=tmp_path / "resident home",
+        resident_root=resident_root,
         systemd_user_dir=systemd_user_dir,
         platform="linux",
         runner=runner,
@@ -3193,11 +3195,13 @@ def test_resident_runtime_and_systemd_user_units_are_idempotent(tmp_path):
     updater_timer = systemd_user_dir / "com.coreedge.codex-plugins-updater.timer"
     presence_service = systemd_user_dir / "com.coreedge.codex-session-presence.service"
     presence_timer = systemd_user_dir / "com.coreedge.codex-session-presence.timer"
-    assert 'ExecStart="' in updater_service.read_text(encoding="utf-8")
-    assert "resident home/run.sh" in updater_service.read_text(encoding="utf-8")
+    updater_service_text = updater_service.read_text(encoding="utf-8")
+    presence_service_text = presence_service.read_text(encoding="utf-8")
+    escaped_resident_root = str(resident_root.resolve()).replace("$", "$$").replace("%", "%%")
+    assert f'ExecStart="{escaped_resident_root}/run.sh"' in updater_service_text
     assert "OnUnitActiveSec=1800s" in updater_timer.read_text(encoding="utf-8")
     assert "WantedBy=timers.target" in updater_timer.read_text(encoding="utf-8")
-    assert "resident home/presence.sh" in presence_service.read_text(encoding="utf-8")
+    assert f'ExecStart="{escaped_resident_root}/presence.sh"' in presence_service_text
     assert "OnUnitActiveSec=60s" in presence_timer.read_text(encoding="utf-8")
     assert first["scheduled"] is True
     assert first["presence"]["scheduled"] is True
@@ -3205,34 +3209,232 @@ def test_resident_runtime_and_systemd_user_units_are_idempotent(tmp_path):
     assert second["scheduled"] is True
     assert second["presence"]["scheduled"] is True
     assert second["changed"] is False
-    assert len(calls) == 10
-    assert calls[0][0] == ["systemctl", "--user", "daemon-reload"]
-    assert calls[1][0] == [
-        "systemctl",
-        "--user",
-        "enable",
-        "com.coreedge.codex-session-presence.timer",
+    assert [call[0] for call in calls] == [
+        ["systemctl", "--user", "daemon-reload"],
+        ["systemctl", "--user", "enable", "com.coreedge.codex-session-presence.timer"],
+        ["systemctl", "--user", "restart", "com.coreedge.codex-session-presence.timer"],
+        ["systemctl", "--user", "daemon-reload"],
+        ["systemctl", "--user", "enable", "com.coreedge.codex-plugins-updater.timer"],
+        ["systemctl", "--user", "restart", "com.coreedge.codex-plugins-updater.timer"],
     ]
-    assert calls[2][0] == [
-        "systemctl",
-        "--user",
-        "restart",
-        "com.coreedge.codex-session-presence.timer",
+
+
+def test_force_service_repair_restarts_active_systemd_timers(tmp_path):
+    resident = load_resident_updater()
+    plugin_root = write_minimal_plugin(
+        tmp_path / "plugins",
+        name="linear-progress-sync",
+        version="0.3.0",
+    )
+    systemd_user_dir = tmp_path / "systemd" / "user"
+    calls = []
+
+    class Completed:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    def runner(args, **_kwargs):
+        calls.append(args)
+        return Completed()
+
+    resident.ensure_resident_updater(
+        plugin_root,
+        codex_home=tmp_path / "codex",
+        resident_root=tmp_path / "resident",
+        systemd_user_dir=systemd_user_dir,
+        platform="linux",
+        runner=runner,
+    )
+    calls.clear()
+
+    forced = resident.ensure_resident_updater(
+        plugin_root,
+        codex_home=tmp_path / "codex",
+        resident_root=tmp_path / "resident",
+        systemd_user_dir=systemd_user_dir,
+        force_service_repair=True,
+        platform="linux",
+        runner=runner,
+    )
+
+    assert forced["scheduled"] is True
+    assert forced["presence"]["scheduled"] is True
+    assert calls == [
+        ["systemctl", "--user", "enable", "com.coreedge.codex-session-presence.timer"],
+        ["systemctl", "--user", "restart", "com.coreedge.codex-session-presence.timer"],
+        ["systemctl", "--user", "enable", "com.coreedge.codex-plugins-updater.timer"],
+        ["systemctl", "--user", "restart", "com.coreedge.codex-plugins-updater.timer"],
     ]
-    assert calls[3][0] == ["systemctl", "--user", "daemon-reload"]
-    assert calls[6][0] == [
-        "systemctl",
-        "--user",
-        "is-active",
-        "--quiet",
-        "com.coreedge.codex-session-presence.timer",
+
+
+def test_default_systemd_user_dir_ignores_relative_xdg_config_home(tmp_path, monkeypatch):
+    resident = load_resident_updater()
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("XDG_CONFIG_HOME", "relative-config")
+
+    assert resident.default_systemd_user_dir() == (
+        Path.home() / ".config" / "systemd" / "user"
+    ).resolve()
+    assert resident.default_systemd_user_dir() != (
+        tmp_path / "relative-config" / "systemd" / "user"
+    ).resolve()
+
+    monkeypatch.setenv("XDG_CONFIG_HOME", "~/relative-config")
+    assert resident.default_systemd_user_dir() == (
+        Path.home() / ".config" / "systemd" / "user"
+    ).resolve()
+
+    absolute_config = tmp_path / "absolute-config"
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(absolute_config))
+    assert resident.default_systemd_user_dir() == (absolute_config / "systemd" / "user").resolve()
+
+
+def test_systemd_retry_state_rejects_corruption_and_unbounded_clock_skew(tmp_path):
+    resident = load_resident_updater()
+    resident_root = tmp_path / "resident"
+    resident_root.mkdir()
+    label = resident.SERVICE_LABEL
+    path = resident.systemd_retry_state_path(resident_root=resident_root, label=label)
+    now = datetime(2026, 7, 20, 12, 0, tzinfo=timezone.utc)
+
+    valid = resident.record_systemd_retry_failure(
+        resident_root=resident_root,
+        label=label,
+        error="user bus unavailable",
+        now=now,
+    )
+    assert resident.read_systemd_retry_state(
+        resident_root=resident_root,
+        label=label,
+        now=now + timedelta(seconds=1),
+    ) == valid
+    assert resident.read_systemd_retry_state(
+        resident_root=resident_root,
+        label=label,
+        now=now - timedelta(seconds=resident.SYSTEMD_CLOCK_SKEW_TOLERANCE_SECONDS + 1),
+    ) is None
+
+    path.write_text("{not json\n", encoding="utf-8")
+    assert resident.read_systemd_retry_state(
+        resident_root=resident_root,
+        label=label,
+        now=now,
+    ) is None
+
+    invalid_payloads = [
+        {
+            "label": label,
+            "error": "missing failed time",
+            "retry_after": (now + timedelta(minutes=5)).isoformat(),
+        },
+        {
+            "label": label,
+            "error": "naive timestamps",
+            "failed_at": now.replace(tzinfo=None).isoformat(),
+            "retry_after": (now + timedelta(minutes=5)).replace(tzinfo=None).isoformat(),
+        },
+        {
+            "label": label,
+            "error": "backwards interval",
+            "failed_at": now.isoformat(),
+            "retry_after": now.isoformat(),
+        },
+        {
+            "label": label,
+            "error": "unbounded interval",
+            "failed_at": now.isoformat(),
+            "retry_after": (
+                now + timedelta(seconds=resident.SYSTEMD_RETRY_BACKOFF_SECONDS + 1)
+            ).isoformat(),
+        },
+        {
+            "label": label,
+            "error": "future failure",
+            "failed_at": (
+                now + timedelta(seconds=resident.SYSTEMD_CLOCK_SKEW_TOLERANCE_SECONDS + 1)
+            ).isoformat(),
+            "retry_after": (
+                now
+                + timedelta(
+                    seconds=(
+                        resident.SYSTEMD_CLOCK_SKEW_TOLERANCE_SECONDS
+                        + resident.SYSTEMD_RETRY_BACKOFF_SECONDS
+                        + 1
+                    )
+                )
+            ).isoformat(),
+        },
     ]
-    assert calls[9][0] == [
-        "systemctl",
-        "--user",
-        "is-enabled",
-        "--quiet",
-        "com.coreedge.codex-plugins-updater.timer",
+    for payload in invalid_payloads:
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        assert resident.read_systemd_retry_state(
+            resident_root=resident_root,
+            label=label,
+            now=now,
+        ) is None
+
+
+def test_systemd_future_retry_state_does_not_suppress_repair(tmp_path):
+    resident = load_resident_updater()
+    plugin_root = write_minimal_plugin(
+        tmp_path / "plugins",
+        name="linear-progress-sync",
+        version="0.3.0",
+    )
+    resident_root = tmp_path / "resident"
+    systemd_user_dir = tmp_path / "systemd" / "user"
+    calls = []
+
+    def missing_systemctl(args, **_kwargs):
+        calls.append(args)
+        raise FileNotFoundError("systemctl not found")
+
+    first = resident.ensure_resident_updater(
+        plugin_root,
+        codex_home=tmp_path / "codex",
+        resident_root=resident_root,
+        systemd_user_dir=systemd_user_dir,
+        platform="linux",
+        runner=missing_systemctl,
+    )
+    future_failed_at = datetime.now(timezone.utc) + timedelta(
+        seconds=resident.SYSTEMD_CLOCK_SKEW_TOLERANCE_SECONDS + 60
+    )
+    for result, label in (
+        (first, resident.SERVICE_LABEL),
+        (first["presence"], resident.PRESENCE_SERVICE_LABEL),
+    ):
+        Path(result["retry_state"]).write_text(
+            json.dumps(
+                {
+                    "label": label,
+                    "error": "future state",
+                    "failed_at": future_failed_at.isoformat(),
+                    "retry_after": (
+                        future_failed_at
+                        + timedelta(seconds=resident.SYSTEMD_RETRY_BACKOFF_SECONDS)
+                    ).isoformat(),
+                }
+            ),
+            encoding="utf-8",
+        )
+    calls.clear()
+
+    retried = resident.ensure_resident_updater(
+        plugin_root,
+        codex_home=tmp_path / "codex",
+        resident_root=resident_root,
+        systemd_user_dir=systemd_user_dir,
+        platform="linux",
+        runner=missing_systemctl,
+    )
+
+    assert retried.get("retry_deferred") is not True
+    assert retried["presence"].get("retry_deferred") is not True
+    assert calls == [
+        ["systemctl", "--user", "enable", "com.coreedge.codex-session-presence.timer"],
+        ["systemctl", "--user", "enable", "com.coreedge.codex-plugins-updater.timer"],
     ]
 
 
@@ -3261,6 +3463,14 @@ def test_resident_systemd_user_timer_recovers_when_unit_is_inactive(tmp_path):
         platform="linux",
         runner=lambda *_args, **_kwargs: Completed(0),
     )
+    for label in (resident.PRESENCE_SERVICE_LABEL, resident.SERVICE_LABEL):
+        os.utime(
+            resident.systemd_health_probe_path(
+                resident_root=tmp_path / "resident",
+                label=label,
+            ),
+            (0, 0),
+        )
 
     def runner(args, **_kwargs):
         calls.append(args)
@@ -3294,6 +3504,88 @@ def test_resident_systemd_user_timer_recovers_when_unit_is_inactive(tmp_path):
     ]
 
 
+def test_resident_systemd_user_timer_recovers_when_service_is_failed(tmp_path):
+    resident = load_resident_updater()
+    plugin_root = write_minimal_plugin(
+        tmp_path / "plugins",
+        name="linear-progress-sync",
+        version="0.3.0",
+    )
+    systemd_user_dir = tmp_path / "systemd" / "user"
+    resident_root = tmp_path / "resident"
+    calls = []
+
+    class Completed:
+        stdout = ""
+        stderr = ""
+
+        def __init__(self, returncode):
+            self.returncode = returncode
+
+    resident.ensure_resident_updater(
+        plugin_root,
+        codex_home=tmp_path / "codex",
+        resident_root=resident_root,
+        systemd_user_dir=systemd_user_dir,
+        platform="linux",
+        runner=lambda *_args, **_kwargs: Completed(0),
+    )
+    for label in (resident.PRESENCE_SERVICE_LABEL, resident.SERVICE_LABEL):
+        os.utime(
+            resident.systemd_health_probe_path(
+                resident_root=resident_root,
+                label=label,
+            ),
+            (0, 0),
+        )
+
+    def runner(args, **_kwargs):
+        calls.append(args)
+        service_is_failed = (
+            args[2:4] == ["is-failed", "--quiet"]
+            and args[-1] == "com.coreedge.codex-plugins-updater.service"
+        )
+        probe_reports_not_matched = args[2:4] == ["is-failed", "--quiet"]
+        return Completed(0 if service_is_failed or not probe_reports_not_matched else 1)
+
+    result = resident.ensure_resident_updater(
+        plugin_root,
+        codex_home=tmp_path / "codex",
+        resident_root=resident_root,
+        systemd_user_dir=systemd_user_dir,
+        platform="linux",
+        runner=runner,
+    )
+
+    updater_calls = [call for call in calls if "codex-plugins-updater" in " ".join(call)]
+    assert result["scheduled"] is True
+    assert updater_calls == [
+        [
+            "systemctl",
+            "--user",
+            "is-active",
+            "--quiet",
+            "com.coreedge.codex-plugins-updater.timer",
+        ],
+        [
+            "systemctl",
+            "--user",
+            "is-enabled",
+            "--quiet",
+            "com.coreedge.codex-plugins-updater.timer",
+        ],
+        [
+            "systemctl",
+            "--user",
+            "is-failed",
+            "--quiet",
+            "com.coreedge.codex-plugins-updater.service",
+        ],
+        ["systemctl", "--user", "enable", "com.coreedge.codex-plugins-updater.timer"],
+        ["systemctl", "--user", "restart", "com.coreedge.codex-plugins-updater.timer"],
+    ]
+
+
 def test_linux_installer_keeps_hook_fallback_when_systemctl_is_unavailable(tmp_path):
     resident = load_resident_updater()
     plugin_root = write_minimal_plugin(
@@ -3302,11 +3594,13 @@ def test_linux_installer_keeps_hook_fallback_when_systemctl_is_unavailable(tmp_p
         version="0.3.0",
     )
     systemd_user_dir = tmp_path / "systemd" / "user"
+    calls = []
 
-    def missing_systemctl(_args, **_kwargs):
+    def missing_systemctl(args, **_kwargs):
+        calls.append(args)
         raise FileNotFoundError("systemctl not found")
 
-    result = resident.ensure_resident_updater(
+    first = resident.ensure_resident_updater(
         plugin_root,
         codex_home=tmp_path / "codex",
         resident_root=tmp_path / "resident",
@@ -3315,13 +3609,183 @@ def test_linux_installer_keeps_hook_fallback_when_systemctl_is_unavailable(tmp_p
         runner=missing_systemctl,
     )
 
-    assert result["installed"] is True
-    assert result["scheduled"] is False
-    assert result["error"] == "systemctl not found"
-    assert result["presence"]["scheduled"] is False
-    assert result["presence"]["error"] == "systemctl not found"
-    assert (systemd_user_dir / "com.coreedge.codex-plugins-updater.timer").is_file()
-    assert (systemd_user_dir / "com.coreedge.codex-session-presence.timer").is_file()
+    updater_timer = systemd_user_dir / "com.coreedge.codex-plugins-updater.timer"
+    presence_timer = systemd_user_dir / "com.coreedge.codex-session-presence.timer"
+    assert first["installed"] is True
+    assert first["scheduled"] is False
+    assert first["error"] == "systemctl not found"
+    assert first["retry_after"]
+    assert first["presence"]["scheduled"] is False
+    assert first["presence"]["error"] == "systemctl not found"
+    assert first["presence"]["retry_after"]
+    assert updater_timer.is_file()
+    assert presence_timer.is_file()
+    assert len(calls) == 2
+
+    deferred = resident.ensure_resident_updater(
+        plugin_root,
+        codex_home=tmp_path / "codex",
+        resident_root=tmp_path / "resident",
+        systemd_user_dir=systemd_user_dir,
+        platform="linux",
+        runner=missing_systemctl,
+    )
+
+    assert len(calls) == 2
+    assert deferred["retry_deferred"] is True
+    assert deferred["retry_after"] == first["retry_after"]
+    assert deferred["presence"]["retry_deferred"] is True
+    assert deferred["presence"]["retry_after"] == first["presence"]["retry_after"]
+
+    updater_timer.write_text("changed on disk\n", encoding="utf-8")
+    changed = resident.ensure_resident_updater(
+        plugin_root,
+        codex_home=tmp_path / "codex",
+        resident_root=tmp_path / "resident",
+        systemd_user_dir=systemd_user_dir,
+        platform="linux",
+        runner=missing_systemctl,
+    )
+
+    assert len(calls) == 3
+    assert changed.get("retry_deferred") is not True
+    assert changed["presence"]["retry_deferred"] is True
+    assert calls[-1] == ["systemctl", "--user", "daemon-reload"]
+
+    forced = resident.ensure_resident_updater(
+        plugin_root,
+        codex_home=tmp_path / "codex",
+        resident_root=tmp_path / "resident",
+        systemd_user_dir=systemd_user_dir,
+        force_service_repair=True,
+        platform="linux",
+        runner=missing_systemctl,
+    )
+
+    assert len(calls) == 5
+    assert forced.get("retry_deferred") is not True
+    assert forced["presence"].get("retry_deferred") is not True
+    assert calls[-2:] == [
+        ["systemctl", "--user", "enable", "com.coreedge.codex-session-presence.timer"],
+        ["systemctl", "--user", "enable", "com.coreedge.codex-plugins-updater.timer"],
+    ]
+
+    class Completed:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    repaired = resident.ensure_resident_updater(
+        plugin_root,
+        codex_home=tmp_path / "codex",
+        resident_root=tmp_path / "resident",
+        systemd_user_dir=systemd_user_dir,
+        force_service_repair=True,
+        platform="linux",
+        runner=lambda *_args, **_kwargs: Completed(),
+    )
+
+    assert repaired["scheduled"] is True
+    assert repaired["presence"]["scheduled"] is True
+    assert not Path(first["retry_state"]).exists()
+    assert not Path(first["presence"]["retry_state"]).exists()
+
+
+def test_resident_runners_capture_nonstandard_python_and_fail_if_it_disappears(
+    tmp_path,
+    monkeypatch,
+):
+    resident = load_resident_updater()
+    actual_python = Path(sys.executable).resolve()
+    custom_python = tmp_path / "custom interpreters" / "python $resident"
+    custom_python.parent.mkdir(parents=True)
+    custom_python.write_text(
+        f"#!/bin/sh\nexec {shlex.quote(str(actual_python))} \"$@\"\n",
+        encoding="utf-8",
+    )
+    custom_python.chmod(0o755)
+    monkeypatch.setattr(resident.sys, "executable", str(custom_python))
+
+    plugin_root = write_minimal_plugin(
+        tmp_path / "plugins",
+        name="linear-progress-sync",
+        version="0.3.0",
+    )
+    update_capture = tmp_path / "update-ran"
+    (plugin_root / "scripts" / "update_plugin.py").write_text(
+        "import os\nfrom pathlib import Path\n"
+        "Path(os.environ['UPDATE_CAPTURE']).write_text('updated')\n",
+        encoding="utf-8",
+    )
+    codex_home = tmp_path / "codex"
+    resident_root = tmp_path / "resident"
+    resident.ensure_resident_updater(
+        plugin_root,
+        codex_home=codex_home,
+        resident_root=resident_root,
+        platform="unsupported",
+    )
+    presence_capture = tmp_path / "presence-ran"
+    cached_presence = (
+        codex_home
+        / "plugins"
+        / "cache"
+        / "coreedge-local"
+        / "codex-session-logging"
+        / "0.2.3"
+    )
+    manifest = cached_presence / ".codex-plugin" / "plugin.json"
+    manifest.parent.mkdir(parents=True)
+    manifest.write_text(
+        json.dumps({"name": "codex-session-logging", "version": "0.2.3"}),
+        encoding="utf-8",
+    )
+    presence_script = cached_presence / "scripts" / "publish_presence.py"
+    presence_script.parent.mkdir(parents=True)
+    presence_script.write_text(
+        "import os\nfrom pathlib import Path\n"
+        "Path(os.environ['PRESENCE_CAPTURE']).write_text('published')\n",
+        encoding="utf-8",
+    )
+
+    update_run = subprocess.run(
+        [str(resident_root / "run.sh")],
+        env={**os.environ, "UPDATE_CAPTURE": str(update_capture)},
+        check=False,
+    )
+    presence_run = subprocess.run(
+        [str(resident_root / "presence.sh")],
+        env={**os.environ, "PRESENCE_CAPTURE": str(presence_capture)},
+        check=False,
+    )
+
+    assert update_run.returncode == 0
+    assert presence_run.returncode == 0
+    assert update_capture.read_text(encoding="utf-8") == "updated"
+    assert presence_capture.read_text(encoding="utf-8") == "published"
+    assert str(custom_python.resolve()) in (resident_root / "run.sh").read_text(encoding="utf-8")
+    assert str(custom_python.resolve()) in (resident_root / "presence.sh").read_text(encoding="utf-8")
+
+    custom_python.unlink()
+    failed_update = subprocess.run(
+        [str(resident_root / "run.sh")],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    failed_presence = subprocess.run(
+        [str(resident_root / "presence.sh")],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+
+    assert failed_update.returncode == 127
+    assert "resident updater Python interpreter is unavailable" in failed_update.stderr
+    assert failed_presence.returncode == 127
+    assert "presence publisher Python interpreter is unavailable" in failed_presence.stderr
 
 
 def test_resident_runner_bootstraps_from_cached_plugin_before_managed_marketplace_exists(tmp_path):
@@ -3791,7 +4255,7 @@ def test_resident_installer_degrades_safely_on_unsupported_platform(tmp_path):
     assert result["reason"] == "unsupported_platform"
 
 
-def test_linux_systemd_user_services_pass_doctor_and_report_inactive_timers(tmp_path):
+def test_linux_systemd_user_services_report_inactive_timers_and_failed_services(tmp_path):
     resident = load_resident_updater()
     codex_home = tmp_path / "codex"
     resident_root = tmp_path / "resident"
@@ -3812,16 +4276,19 @@ def test_linux_systemd_user_services_pass_doctor_and_report_inactive_timers(tmp_
         platform="linux",
         runner=lambda *_args, **_kwargs: Completed(0),
     )
+    def healthy_runner(args, **_kwargs):
+        return Completed(1 if args[2] == "is-failed" else 0)
+
     healthy = resident.doctor(
         codex_home=codex_home,
         resident_root=resident_root,
         systemd_user_dir=systemd_user_dir,
         platform="linux",
-        runner=lambda *_args, **_kwargs: Completed(0),
+        runner=healthy_runner,
     )
 
     def inactive_runner(args, **_kwargs):
-        return Completed(1 if args[2] == "is-active" else 0)
+        return Completed(1 if args[2] in {"is-active", "is-failed"} else 0)
 
     inactive = resident.doctor(
         codex_home=codex_home,
@@ -3831,14 +4298,89 @@ def test_linux_systemd_user_services_pass_doctor_and_report_inactive_timers(tmp_
         runner=inactive_runner,
     )
 
+    def failed_service_runner(args, **_kwargs):
+        return Completed(0)
+
+    failed_services = resident.doctor(
+        codex_home=codex_home,
+        resident_root=resident_root,
+        systemd_user_dir=systemd_user_dir,
+        platform="linux",
+        runner=failed_service_runner,
+    )
+
     assert healthy["healthy"] is True
     assert healthy["systemd_timer_enabled"] is True
     assert healthy["systemd_timer_active"] is True
     assert healthy["presence_systemd_timer_enabled"] is True
     assert healthy["presence_systemd_timer_active"] is True
+    assert healthy["systemd_service_failed"] is False
+    assert healthy["presence_systemd_service_failed"] is False
     assert inactive["healthy"] is False
     assert "resident updater systemd user timer is not active" in inactive["issues"]
     assert "resident session presence systemd user timer is not active" in inactive["issues"]
+    assert failed_services["healthy"] is False
+    assert "resident updater systemd user service is failed" in failed_services["issues"]
+    assert "resident session presence systemd user service is failed" in failed_services["issues"]
+
+
+def test_systemd_probe_freshness_does_not_mask_missing_presence_state(tmp_path):
+    resident = load_resident_updater()
+    codex_home = tmp_path / "codex"
+    resident_root = tmp_path / "resident"
+    systemd_user_dir = tmp_path / "systemd" / "user"
+
+    class Completed:
+        stdout = ""
+        stderr = ""
+
+        def __init__(self, returncode):
+            self.returncode = returncode
+
+    def healthy_runner(args, **_kwargs):
+        return Completed(1 if args[2] == "is-failed" else 0)
+
+    resident.activate_release(
+        ROOT,
+        codex_home=codex_home,
+        resident_root=resident_root,
+        systemd_user_dir=systemd_user_dir,
+        platform="linux",
+        runner=healthy_runner,
+    )
+    active_stamp = resident_root / "presence-service-active"
+    probe_stamp = resident.systemd_health_probe_path(
+        resident_root=resident_root,
+        label=resident.PRESENCE_SERVICE_LABEL,
+    )
+    presence_service = systemd_user_dir / f"{resident.PRESENCE_SERVICE_LABEL}.service"
+    presence_timer = systemd_user_dir / f"{resident.PRESENCE_SERVICE_LABEL}.timer"
+    old_timestamp = (
+        datetime.now(timezone.utc)
+        - timedelta(seconds=resident.PRESENCE_HEALTH_GRACE_SECONDS + 60)
+    ).timestamp()
+    for path in (active_stamp, probe_stamp, presence_service, presence_timer):
+        os.utime(path, (old_timestamp, old_timestamp))
+
+    resident.ensure_resident_updater(
+        resident_root / "marketplace/current/plugins/linear-progress-sync",
+        codex_home=codex_home,
+        resident_root=resident_root,
+        systemd_user_dir=systemd_user_dir,
+        platform="linux",
+        runner=healthy_runner,
+    )
+    health = resident.doctor(
+        codex_home=codex_home,
+        resident_root=resident_root,
+        systemd_user_dir=systemd_user_dir,
+        platform="linux",
+        runner=healthy_runner,
+    )
+
+    assert active_stamp.stat().st_mtime == old_timestamp
+    assert probe_stamp.stat().st_mtime > old_timestamp
+    assert "resident session presence has not produced health state" in health["issues"]
 
 
 def test_resident_doctor_reports_activation_drift(tmp_path):
@@ -4155,6 +4697,8 @@ def test_readmes_register_linear_mcp_before_linear_login():
         assert "renewal thread" in text
         assert "every 30 minutes" in text
         assert "historical-backfill protections" in text
+        assert "self-heal without rerunning setup" in text
+        assert "a later new task loads that release and installs and enables the timers" in text
         assert "LINEAR_SYNC_AUTO_UPDATE=0" in text
         assert "not a single plugin source" in text
         assert "Do not install the GitHub URL or repository root directly with `codex plugin add`" in text
@@ -4310,6 +4854,8 @@ def test_plugin_exposes_linear_start_command_and_pre_tool_guard_hook():
     assert "update_plugin.py --force" in skill_text
     assert "update_plugin.py --doctor" in skill_text
     assert "renewal thread" in skill_text
+    assert "self-heal without rerunning setup" in skill_text
+    assert "a later new task loads that release and installs and enables the timers" in skill_text
     assert "LINEAR_SYNC_AUTO_UPDATE=0" in skill_text
     assert "configure-user" in skill_text
     assert "Do not create the Linear issue, branch, PR, or code changes until the chosen repo destination is saved" in skill_text

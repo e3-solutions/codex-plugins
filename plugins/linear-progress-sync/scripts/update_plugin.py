@@ -779,6 +779,7 @@ def repair_resident_services(
         resident_root=runtime_path.parents[2],
         launch_agents_dir=launch_agents_dir,
         systemd_user_dir=systemd_user_dir,
+        force_service_repair=True,
         platform=platform,
         runner=runner,
     )
