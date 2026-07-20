@@ -8,7 +8,9 @@ import shlex
 import shutil
 import subprocess
 import sys
+import threading
 import zipfile
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -2156,7 +2158,7 @@ def test_legacy_upgrade_installs_presence_on_next_automatic_resident_cycle(tmp_p
     manifest.write_text(
         json.dumps(
             {
-                "version": "0.3.3",
+                "version": "0.3.4",
                 "archive_url": archive.as_uri(),
                 "sha256": hashlib.sha256(archive.read_bytes()).hexdigest(),
                 "plugin_subdir": "plugins/linear-progress-sync",
@@ -2212,8 +2214,8 @@ def test_legacy_upgrade_installs_presence_on_next_automatic_resident_cycle(tmp_p
     resident_root = codex_home / "coreedge"
 
     assert first_cycle.returncode == 0, first_cycle.stderr
-    assert json.loads(first_cycle.stdout)["resident"]["version"] == "0.3.3"
-    assert (resident_root / "runtime" / "current").resolve().name == "0.3.3"
+    assert json.loads(first_cycle.stdout)["resident"]["version"] == "0.3.4"
+    assert (resident_root / "runtime" / "current").resolve().name == "0.3.4"
     assert not (home / "Library" / "LaunchAgents" / "com.coreedge.codex-session-presence.plist").exists()
 
     second_cycle = subprocess.run(
@@ -3033,12 +3035,12 @@ def test_real_marketplace_activates_in_isolated_codex_home_and_passes_doctor(tmp
         platform="unsupported",
     )
 
-    assert activation["version"] == "0.3.3"
+    assert activation["version"] == "0.3.4"
     assert health["healthy"] is True
     assert health["issues"] == []
     assert health["cache_versions"] == {
         "codex-session-logging": ["0.2.3"],
-        "linear-progress-sync": ["0.3.3"],
+        "linear-progress-sync": ["0.3.4"],
     }
     assert subprocess.run(["sh", "-n", str(resident_root / "run.sh")], check=False).returncode == 0
 
@@ -3055,7 +3057,7 @@ def test_resident_hook_repairs_matching_cache_and_runtime_corruption_from_manage
         platform="unsupported",
     )
     managed = resident_root / "marketplace/current/plugins/linear-progress-sync"
-    cache = codex_home / "plugins/cache/coreedge-local/linear-progress-sync/0.3.3"
+    cache = codex_home / "plugins/cache/coreedge-local/linear-progress-sync/0.3.4"
     runtime = resident_root / "runtime/current"
     corrupt_content = (managed / "scripts/linear_sync.py").read_bytes()
     (cache / "scripts/update_plugin.py").write_bytes(corrupt_content)
@@ -4440,7 +4442,7 @@ def test_resident_doctor_reports_content_corruption_and_unloaded_service(tmp_pat
     broken_cache_script = (
         cache_root
         / "linear-progress-sync"
-        / "0.3.3"
+        / "0.3.4"
         / "scripts"
         / "update_plugin.py"
     )
@@ -4692,7 +4694,7 @@ def test_readmes_register_linear_mcp_before_linear_login():
         assert "saves it in `~/.codex/linear-sync/repos.json`" in text
         assert "update_plugin.py --force" in text
         assert "update_plugin.py --doctor" in text
-        assert "`0.3.3`" in text
+        assert "`0.3.4`" in text
         assert "one-minute task-presence publisher" in text
         assert "renewal thread" in text
         assert "every 30 minutes" in text
@@ -4787,6 +4789,147 @@ def test_worker_failure_does_not_lose_queued_event(tmp_path, monkeypatch):
     result = linear_sync.drain_once(root=repo, executor=failing_executor)
     assert result["failed"] == 1
     assert list((state_dir / "events").glob("*.json"))
+
+
+def test_concurrent_drains_execute_each_commit_once(tmp_path, monkeypatch):
+    state_dir = tmp_path / "state"
+    monkeypatch.setenv("LINEAR_SYNC_STATE_DIR", str(state_dir))
+    save_linear_user(tmp_path, monkeypatch)
+    repo = init_git_repo(tmp_path / "repo", branch="arya/cor-70-work")
+    linear_sync.enqueue_event(
+        "post_commit",
+        {
+            "id": "evt-first",
+            "branch": "arya/cor-70-work",
+            "commit_sha": "same-sha",
+            "commit_subject": "COR-70 useful work",
+        },
+        root=repo,
+    )
+    entered = threading.Event()
+    release = threading.Event()
+    calls = []
+
+    def blocking_executor(prompt, event, inference):
+        calls.append(event["id"])
+        entered.set()
+        assert release.wait(timeout=5)
+        return linear_sync.WorkerResult(True, "ok")
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(linear_sync.drain_once, root=repo, executor=blocking_executor)
+        assert entered.wait(timeout=5)
+        linear_sync.enqueue_event(
+            "post_commit",
+            {
+                "id": "evt-duplicate",
+                "branch": "arya/cor-70-work",
+                "commit_sha": "same-sha",
+                "commit_subject": "COR-70 useful work",
+            },
+            root=repo,
+        )
+        busy = pool.submit(linear_sync.drain_once, root=repo, executor=blocking_executor).result(timeout=5)
+        release.set()
+        completed = first.result(timeout=5)
+
+    assert busy["busy"] is True
+    assert completed["processed"] == 1
+    assert completed["skipped"] == 1
+    assert calls == ["evt-first"]
+    assert not list((state_dir / "events").glob("*.json"))
+
+
+def test_stale_drain_lock_is_reclaimed(tmp_path, monkeypatch):
+    state_dir = tmp_path / "state"
+    monkeypatch.setenv("LINEAR_SYNC_STATE_DIR", str(state_dir))
+    save_linear_user(tmp_path, monkeypatch)
+    repo = init_git_repo(tmp_path / "repo", branch="arya/cor-71-work")
+    linear_sync.ensure_state(repo)
+    (state_dir / linear_sync.DRAIN_LOCK_FILE).write_text("99999999", encoding="utf-8")
+    linear_sync.enqueue_event(
+        "post_commit",
+        {
+            "id": "evt-stale-lock",
+            "branch": "arya/cor-71-work",
+            "commit_sha": "stale-lock-sha",
+            "commit_subject": "COR-71 useful work",
+        },
+        root=repo,
+    )
+
+    result = linear_sync.drain_once(
+        root=repo,
+        executor=lambda *_: linear_sync.WorkerResult(True, "ok"),
+    )
+
+    assert result["processed"] == 1
+    assert not (state_dir / linear_sync.DRAIN_LOCK_FILE).exists()
+
+
+def test_live_terminal_result_retires_event_without_marking_commit_synced(tmp_path, monkeypatch):
+    state_dir = tmp_path / "state"
+    monkeypatch.setenv("LINEAR_SYNC_STATE_DIR", str(state_dir))
+    save_linear_user(tmp_path, monkeypatch)
+    repo = init_git_repo(tmp_path / "repo", branch="arya/cor-72-work")
+    linear_sync.enqueue_event(
+        "post_commit",
+        {
+            "id": "evt-live-terminal",
+            "branch": "arya/cor-72-work",
+            "commit_sha": "terminal-sha",
+            "commit_subject": "COR-72 useful work",
+        },
+        root=repo,
+    )
+
+    result = linear_sync.drain_once(
+        root=repo,
+        executor=lambda *_: linear_sync.WorkerResult(True, "terminal", terminal=True),
+    )
+    state = linear_sync.read_state(repo)
+
+    assert result["skipped"] == 1
+    assert "evt-live-terminal" in state["processed_event_ids"]
+    assert "terminal-sha" not in state["synced_commit_shas"]
+    assert not list((state_dir / "events").glob("*.json"))
+
+
+def test_worker_failures_are_quarantined_after_bounded_retries(tmp_path, monkeypatch):
+    state_dir = tmp_path / "state"
+    monkeypatch.setenv("LINEAR_SYNC_STATE_DIR", str(state_dir))
+    save_linear_user(tmp_path, monkeypatch)
+    repo = init_git_repo(tmp_path / "repo", branch="arya/cor-73-work")
+    linear_sync.enqueue_event(
+        "post_commit",
+        {
+            "id": "evt-quarantine",
+            "branch": "arya/cor-73-work",
+            "commit_sha": "quarantine-sha",
+            "commit_subject": "COR-73 useful work",
+        },
+        root=repo,
+    )
+    calls = []
+
+    def failing_executor(*_):
+        calls.append(True)
+        return linear_sync.WorkerResult(False, "temporary failure")
+
+    first = linear_sync.drain_once(root=repo, executor=failing_executor)
+    second = linear_sync.drain_once(root=repo, executor=failing_executor)
+    third = linear_sync.drain_once(root=repo, executor=failing_executor)
+    state = linear_sync.read_state(repo)
+
+    assert first["quarantined"] == 0
+    assert second["quarantined"] == 0
+    assert third["quarantined"] == 1
+    assert len(calls) == linear_sync.MAX_WORKER_FAILURES
+    assert "evt-quarantine" in state["processed_event_ids"]
+    assert state["failures"]["evt-quarantine"]["quarantined_at"]
+    assert not list((state_dir / "events").glob("*.json"))
+    review_entries = [json.loads(line) for line in (state_dir / "review_queue.jsonl").read_text().splitlines()]
+    assert "quarantined to stop automatic retries" in review_entries[-1]["reason"]
 
 
 def test_plugin_hooks_do_not_use_repo_relative_script_paths():
@@ -4902,7 +5045,45 @@ def test_codex_prompt_requires_success_sentinel(tmp_path, monkeypatch):
     inference = linear_sync.IssueInference("COR-9", 0.95, "branch")
     prompt = linear_sync.build_codex_prompt(event, inference)
     assert "LINEAR_SYNC_OK COR-9" in prompt
+    assert "LINEAR_SYNC_TERMINAL COR-9" in prompt
     assert "do not print LINEAR_SYNC_OK" in prompt
+
+
+def test_codex_worker_reports_confirmed_terminal_issue(monkeypatch):
+    class Completed:
+        returncode = 0
+        stdout = "Checked current Linear state.\nLINEAR_SYNC_TERMINAL COR-9\n"
+        stderr = ""
+
+    monkeypatch.setattr(linear_sync.shutil, "which", lambda _: "/usr/bin/codex")
+    monkeypatch.setattr(linear_sync.subprocess, "run", lambda *args, **kwargs: Completed())
+
+    result = linear_sync.run_codex_update(
+        "prompt",
+        {"repo": str(ROOT)},
+        linear_sync.IssueInference("COR-9", 1.0, "active issue"),
+    )
+
+    assert result.ok is True
+    assert result.terminal is True
+
+
+def test_codex_worker_timeout_is_counted_as_a_failure(monkeypatch):
+    def timeout(*args, **kwargs):
+        raise subprocess.TimeoutExpired(args[0] if args else "codex", linear_sync.WORKER_TIMEOUT_SECONDS)
+
+    monkeypatch.setattr(linear_sync.shutil, "which", lambda _: "/usr/bin/codex")
+    monkeypatch.setattr(linear_sync.subprocess, "run", timeout)
+
+    result = linear_sync.run_codex_update(
+        "prompt",
+        {"repo": str(ROOT)},
+        linear_sync.IssueInference("COR-9", 1.0, "active issue"),
+    )
+
+    assert result.ok is False
+    assert result.terminal is False
+    assert "timed out after 180 seconds" in result.message
 
 
 def test_codex_prompt_includes_linear_user_footer(tmp_path, monkeypatch):

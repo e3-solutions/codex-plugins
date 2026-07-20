@@ -35,6 +35,11 @@ STATE_DIR_ENV = "LINEAR_SYNC_STATE_DIR"
 CONFIG_DIR_ENV = "LINEAR_SYNC_CONFIG_DIR"
 DRY_RUN_ENV = "LINEAR_SYNC_DRY_RUN"
 CODEX_COMMAND_ENV = "LINEAR_SYNC_CODEX_COMMAND"
+DRAIN_LOCK_FILE = "drain.lock"
+DRAIN_LOCK_STALE_SECONDS = 5 * 60
+MAX_WORKER_FAILURES = 3
+TERMINAL_SYNC_SENTINEL = "LINEAR_SYNC_TERMINAL"
+WORKER_TIMEOUT_SECONDS = 180
 ALLOWED_GITHUB_ORG = "e3-solutions"
 LINEAR_MCP_URL = "https://mcp.linear.app/mcp"
 LINEAR_HOOK_EVENTS = ("SessionStart", "PreToolUse", "PostToolUse")
@@ -96,6 +101,7 @@ class IssueInference:
 class WorkerResult:
     ok: bool
     message: str
+    terminal: bool = False
 
 
 @dataclass(frozen=True)
@@ -1469,12 +1475,13 @@ def mark_processed(state: JsonDict, event_id: str | None) -> None:
     state["processed_event_ids"] = sorted(processed)
 
 
-def increment_failure(state: JsonDict, event_id: str, message: str) -> None:
+def increment_failure(state: JsonDict, event_id: str, message: str) -> int:
     failures = state.setdefault("failures", {})
     entry = failures.setdefault(event_id, {"count": 0, "last_error": None})
     entry["count"] = int(entry.get("count") or 0) + 1
     entry["last_error"] = message
     entry["last_failed_at"] = now_iso()
+    return entry["count"]
 
 
 def write_review_queue(event: JsonDict, inference: IssueInference, reason: str, *, root: str | Path | None = None) -> None:
@@ -1517,7 +1524,108 @@ def load_events(root: str | Path | None = None) -> list[tuple[Path, JsonDict]]:
     return events
 
 
+def drain_lock_path(root: str | Path | None = None) -> Path:
+    return ensure_state(root) / DRAIN_LOCK_FILE
+
+
+def process_is_running(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def acquire_drain_lock(root: str | Path | None = None) -> tuple[int | None, Path]:
+    lock_path = drain_lock_path(root)
+    for attempt in range(2):
+        try:
+            fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+        except FileExistsError:
+            try:
+                pid = int(lock_path.read_text(encoding="utf-8").strip())
+            except (FileNotFoundError, OSError, ValueError):
+                try:
+                    age = max(0.0, time.time() - lock_path.stat().st_mtime)
+                except FileNotFoundError:
+                    continue
+                if age < DRAIN_LOCK_STALE_SECONDS:
+                    return None, lock_path
+                pid = -1
+            if process_is_running(pid) or attempt:
+                return None, lock_path
+            try:
+                lock_path.unlink()
+            except FileNotFoundError:
+                pass
+            continue
+        os.write(fd, str(os.getpid()).encode("utf-8"))
+        return fd, lock_path
+    return None, lock_path
+
+
+def release_drain_lock(fd: int | None, lock_path: Path) -> None:
+    if fd is not None:
+        os.close(fd)
+    try:
+        lock_path.unlink()
+    except FileNotFoundError:
+        pass
+
+
 def drain_once(
+    *,
+    root: str | Path | None = None,
+    dry_run: bool = False,
+    executor: Callable[[str, JsonDict, IssueInference], WorkerResult] | None = None,
+    now: datetime | None = None,
+) -> JsonDict:
+    lock_fd, lock_path = acquire_drain_lock(root)
+    if lock_fd is None:
+        return {
+            "processed": 0,
+            "reviewed": 0,
+            "skipped": 0,
+            "failed": 0,
+            "quarantined": 0,
+            "busy": True,
+        }
+
+    totals = {
+        "processed": 0,
+        "reviewed": 0,
+        "skipped": 0,
+        "failed": 0,
+        "quarantined": 0,
+    }
+    attempted_paths: set[Path] = set()
+    try:
+        while True:
+            events = [(path, event) for path, event in load_events(root) if path not in attempted_paths]
+            if not events:
+                return totals
+            attempted_paths.update(path for path, _ in events)
+            result = _drain_events(
+                events,
+                root=root,
+                dry_run=dry_run,
+                executor=executor,
+                now=now,
+            )
+            for key in ("processed", "reviewed", "skipped", "failed", "quarantined"):
+                totals[key] += int(result.get(key) or 0)
+            if result.get("active_state_error"):
+                totals["active_state_error"] = result["active_state_error"]
+    finally:
+        release_drain_lock(lock_fd, lock_path)
+
+
+def _drain_events(
+    events: list[tuple[Path, JsonDict]],
     *,
     root: str | Path | None = None,
     dry_run: bool = False,
@@ -1529,7 +1637,7 @@ def drain_once(
     failed = 0
     reviewed = 0
     skipped = 0
-    events = load_events(root)
+    quarantined = 0
     commit_events: list[tuple[Path, JsonDict]] = []
     for path, event in events:
         if event.get("type") == "post_commit":
@@ -1614,20 +1722,37 @@ def drain_once(
             continue
 
         result = (executor or run_codex_update)(prompt, event, inference)
-        if result.ok:
+        if result.ok and result.terminal:
+            log_noop(local_state, event, "Linear confirmed issue is terminal", inference)
+            mark_processed(local_state, event_id)
+            local_state.setdefault("failures", {}).pop(event_id, None)
+            safe_unlink(path)
+            skipped += 1
+        elif result.ok:
             mark_processed(local_state, event_id)
             mark_commit_synced(local_state, commit_sha, inference.issue_key)
+            local_state.setdefault("failures", {}).pop(event_id, None)
             safe_unlink(path)
             processed += 1
         else:
-            increment_failure(local_state, event_id, result.message)
+            failure_count = increment_failure(local_state, event_id, result.message)
             failed += 1
+            if failure_count >= MAX_WORKER_FAILURES:
+                reason = f"worker failed {failure_count} times; quarantined to stop automatic retries"
+                write_review_queue(event, inference, reason, root=root)
+                log_noop(local_state, event, reason, inference)
+                local_state["failures"][event_id]["quarantined_at"] = now_iso()
+                mark_processed(local_state, event_id)
+                safe_unlink(path)
+                reviewed += 1
+                quarantined += 1
     save_state(local_state, root)
     return {
         "processed": processed,
         "reviewed": reviewed,
         "skipped": skipped,
         "failed": failed,
+        "quarantined": quarantined,
     }
 
 
@@ -1894,11 +2019,13 @@ Hard safety rules:
 - Never mark any issue Done, Completed, Closed, Canceled, or any terminal state.
 - Only add a concise comment to issue {inference.issue_key}.
 - Optionally move issue {inference.issue_key} to In Progress only if the current Linear state is non-terminal.
-- If issue {inference.issue_key} is already terminal, do not modify Linear.
+- If issue {inference.issue_key} is already terminal, do not modify Linear. After confirming its current
+  status is terminal, print exactly: {TERMINAL_SYNC_SENTINEL} {inference.issue_key}
 - Do not create duplicate comments if this exact commit/update already appears on the issue.
 - End the Linear comment exactly with: {footer}
 - After the Linear comment is actually created, print exactly: LINEAR_SYNC_OK {inference.issue_key}
-- If you cannot access Linear tools or cannot confirm the comment was created, do not print LINEAR_SYNC_OK.
+- If you cannot access Linear tools or cannot confirm either outcome, do not print LINEAR_SYNC_OK or
+  {TERMINAL_SYNC_SENTINEL}.
 
 Issue inference:
 - issue_key: {inference.issue_key}
@@ -1924,19 +2051,26 @@ def run_codex_update(prompt: str, event: JsonDict, inference: IssueInference) ->
     argv = shlex.split(command)
     if not argv or shutil.which(argv[0]) is None:
         return WorkerResult(False, f"Codex CLI not available for {inference.issue_key}")
-    result = subprocess.run(
-        [*argv, prompt],
-        cwd=event.get("repo") or os.getcwd(),
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        timeout=180,
-        check=False,
-    )
+    try:
+        result = subprocess.run(
+            [*argv, prompt],
+            cwd=event.get("repo") or os.getcwd(),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=WORKER_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return WorkerResult(False, f"codex exec timed out after {WORKER_TIMEOUT_SECONDS} seconds")
     output = "\n".join(part for part in (result.stdout.strip(), result.stderr.strip()) if part)
     if result.returncode != 0:
         return WorkerResult(False, output or "codex exec failed")
-    if "LINEAR_SYNC_OK" not in result.stdout:
+    output_lines = {line.strip() for line in result.stdout.splitlines()}
+    terminal_sentinel = f"{TERMINAL_SYNC_SENTINEL} {inference.issue_key}"
+    if terminal_sentinel in output_lines:
+        return WorkerResult(True, result.stdout.strip(), terminal=True)
+    if f"LINEAR_SYNC_OK {inference.issue_key}" not in output_lines:
         return WorkerResult(False, output or "codex exec did not confirm Linear update")
     return WorkerResult(True, result.stdout.strip())
 
