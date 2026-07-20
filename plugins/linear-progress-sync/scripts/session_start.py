@@ -10,7 +10,10 @@ def main() -> None:
     try:
         from resident_updater import ensure_resident_updater
 
-        ensure_resident_updater(Path(__file__).resolve().parents[1])
+        ensure_resident_updater(
+            Path(__file__).resolve().parents[1],
+            force_service_repair=True,
+        )
     except Exception:
         pass
     try:

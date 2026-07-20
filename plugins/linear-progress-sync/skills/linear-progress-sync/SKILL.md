@@ -77,9 +77,9 @@ codex mcp login linear
 
 This repository is a Codex plugin marketplace, not a single plugin source. Do not tell teammates or agents to run `codex plugin add` with the GitHub URL or repository root directly; that can skip marketplace registration, default plugin installation, legacy hook cleanup, and Linear MCP registration.
 
-Setup installs a resident updater under `~/.codex/coreedge`. On macOS it checks at login and every 30 minutes, validates and stages the current `main.zip`, atomically switches the managed marketplace, selects one cache version per default plugin, and retains rollback copies outside Codex's cache scan. SessionStart and PreToolUse self-heal a missing service. Persistently disable or re-enable network checks with:
+Setup installs a resident updater under `~/.codex/coreedge`. It checks at login and every 30 minutes through a macOS LaunchAgent or Linux systemd user timer, validates and stages the current `main.zip`, atomically switches the managed marketplace, selects one cache version per default plugin, and retains rollback copies outside Codex's cache scan. Linux VMs use user units under `$XDG_CONFIG_HOME/systemd/user` when that variable is set and `~/.config/systemd/user` otherwise. Headless VMs need `loginctl enable-linger <user>` if the timers must continue after logout. SessionStart and PreToolUse self-heal a missing service. Persistently disable or re-enable network checks with:
 
-Existing installations activate `0.3.2` during one ordinary resident check. The release preserves historical-backfill protections and the separate one-minute task-presence publisher, which reads metadata only, while making Linear progress comments commit-only. Updates are automatic; presence does not depend on an already-running Codex process reloading hooks. Do not ask teammates to run an update command, deliberately restart Codex, or create a renewal thread. Fresh setup installs and schedules the current plugins immediately.
+Existing macOS installations activate `0.3.3` during one ordinary resident check. The release preserves historical-backfill protections, the metadata-only one-minute task-presence publisher, and commit-only Linear progress comments while adding Linux systemd user timers. Linux installations from before `0.3.3` self-heal without rerunning setup: one new task starts the background update to `0.3.3`, and a later new task loads that release and installs and enables the timers. Presence does not depend on an already-running Codex process reloading hooks. Do not ask teammates to run an update command, deliberately restart Codex, or create a renewal thread for normal updates. Fresh setup installs and schedules the current plugins immediately.
 
 ```bash
 python3 ~/.codex/coreedge/runtime/current/update_plugin.py --disable-auto-update
@@ -100,7 +100,7 @@ Inspect updater health:
 python3 ~/.codex/coreedge/runtime/current/update_plugin.py --doctor
 ```
 
-The doctor result includes both the resident updater and the metadata-only task-presence LaunchAgent. Presence runs once per minute and does not require Codex to reload hooks.
+The doctor result includes both the resident updater and the metadata-only task-presence LaunchAgent or systemd user timer. Presence runs once per minute and does not require Codex to reload hooks.
 
 If Codex asks to review hooks after setup, trust the Linear Progress Sync and Codex Session Logging hooks once. Automatic kickoff and session capture depend on those hooks running.
 
