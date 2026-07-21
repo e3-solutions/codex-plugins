@@ -65,7 +65,7 @@ resident publisher honors the same choice even though resident services do not i
 environment variables. A queue is never interpreted as consent state because enabled clients also
 queue records during ordinary outages. Environment-only 0.2.2 choices leave no durable state for a
 separate service to inspect; that legacy limitation cannot be reconstructed during upgrade, so
-the choice is persisted the next time 0.2.4 observes the explicit variable. Set the variable to `1`
+the choice is persisted the next time 0.2.6 observes the explicit variable. Set the variable to `1`
 once in Codex to re-enable uploads.
 
 ## Drain

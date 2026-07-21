@@ -17,6 +17,7 @@ import urllib.request
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Callable
 
@@ -38,7 +39,7 @@ DEFAULT_INGEST_URL = f"{DEFAULT_SUPABASE_URL}/functions/v1/codex-session-ingest"
 DEFAULT_BUCKET = "codex-sessions"
 ALLOWED_GITHUB_ORG = "e3-solutions"
 EXCERPT_BYTES = 4096
-PLUGIN_VERSION = "0.2.4"
+PLUGIN_VERSION = "0.2.6"
 PERMANENT_HTTP_STATUSES = {400, 413, 415, 422}
 
 
@@ -523,15 +524,65 @@ def git_origin_remote(cwd: str) -> str | None:
 
 
 def remote_belongs_to_org(remote: str | None, org: str) -> bool:
+    return canonical_github_remote(remote, org) is not None
+
+
+def canonical_github_remote(remote: str | None, org: str) -> str | None:
+    """Return a GitHub canonical remote after verifying an allowed local alias."""
     if not remote:
-        return False
+        return None
     value = remote.strip()
-    patterns = (
-        rf"^https://github\.com/{re.escape(org)}/[^/]+(?:\.git)?/?$",
-        rf"^git@github\.com:{re.escape(org)}/[^/]+(?:\.git)?$",
-        rf"^ssh://git@github\.com/{re.escape(org)}/[^/]+(?:\.git)?$",
+    github_https = re.match(
+        rf"^https://github\.com/{re.escape(org)}/(?P<repository>[^/]+?)(?:\.git)?/?$",
+        value,
+        flags=re.IGNORECASE,
     )
-    return any(re.match(pattern, value, flags=re.IGNORECASE) for pattern in patterns)
+    if github_https:
+        return canonical_github_url(org, github_https.group("repository"))
+
+    scp_style = re.match(
+        rf"^git@(?P<host>[^:/\s]+):{re.escape(org)}/(?P<repository>[^/]+?)(?:\.git)?/?$",
+        value,
+        flags=re.IGNORECASE,
+    )
+    ssh_url = re.match(
+        rf"^ssh://git@(?P<host>[^/\s:]+)(?::\d+)?/{re.escape(org)}/(?P<repository>[^/]+?)(?:\.git)?/?$",
+        value,
+        flags=re.IGNORECASE,
+    )
+    match = scp_style or ssh_url
+    if not match or not ssh_host_resolves_to_github(match.group("host")):
+        return None
+    return canonical_github_url(org, match.group("repository"))
+
+
+def canonical_github_url(org: str, repository: str) -> str:
+    return f"https://github.com/{org}/{repository}.git"
+
+
+@lru_cache(maxsize=32)
+def ssh_host_resolves_to_github(host: str) -> bool:
+    """Accept SSH aliases only when local SSH configuration resolves them to GitHub."""
+    if host.rstrip(".").lower() == "github.com":
+        return True
+    try:
+        result = subprocess.run(
+            ["ssh", "-G", host],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            check=False,
+            timeout=2,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    if result.returncode != 0:
+        return False
+    for line in result.stdout.splitlines():
+        key, separator, value = line.partition(" ")
+        if key.lower() == "hostname" and separator:
+            return value.strip().rstrip(".").lower() == "github.com"
+    return False
 
 
 def first_string(payload: JsonDict, *keys: str) -> str | None:
@@ -905,10 +956,14 @@ def client_context(record: JsonDict, *, base: Path) -> JsonDict:
     hostname = local_hostname()
     username = local_username()
     installation_id = local_installation_id(base)
+    remote = metadata.get("repo_remote") or (git_origin_remote(cwd) if cwd else None)
+    canonical_remote = canonical_github_remote(
+        str(remote) if isinstance(remote, str) else None,
+        ALLOWED_GITHUB_ORG,
+    )
     context: JsonDict = {
         "cwd": cwd,
-        "repo_remote": metadata.get("repo_remote")
-        or (git_origin_remote(cwd) if cwd else None),
+        "repo_remote": canonical_remote or remote,
         "git_email": git_email,
         "git_user_name": git_config_value(cwd, "user.name"),
         "git_branch": metadata.get("git_branch")
