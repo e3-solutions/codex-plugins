@@ -122,7 +122,7 @@ def test_backfill_queues_e3_messages_with_stable_ids_and_original_timestamps(tmp
     assert all(record["metadata"]["source"] == "historical_transcript" for record in records)
 
     payload = backfill.build_ingest_payload(records[0], base=tmp_path / "state")
-    assert payload["client"]["repo_remote"] == "git@github.com:e3-solutions/old-repo.git"
+    assert payload["client"]["repo_remote"] == "https://github.com/e3-solutions/old-repo.git"
     assert payload["message"]["content"] in {"Historical prompt", "Historical answer"}
 
 

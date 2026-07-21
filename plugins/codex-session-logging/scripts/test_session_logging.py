@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 import session_logging
@@ -39,6 +40,28 @@ class RemoteBelongsToOrgTests(unittest.TestCase):
                 "git@github.com:other-org/negotiation.git",
                 "e3-solutions",
             )
+        )
+
+    def test_client_context_submits_the_canonical_remote(self) -> None:
+        record = {
+            "metadata": {
+                "cwd": "/tmp/negotiation",
+                "repo_remote": "git@github-coreedge:e3-solutions/negotiation.git",
+            }
+        }
+        with (
+            patch("session_logging.ssh_host_resolves_to_github", return_value=True),
+            patch("session_logging.git_config_value", return_value=None),
+            patch("session_logging.local_hostname", return_value="test-host"),
+            patch("session_logging.local_username", return_value="jai"),
+            patch("session_logging.local_installation_id", return_value="installation-id"),
+            patch("session_logging.saved_linear_user_name", return_value="Jai"),
+        ):
+            context = session_logging.client_context(record, base=Path("/tmp/logging"))
+
+        self.assertEqual(
+            context["repo_remote"],
+            "https://github.com/e3-solutions/negotiation.git",
         )
 
 
