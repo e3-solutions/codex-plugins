@@ -39,7 +39,7 @@ DEFAULT_INGEST_URL = f"{DEFAULT_SUPABASE_URL}/functions/v1/codex-session-ingest"
 DEFAULT_BUCKET = "codex-sessions"
 ALLOWED_GITHUB_ORG = "e3-solutions"
 EXCERPT_BYTES = 4096
-PLUGIN_VERSION = "0.2.4"
+PLUGIN_VERSION = "0.2.6"
 PERMANENT_HTTP_STATUSES = {400, 413, 415, 422}
 
 
@@ -524,24 +524,40 @@ def git_origin_remote(cwd: str) -> str | None:
 
 
 def remote_belongs_to_org(remote: str | None, org: str) -> bool:
+    return canonical_github_remote(remote, org) is not None
+
+
+def canonical_github_remote(remote: str | None, org: str) -> str | None:
+    """Return a GitHub canonical remote after verifying an allowed local alias."""
     if not remote:
-        return False
+        return None
     value = remote.strip()
-    if re.match(rf"^https://github\.com/{re.escape(org)}/[^/]+(?:\.git)?/?$", value, flags=re.IGNORECASE):
-        return True
+    github_https = re.match(
+        rf"^https://github\.com/{re.escape(org)}/(?P<repository>[^/]+?)(?:\.git)?/?$",
+        value,
+        flags=re.IGNORECASE,
+    )
+    if github_https:
+        return canonical_github_url(org, github_https.group("repository"))
 
     scp_style = re.match(
-        rf"^git@(?P<host>[^:/\s]+):{re.escape(org)}/[^/]+(?:\.git)?/?$",
+        rf"^git@(?P<host>[^:/\s]+):{re.escape(org)}/(?P<repository>[^/]+?)(?:\.git)?/?$",
         value,
         flags=re.IGNORECASE,
     )
     ssh_url = re.match(
-        rf"^ssh://git@(?P<host>[^/\s:]+)(?::\d+)?/{re.escape(org)}/[^/]+(?:\.git)?/?$",
+        rf"^ssh://git@(?P<host>[^/\s:]+)(?::\d+)?/{re.escape(org)}/(?P<repository>[^/]+?)(?:\.git)?/?$",
         value,
         flags=re.IGNORECASE,
     )
     match = scp_style or ssh_url
-    return bool(match and ssh_host_resolves_to_github(match.group("host")))
+    if not match or not ssh_host_resolves_to_github(match.group("host")):
+        return None
+    return canonical_github_url(org, match.group("repository"))
+
+
+def canonical_github_url(org: str, repository: str) -> str:
+    return f"https://github.com/{org}/{repository}.git"
 
 
 @lru_cache(maxsize=32)
@@ -940,10 +956,14 @@ def client_context(record: JsonDict, *, base: Path) -> JsonDict:
     hostname = local_hostname()
     username = local_username()
     installation_id = local_installation_id(base)
+    remote = metadata.get("repo_remote") or (git_origin_remote(cwd) if cwd else None)
+    canonical_remote = canonical_github_remote(
+        str(remote) if isinstance(remote, str) else None,
+        ALLOWED_GITHUB_ORG,
+    )
     context: JsonDict = {
         "cwd": cwd,
-        "repo_remote": metadata.get("repo_remote")
-        or (git_origin_remote(cwd) if cwd else None),
+        "repo_remote": canonical_remote or remote,
         "git_email": git_email,
         "git_user_name": git_config_value(cwd, "user.name"),
         "git_branch": metadata.get("git_branch")
