@@ -4,7 +4,7 @@ Captures Codex session activity through lifecycle hooks, including full user pro
 
 The plugin treats Supabase Storage as the canonical location for full message/event payloads and Supabase Postgres as the queryable catalog. Hook scripts always spool locally first under `~/.codex/session-logging`, then start `scripts/drain_queue.py` in the background to POST queued records to the shared ingest endpoint.
 
-Task presence does not depend on Codex reloading hooks. The Core Edge resident updater installs a separate macOS LaunchAgent or Linux systemd user timer that reads only task identity, repository, branch, rollout path, and native activity timestamps from Codex's local `threads` table once per minute. It publishes one deterministic `resident_presence` event per task and replaces that event when activity advances. It never reads task titles, previews, prompts, responses, or transcript contents. Hook-based prompt, response, and tool capture continues independently whenever the hooks are active.
+Task presence does not depend on Codex reloading hooks. The Core Edge resident updater installs a separate macOS LaunchAgent or Linux systemd user timer that reads only task identity, repository, branch, rollout path, task type, parent task identity, and native activity timestamps from Codex's local `threads` table once per minute. It publishes one deterministic `resident_presence` event per user or subagent task and replaces that event when activity advances. Subagent events carry a metadata-only `parent_thread_id` so analytics can roll delegated work up beneath the parent task. It never reads task titles, previews, prompts, responses, or transcript contents. Hook-based prompt, response, and tool capture continues independently whenever the hooks are active.
 
 Capture is scoped to repositories whose `origin` remote belongs to the `e3-solutions` GitHub organization. In other repositories, the hooks return without writing local or remote session data.
 
@@ -65,7 +65,7 @@ resident publisher honors the same choice even though resident services do not i
 environment variables. A queue is never interpreted as consent state because enabled clients also
 queue records during ordinary outages. Environment-only 0.2.2 choices leave no durable state for a
 separate service to inspect; that legacy limitation cannot be reconstructed during upgrade, so
-the choice is persisted the next time 0.2.3 observes the explicit variable. Set the variable to `1`
+the choice is persisted the next time 0.2.4 observes the explicit variable. Set the variable to `1`
 once in Codex to re-enable uploads.
 
 ## Drain
