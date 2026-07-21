@@ -13,6 +13,7 @@ import sys
 import zipfile
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -212,18 +213,17 @@ def verify_session(
     cwd = clean_string(identity.get("cwd"))
     session_id = clean_string(identity.get("session_id"))
     explicit_remote = clean_string(identity.get("repo_remote"))
-    remote = explicit_remote
+    remote = canonical_github_remote(explicit_remote, org) if explicit_remote else None
     verification = "transcript_metadata"
-    if explicit_remote and not remote_belongs_to_org(explicit_remote, org):
+    if explicit_remote and not remote:
         return None
     if not remote and cwd and cwd in cwd_remotes:
         remote = cwd_remotes[cwd]
         verification = "matching_codex_cwd"
     if not remote and cwd:
-        remote = git_origin_remote(cwd)
+        live_remote = git_origin_remote(cwd)
+        remote = canonical_github_remote(live_remote, org)
         verification = "live_git_remote"
-    if remote and not remote_belongs_to_org(remote, org):
-        return None
     if not remote:
         if session_id and trusted_session_ids and session_id in trusted_session_ids:
             verification = "e3_only_claude_logger"
@@ -241,8 +241,9 @@ def verified_cwd_remotes(identities: Iterator[dict[str, str | None]], *, org: st
     for identity in identities:
         cwd = clean_string(identity.get("cwd"))
         remote = clean_string(identity.get("repo_remote"))
-        if cwd and remote and remote_belongs_to_org(remote, org):
-            candidates.setdefault(cwd, set()).add(remote)
+        canonical_remote = canonical_github_remote(remote, org)
+        if cwd and canonical_remote:
+            candidates.setdefault(cwd, set()).add(canonical_remote)
     return {cwd: next(iter(remotes)) for cwd, remotes in candidates.items() if len(remotes) == 1}
 
 
@@ -334,10 +335,64 @@ def git_origin_remote(cwd: str) -> str | None:
 
 
 def remote_belongs_to_org(remote: str | None, org: str) -> bool:
+    return canonical_github_remote(remote, org) is not None
+
+
+def canonical_github_remote(remote: str | None, org: str) -> str | None:
+    """Return a canonical GitHub remote after verifying any local SSH alias."""
     if not remote:
+        return None
+    value = remote.strip()
+    https_match = re.match(
+        rf"^https://(?:www\.)?github\.com/{re.escape(org)}/(?P<repository>[^/]+?)(?:\.git)?/?$",
+        value,
+        flags=re.IGNORECASE,
+    )
+    if https_match:
+        return canonical_github_url(org, https_match.group("repository"))
+
+    scp_match = re.match(
+        rf"^git@(?P<host>[^:/\s]+):{re.escape(org)}/(?P<repository>[^/]+?)(?:\.git)?/?$",
+        value,
+        flags=re.IGNORECASE,
+    )
+    ssh_match = re.match(
+        rf"^ssh://git@(?P<host>[^/\s:]+)(?::\d+)?/{re.escape(org)}/(?P<repository>[^/]+?)(?:\.git)?/?$",
+        value,
+        flags=re.IGNORECASE,
+    )
+    match = scp_match or ssh_match
+    if not match or not ssh_host_resolves_to_github(match.group("host")):
+        return None
+    return canonical_github_url(org, match.group("repository"))
+
+
+def canonical_github_url(org: str, repository: str) -> str:
+    return f"https://github.com/{org}/{repository}.git"
+
+
+@lru_cache(maxsize=32)
+def ssh_host_resolves_to_github(host: str) -> bool:
+    if host.rstrip(".").lower() == "github.com":
+        return True
+    try:
+        completed = subprocess.run(
+            ["ssh", "-G", host],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=2,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
         return False
-    pattern = rf"(?:github\.com|www\.github\.com)[:/]+{re.escape(org)}(?:/|$)"
-    return re.search(pattern, remote, flags=re.IGNORECASE) is not None
+    if completed.returncode != 0:
+        return False
+    for line in completed.stdout.splitlines():
+        key, separator, value = line.partition(" ")
+        if key.lower() == "hostname" and separator:
+            return value.strip().rstrip(".").lower() == "github.com"
+    return False
 
 
 def write_session_file(

@@ -5,6 +5,7 @@ import json
 import sys
 import zipfile
 from pathlib import Path
+from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -123,6 +124,52 @@ def test_claude_e3_logger_can_verify_deleted_repo_session(tmp_path):
 
     assert result["selected"] == {"codex": 0, "claude": 1, "total": 1}
     assert result["sessions"][0]["verification"] == "e3_only_claude_logger"
+
+
+def test_export_accepts_verified_github_ssh_alias_and_canonicalizes_manifest(tmp_path):
+    exporter = load_exporter()
+    codex_home = tmp_path / "codex"
+    write_jsonl(
+        codex_home / "sessions" / "2026" / "alias.jsonl",
+        codex_rows(
+            session_id="codex-alias",
+            remote="git@github-coreedge:e3-solutions/negotiation.git",
+        ),
+    )
+
+    with patch.object(exporter, "ssh_host_resolves_to_github", return_value=True) as resolves:
+        result = exporter.export_sessions(
+            codex_home=codex_home,
+            claude_home=tmp_path / "claude",
+            output=tmp_path / "sessions.zip",
+            dry_run=True,
+        )
+
+    assert result["selected"] == {"codex": 1, "claude": 0, "total": 1}
+    assert result["sessions"][0]["repo_remote"] == "https://github.com/e3-solutions/negotiation.git"
+    resolves.assert_any_call("github-coreedge")
+
+
+def test_export_rejects_unverified_ssh_alias(tmp_path):
+    exporter = load_exporter()
+    codex_home = tmp_path / "codex"
+    write_jsonl(
+        codex_home / "sessions" / "2026" / "alias.jsonl",
+        codex_rows(
+            session_id="codex-alias",
+            remote="git@internal-git:e3-solutions/negotiation.git",
+        ),
+    )
+
+    with patch.object(exporter, "ssh_host_resolves_to_github", return_value=False):
+        result = exporter.export_sessions(
+            codex_home=codex_home,
+            claude_home=tmp_path / "claude",
+            output=tmp_path / "sessions.zip",
+            dry_run=True,
+        )
+
+    assert result["selected"] == {"codex": 0, "claude": 0, "total": 0}
 
 
 def test_raw_export_preserves_original_bytes(tmp_path):
