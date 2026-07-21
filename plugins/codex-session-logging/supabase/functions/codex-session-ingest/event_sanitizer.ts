@@ -52,6 +52,13 @@ function sanitizeEventMetadata(
     return metadata;
   }
 
+  if (eventType === "resident_presence") {
+    copyStringFields(source, metadata, [
+      "thread_source",
+      "parent_thread_id",
+    ]);
+  }
+
   if (
     [
       "tool_call_started",

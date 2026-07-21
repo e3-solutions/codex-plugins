@@ -9,6 +9,7 @@ import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from uuid import UUID
 
 import session_logging
 
@@ -92,6 +93,7 @@ def read_recent_threads(
         optional = {
             "git_branch": "git_branch" if "git_branch" in columns else "null",
             "git_origin_url": "git_origin_url" if "git_origin_url" in columns else "null",
+            "source": "source" if "source" in columns else "null",
             "thread_source": "thread_source" if "thread_source" in columns else "null",
             "archived": "archived" if "archived" in columns else "0",
         }
@@ -103,6 +105,7 @@ def read_recent_threads(
                 cwd,
                 {optional['git_origin_url']} as git_origin_url,
                 {optional['git_branch']} as git_branch,
+                {optional['source']} as source,
                 {optional['thread_source']} as thread_source,
                 {optional['archived']} as archived,
                 {created} as created_at_ms,
@@ -179,14 +182,14 @@ def milliseconds_to_iso(value: object) -> str:
 
 def native_row_precedence(row: JsonDict) -> tuple[int, int]:
     source = row.get("thread_source")
-    suppresses_presence = bool(row.get("archived")) or source not in (None, "", "user")
+    suppresses_presence = bool(row.get("archived")) or source not in (None, "", "user", "subagent")
     return int(row["updated_at_ms"]), int(suppresses_presence)
 
 
 def eligible_thread(row: JsonDict) -> bool:
     if bool(row.get("archived")):
         return False
-    if row.get("thread_source") not in (None, "", "user"):
+    if row.get("thread_source") not in (None, "", "user", "subagent"):
         return False
     required = ("id", "rollout_path", "cwd", "updated_at_ms")
     if any(not row.get(key) for key in required):
@@ -198,6 +201,33 @@ def eligible_thread(row: JsonDict) -> bool:
         str(remote) if remote else None,
         session_logging.ALLOWED_GITHUB_ORG,
     )
+
+
+def parent_thread_id(row: JsonDict) -> str | None:
+    if row.get("thread_source") != "subagent":
+        return None
+    source = row.get("source")
+    if not isinstance(source, str) or not source:
+        return None
+    try:
+        payload = json.loads(source)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    subagent = payload.get("subagent")
+    if not isinstance(subagent, dict):
+        return None
+    thread_spawn = subagent.get("thread_spawn")
+    if not isinstance(thread_spawn, dict):
+        return None
+    value = thread_spawn.get("parent_thread_id")
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        return str(UUID(value))
+    except ValueError:
+        return None
 
 
 def presence_record(row: JsonDict, *, base: Path) -> JsonDict:
@@ -219,6 +249,9 @@ def presence_record(row: JsonDict, *, base: Path) -> JsonDict:
     for key in ("git_branch", "thread_source"):
         if row.get(key):
             metadata[key] = str(row[key])
+    parent_id = parent_thread_id(row)
+    if parent_id:
+        metadata["parent_thread_id"] = parent_id
     detail: JsonDict = {
         "id": event_id,
         "session_id": session_id,

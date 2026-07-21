@@ -54,6 +54,7 @@ def create_native_database(path: Path, rows: list[dict], *, valid: bool = True) 
             rollout_path text not null,
             created_at integer not null,
             updated_at integer not null,
+            source text not null,
             cwd text not null,
             title text not null,
             preview text not null,
@@ -73,6 +74,7 @@ def create_native_database(path: Path, rows: list[dict], *, valid: bool = True) 
             "rollout_path": row.get("rollout_path", f"/tmp/{row['id']}.jsonl"),
             "created_at": row.get("created_at", 1_784_040_000),
             "updated_at": row.get("updated_at", 1_784_040_060),
+            "source": row.get("source", "vscode"),
             "cwd": row.get("cwd", f"/tmp/{row['id']}"),
             "title": row.get("title", "sensitive title"),
             "preview": row.get("preview", "sensitive preview"),
@@ -87,11 +89,11 @@ def create_native_database(path: Path, rows: list[dict], *, valid: bool = True) 
         connection.execute(
             """
             insert into threads (
-                id, rollout_path, created_at, updated_at, cwd, title, preview,
+                id, rollout_path, created_at, updated_at, source, cwd, title, preview,
                 first_user_message, archived, git_branch, git_origin_url,
                 created_at_ms, updated_at_ms, thread_source
             ) values (
-                :id, :rollout_path, :created_at, :updated_at, :cwd, :title, :preview,
+                :id, :rollout_path, :created_at, :updated_at, :source, :cwd, :title, :preview,
                 :first_user_message, :archived, :git_branch, :git_origin_url,
                 :created_at_ms, :updated_at_ms, :thread_source
             )
@@ -120,20 +122,36 @@ def configure_successful_uploads(presence, monkeypatch, uploader):
     )
 
 
-def test_resident_presence_publishes_only_metadata_for_eligible_user_tasks(tmp_path, monkeypatch):
+def test_resident_presence_publishes_user_and_subagent_tasks_with_parent_linkage(tmp_path, monkeypatch):
     now = datetime(2026, 7, 14, 18, 20, tzinfo=timezone.utc)
     updated_ms = int((now - timedelta(seconds=10)).timestamp() * 1000)
+    parent_id = "019f02bd-5d00-7e22-8e1a-4a30e7261c9f"
     codex_home = tmp_path / "codex"
     create_native_database(
         codex_home / "state_5.sqlite",
         [
-            {"id": "eligible", "updated_at_ms": updated_ms},
+            {"id": parent_id, "updated_at_ms": updated_ms},
             {
                 "id": "external",
                 "updated_at_ms": updated_ms,
                 "git_origin_url": "https://github.com/example/private.git",
             },
-            {"id": "subagent", "updated_at_ms": updated_ms, "thread_source": "subagent"},
+            {
+                "id": "subagent",
+                "updated_at_ms": updated_ms,
+                "thread_source": "subagent",
+                "source": json.dumps(
+                    {
+                        "subagent": {
+                            "thread_spawn": {
+                                "parent_thread_id": parent_id,
+                                "depth": 1,
+                                "agent_nickname": "private nickname",
+                            }
+                        }
+                    }
+                ),
+            },
             {"id": "archived", "updated_at_ms": updated_ms, "archived": 1},
         ],
     )
@@ -147,21 +165,75 @@ def test_resident_presence_publishes_only_metadata_for_eligible_user_tasks(tmp_p
         state_path=tmp_path / "presence.json",
         now=now,
     )
-    record = uploader.payloads[0]
-    detail = json.loads((tmp_path / "logging" / record["local_content_path"]).read_text(encoding="utf-8"))
+    records = {record["session_id"]: record for record in uploader.payloads}
+    details = {
+        session_id: json.loads(
+            (tmp_path / "logging" / record["local_content_path"]).read_text(encoding="utf-8")
+        )
+        for session_id, record in records.items()
+    }
 
-    assert result["eligible"] == 1
-    assert result["published"] == 1
-    assert len(uploader.payloads) == 1
-    assert record["event_type"] == "resident_presence"
-    assert record["seq"] == 0
-    assert record["id"] == presence.session_logging.sha256_hex("resident-presence:eligible")[:32]
-    assert detail["metadata"]["source"] == "resident_presence"
-    serialized = json.dumps({"record": record, "detail": detail})
-    for secret in ("sensitive title", "sensitive preview", "sensitive prompt"):
+    assert result["eligible"] == 2
+    assert result["published"] == 2
+    assert set(records) == {parent_id, "subagent"}
+    assert all(record["event_type"] == "resident_presence" for record in records.values())
+    assert all(record["seq"] == 0 for record in records.values())
+    assert records[parent_id]["id"] == presence.session_logging.sha256_hex(f"resident-presence:{parent_id}")[:32]
+    assert details["subagent"]["metadata"] == {
+        "cwd": "/tmp/subagent",
+        "transcript_path": "/tmp/subagent.jsonl",
+        "repo_remote": "https://github.com/e3-solutions/example.git",
+        "source": "resident_presence",
+        "native_created_at": "2026-07-14T14:40:00+00:00",
+        "native_updated_at": "2026-07-14T18:19:50+00:00",
+        "git_branch": "arya/test",
+        "thread_source": "subagent",
+        "parent_thread_id": parent_id,
+    }
+    serialized = json.dumps({"records": records, "details": details})
+    for secret in ("sensitive title", "sensitive preview", "sensitive prompt", "private nickname"):
         assert secret not in serialized
     for forbidden_key in ("title", "preview", "first_user_message", "prompt", "content"):
-        assert forbidden_key not in detail["metadata"]
+        assert all(forbidden_key not in detail["metadata"] for detail in details.values())
+
+
+def test_fresh_subagent_presence_is_published_when_parent_is_idle(tmp_path, monkeypatch):
+    now = datetime(2026, 7, 14, 18, 20, tzinfo=timezone.utc)
+    parent_id = "019f02bd-5d00-7e22-8e1a-4a30e7261c9f"
+    codex_home = tmp_path / "codex"
+    create_native_database(
+        codex_home / "state_5.sqlite",
+        [
+            {
+                "id": parent_id,
+                "updated_at_ms": int((now - timedelta(hours=2)).timestamp() * 1000),
+            },
+            {
+                "id": "active-child",
+                "thread_source": "subagent",
+                "source": json.dumps(
+                    {"subagent": {"thread_spawn": {"parent_thread_id": parent_id, "depth": 1}}}
+                ),
+                "updated_at_ms": int((now - timedelta(seconds=5)).timestamp() * 1000),
+            },
+        ],
+    )
+    monkeypatch.setenv("CODEX_SESSION_LOG_STATE_DIR", str(tmp_path / "logging"))
+    presence = load_presence()
+    uploader = RecordingUploader()
+    configure_successful_uploads(presence, monkeypatch, uploader)
+
+    result = presence.run_presence(
+        codex_home=codex_home,
+        state_path=tmp_path / "presence.json",
+        now=now,
+    )
+
+    assert result["eligible"] == 2
+    assert result["published"] == 1
+    assert result["drain"]["expired"] == 1
+    assert [record["session_id"] for record in uploader.payloads] == ["active-child"]
+    assert uploader.payloads[0]["metadata"]["parent_thread_id"] == parent_id
 
 
 def test_resident_presence_is_deduplicated_and_reuses_one_event_per_task(tmp_path, monkeypatch):
@@ -730,7 +802,7 @@ def test_presence_cli_posts_real_ingest_payload_to_loopback_endpoint(tmp_path):
     assert result["published"] == 1
     assert len(received) == 1
     payload = received[0]
-    assert payload["plugin"] == {"name": "codex-session-logging", "version": "0.2.3"}
+    assert payload["plugin"] == {"name": "codex-session-logging", "version": "0.2.4"}
     assert payload["record"]["session_id"] == "live-cli"
     assert payload["event"]["event_type"] == "resident_presence"
     assert "sensitive prompt" not in json.dumps(payload)

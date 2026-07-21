@@ -1,6 +1,6 @@
 {
   "name": "linear-progress-sync",
-  "version": "0.3.3",
+  "version": "0.3.4",
   "description": "Start Codex implementation work from a linked Linear issue, branch, and draft PR, then safely sync progress.",
   "author": {
     "name": "Core Edge Solution"

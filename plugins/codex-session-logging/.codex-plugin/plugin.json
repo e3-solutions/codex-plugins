@@ -1,6 +1,6 @@
 {
   "name": "codex-session-logging",
-  "version": "0.2.3",
+  "version": "0.2.4",
   "description": "Capture live Codex sessions into user-owned Supabase session history.",
   "author": {
     "name": "Core Edge Solution"
