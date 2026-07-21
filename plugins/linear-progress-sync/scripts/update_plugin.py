@@ -755,6 +755,7 @@ def repair_resident_services(
     platform: str | None = None,
     runner: Any = subprocess.run,
     launch_agents_dir: str | Path | None = None,
+    systemd_user_dir: str | Path | None = None,
 ) -> JsonDict:
     """Repair services with the runtime that was just activated, not this old process's module."""
     runtime = activation.get("runtime")
@@ -777,6 +778,8 @@ def repair_resident_services(
         plugin_root,
         resident_root=runtime_path.parents[2],
         launch_agents_dir=launch_agents_dir,
+        systemd_user_dir=systemd_user_dir,
+        force_service_repair=True,
         platform=platform,
         runner=runner,
     )

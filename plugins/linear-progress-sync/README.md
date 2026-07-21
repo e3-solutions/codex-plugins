@@ -14,7 +14,7 @@ Current behavior:
 - Repos with no `origin` remote, no git repo, or a non-E3 origin are out of scope and file edits are allowed without Linear kickoff.
 - Before kickoff in scoped repos, only file edits, write-like Bash commands, and branch creation are blocked. Read-only inspection and non-mutating commands are allowed.
 - Linear progress comments are created only after Git commits; file edits and session completion do not post progress comments.
-- A resident updater checks at macOS login and every 30 minutes, atomically activates newer default marketplace plugins, and retains `SessionStart` as a self-healing fallback.
+- A resident updater checks at login and every 30 minutes through a macOS LaunchAgent or Linux systemd user timer, atomically activates newer default marketplace plugins, and retains `SessionStart` as a self-healing fallback.
 
 ## Setup
 
@@ -31,6 +31,12 @@ codex mcp login linear
 Then restart Codex or start a new Codex thread. If Codex asks to review hooks, trust the Linear Progress Sync and Codex Session Logging hooks once.
 
 `setup.py` checks GitHub CLI auth, installs Linear Progress Sync and Codex Session Logging, removes legacy Core Edge hook copies from `~/.codex/hooks.json`, and registers Linear MCP. It does not log you in to Linear, so `codex mcp login linear` is still required.
+
+Linux requires a systemd-based distribution with a working user service manager. Setup writes user units under `$XDG_CONFIG_HOME/systemd/user` when that variable is set and `~/.config/systemd/user` otherwise, then enables the updater and task-presence timers without requiring root. On a headless VM where these timers must continue after logout, an administrator should enable lingering for the teammate account before setup:
+
+```bash
+sudo loginctl enable-linger "$USER"
+```
 
 Preview setup without changing Codex config:
 
@@ -61,9 +67,9 @@ Before kickoff, file edits, write-like Bash commands, and branch creation wait u
 
 After kickoff, successful Git commits are synced back to the active Linear issue automatically. File edits and session completion never create progress comments.
 
-Setup installs a resident updater under `~/.codex/coreedge`. On macOS it runs at login and every 30 minutes, independently of Codex tasks. It downloads the current `main.zip`, validates and stages the default marketplace plugins, switches `~/.codex/coreedge/marketplace/current` atomically, points the registered marketplace at that stable path, and leaves only the selected version visible in each Codex plugin cache. Previous versions move to `~/.codex/coreedge/rollback/cache` so a failed activation can restore the prior state. `SessionStart` and `PreToolUse` repair a missing resident service without delaying or blocking Codex.
+Setup installs a resident updater under `~/.codex/coreedge`. It runs independently of Codex tasks through macOS LaunchAgents or Linux systemd user timers: once shortly after login, every 30 minutes for updates, and every minute for metadata-only task presence. It downloads the current `main.zip`, validates and stages the default marketplace plugins, switches `~/.codex/coreedge/marketplace/current` atomically, points the registered marketplace at that stable path, and leaves only the selected version visible in each Codex plugin cache. Previous versions move to `~/.codex/coreedge/rollback/cache` so a failed activation can restore the prior state. `SessionStart` and `PreToolUse` repair a missing resident service without delaying or blocking Codex.
 
-Existing installations download and activate `0.3.2` during one ordinary resident check. The release preserves historical-backfill protections and the separate one-minute task-presence publisher, which reads metadata only, while making Linear progress comments commit-only. Updates are automatic and require no Codex restart, new task, or teammate action. Fresh setup installs and schedules the current plugins immediately. Presence reads metadata-only native Codex task state, expires observations older than five minutes instead of replaying false activity after an outage, and does not depend on an already-running Codex process reloading hooks. An already-running task keeps the skill text it loaded at creation, while hook implementations switch to the selected cache automatically and presence continues independently.
+Existing macOS installations download and activate `0.3.3` during one ordinary resident check. The release preserves historical-backfill protections, the metadata-only one-minute task-presence publisher, and commit-only Linear progress comments while adding Linux systemd user timers. Linux installations from before `0.3.3` self-heal without rerunning setup: one new task starts the background update to `0.3.3`, and a later new task loads that release and installs and enables the timers. Fresh setup installs and schedules the current plugins immediately. Presence expires observations older than five minutes instead of replaying false activity after an outage and does not depend on an already-running Codex process reloading hooks. An already-running task keeps the skill text it loaded at creation, while hook implementations switch to the selected cache automatically and presence continues independently.
 
 Persistently disable or re-enable automatic network update checks with:
 
@@ -101,7 +107,7 @@ To roll out a new default plugin or extension:
 
 After the one-time setup, releases are staged and activated by the resident service. No teammate reinstall, update command, or renewal thread is part of the rollout. A normal future task naturally picks up changed skill text; existing hook events use the sole selected cache version.
 
-`update_plugin.py --doctor` also verifies that the updater and metadata-only task-presence LaunchAgents are installed and loaded.
+`update_plugin.py --doctor` also verifies that the updater and metadata-only task-presence LaunchAgents or systemd user timers are installed and active.
 
 ## Optional
 

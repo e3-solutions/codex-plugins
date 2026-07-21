@@ -1,5 +1,5 @@
 {
-  "version": "0.3.2",
+  "version": "0.3.3",
   "archive_url": "https://github.com/e3-solutions/codex-plugins/archive/refs/heads/main.zip",
   "plugin_subdir": "plugins/linear-progress-sync"
 }
