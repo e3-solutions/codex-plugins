@@ -17,6 +17,7 @@ import urllib.request
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Callable
 
@@ -526,12 +527,46 @@ def remote_belongs_to_org(remote: str | None, org: str) -> bool:
     if not remote:
         return False
     value = remote.strip()
-    patterns = (
-        rf"^https://github\.com/{re.escape(org)}/[^/]+(?:\.git)?/?$",
-        rf"^git@github\.com:{re.escape(org)}/[^/]+(?:\.git)?$",
-        rf"^ssh://git@github\.com/{re.escape(org)}/[^/]+(?:\.git)?$",
+    if re.match(rf"^https://github\.com/{re.escape(org)}/[^/]+(?:\.git)?/?$", value, flags=re.IGNORECASE):
+        return True
+
+    scp_style = re.match(
+        rf"^git@(?P<host>[^:/\s]+):{re.escape(org)}/[^/]+(?:\.git)?/?$",
+        value,
+        flags=re.IGNORECASE,
     )
-    return any(re.match(pattern, value, flags=re.IGNORECASE) for pattern in patterns)
+    ssh_url = re.match(
+        rf"^ssh://git@(?P<host>[^/\s:]+)(?::\d+)?/{re.escape(org)}/[^/]+(?:\.git)?/?$",
+        value,
+        flags=re.IGNORECASE,
+    )
+    match = scp_style or ssh_url
+    return bool(match and ssh_host_resolves_to_github(match.group("host")))
+
+
+@lru_cache(maxsize=32)
+def ssh_host_resolves_to_github(host: str) -> bool:
+    """Accept SSH aliases only when local SSH configuration resolves them to GitHub."""
+    if host.rstrip(".").lower() == "github.com":
+        return True
+    try:
+        result = subprocess.run(
+            ["ssh", "-G", host],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            check=False,
+            timeout=2,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    if result.returncode != 0:
+        return False
+    for line in result.stdout.splitlines():
+        key, separator, value = line.partition(" ")
+        if key.lower() == "hostname" and separator:
+            return value.strip().rstrip(".").lower() == "github.com"
+    return False
 
 
 def first_string(payload: JsonDict, *keys: str) -> str | None:
