@@ -46,7 +46,7 @@ export async function handleRequest(req: Request): Promise<Response> {
       });
     }
 
-    const userId = await userIdForClientIdentity(client);
+    const userId = await resolveUserId(client);
     if (optionalString(payload.kind) === "backfill_status") {
       const backfill = requireObject(payload.backfill, "backfill");
       const observedAt = requireString(
@@ -344,6 +344,63 @@ async function upsertSessionUser(
     }
   }
   await restUpsert("codex_session_users", row, "user_id");
+}
+
+async function resolveUserId(client: JsonObject): Promise<string> {
+  const installationId = optionalString(client.installation_id);
+  if (!installationId) {
+    return userIdForClientIdentity(client);
+  }
+
+  const response = await supabaseFetch(
+    `/rest/v1/codex_session_users?select=user_id,git_email,first_seen_at&installation_id=eq.${
+      encodeURIComponent(installationId)
+    }`,
+    {
+      method: "GET",
+      headers: {
+        accept: "application/json",
+      },
+    },
+  );
+  const rows = await response.json();
+  if (!Array.isArray(rows)) {
+    throw new Error("invalid codex_session_users response");
+  }
+
+  const currentEmail = optionalString(client.git_email)?.toLowerCase();
+  const candidates = rows.map(optionalObject).filter((row) =>
+    optionalString(row.user_id) !== null
+  );
+  candidates.sort((left, right) => {
+    const leftEmail = optionalString(left.git_email)?.toLowerCase();
+    const rightEmail = optionalString(right.git_email)?.toLowerCase();
+    const leftRank = leftEmail === currentEmail && currentEmail
+      ? 0
+      : leftEmail
+      ? 1
+      : 2;
+    const rightRank = rightEmail === currentEmail && currentEmail
+      ? 0
+      : rightEmail
+      ? 1
+      : 2;
+    if (leftRank !== rightRank) {
+      return leftRank - rightRank;
+    }
+    const seenComparison = (optionalString(left.first_seen_at) ?? "")
+      .localeCompare(optionalString(right.first_seen_at) ?? "");
+    if (seenComparison !== 0) {
+      return seenComparison;
+    }
+    return requireString(left.user_id, "user_id").localeCompare(
+      requireString(right.user_id, "user_id"),
+    );
+  });
+  const existingUserId = candidates.length > 0
+    ? optionalString(candidates[0].user_id)
+    : null;
+  return existingUserId ?? await userIdForClientIdentity(client);
 }
 
 async function sessionMetadataForUpsert(
