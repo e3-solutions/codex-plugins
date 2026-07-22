@@ -134,7 +134,10 @@ Deno.test("handleRequest preserves existing session codex setup on later event u
       ? JSON.parse(requestInit.body) as JsonObject
       : null;
     requests.push({ url, body });
-    if (url.includes("/rest/v1/codex_sessions?select=")) {
+    if (
+      url.includes("/rest/v1/codex_sessions?select=") ||
+      url.includes("/rest/v1/codex_session_users?select=")
+    ) {
       return new Response(
         JSON.stringify([{
           metadata: {
@@ -220,7 +223,10 @@ Deno.test("handleRequest upserts session user identity rollup", async () => {
       ? JSON.parse(requestInit.body) as JsonObject
       : null;
     requests.push({ url, body });
-    if (url.includes("/rest/v1/codex_sessions?select=")) {
+    if (
+      url.includes("/rest/v1/codex_sessions?select=") ||
+      url.includes("/rest/v1/codex_session_users?select=")
+    ) {
       return new Response(JSON.stringify([]), {
         status: 200,
         headers: { "content-type": "application/json" },
@@ -291,6 +297,98 @@ Deno.test("handleRequest upserts session user identity rollup", async () => {
   }
 });
 
+Deno.test("handleRequest reuses the email-backed user for an existing installation", async () => {
+  const requests: Array<{ url: string; body: JsonObject | null }> = [];
+  const originalFetch = globalThis.fetch;
+  const previousUrl = Deno.env.get("SUPABASE_URL");
+  const previousServiceRole = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
+  const canonicalUserId = "11111111-1111-4111-8111-111111111111";
+
+  Deno.env.set("SUPABASE_URL", "https://project.supabase.co");
+  Deno.env.set("SUPABASE_SERVICE_ROLE_KEY", "service-role-key");
+  globalThis.fetch = async (input, init = {}) => {
+    const url = input instanceof Request
+      ? input.url
+      : input instanceof URL
+      ? input.toString()
+      : input;
+    const requestInit = init as { body?: BodyInit | null };
+    const body = typeof requestInit.body === "string"
+      ? JSON.parse(requestInit.body) as JsonObject
+      : null;
+    requests.push({ url, body });
+    if (url.includes("/rest/v1/codex_session_users?select=")) {
+      return new Response(
+        JSON.stringify([
+          {
+            user_id: "22222222-2222-4222-8222-222222222222",
+            git_email: null,
+            first_seen_at: "2026-07-01T00:00:00.000Z",
+          },
+          {
+            user_id: canonicalUserId,
+            git_email: "developer@example.test",
+            first_seen_at: "2026-06-01T00:00:00.000Z",
+          },
+        ]),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+    }
+    if (url.includes("/rest/v1/codex_sessions?select=")) {
+      return new Response(JSON.stringify([]), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    }
+    return new Response("", { status: 201 });
+  };
+
+  try {
+    const response = await handleRequest(
+      new Request("https://example.test/codex-session-ingest", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          version: 1,
+          record: {
+            id: "904fd832-7779-4665-9bec-2f10462c721b",
+            type: "event",
+            session_id: "missing-email-session",
+            seq: 1,
+            event_type: "resident_presence",
+            created_at: "2026-07-22T00:00:00.000Z",
+            metadata: { cwd: "/repo" },
+          },
+          event: { metadata: { cwd: "/repo" } },
+          client: {
+            repo_remote: "https://github.com/e3-solutions/codex-plugins.git",
+            installation_id: "shared-installation-id",
+            local_username: "developer",
+          },
+        }),
+      }),
+    );
+    const userUpsert = requests.find((request) =>
+      request.url.includes("/rest/v1/codex_session_users?on_conflict=user_id")
+    );
+    const sessionUpsert = requests.find((request) =>
+      request.url.includes("/rest/v1/codex_sessions?on_conflict=")
+    );
+    const eventUpsert = requests.find((request) =>
+      request.url.includes("/rest/v1/codex_session_events?on_conflict=")
+    );
+
+    assertEquals(response.status, 200);
+    assertEquals(userUpsert?.body?.user_id, canonicalUserId);
+    assertEquals(sessionUpsert?.body?.user_id, canonicalUserId);
+    assertEquals(eventUpsert?.body?.user_id, canonicalUserId);
+  } finally {
+    globalThis.fetch = originalFetch;
+    restoreEnv("SUPABASE_URL", previousUrl);
+    restoreEnv("SUPABASE_SERVICE_ROLE_KEY", previousServiceRole);
+  }
+});
+
 Deno.test("handleRequest still upserts non-backfill session token usage", async () => {
   const requests: Array<{ url: string; body: JsonObject | null }> = [];
   const originalFetch = globalThis.fetch;
@@ -310,7 +408,10 @@ Deno.test("handleRequest still upserts non-backfill session token usage", async 
       ? JSON.parse(requestInit.body) as JsonObject
       : null;
     requests.push({ url, body });
-    if (url.includes("/rest/v1/codex_sessions?select=")) {
+    if (
+      url.includes("/rest/v1/codex_sessions?select=") ||
+      url.includes("/rest/v1/codex_session_users?select=")
+    ) {
       return new Response(JSON.stringify([]), {
         status: 200,
         headers: { "content-type": "application/json" },
@@ -627,7 +728,10 @@ Deno.test("handleRequest stamps the claude agent and end time onto the session",
       ? JSON.parse(requestInit.body) as JsonObject
       : null;
     requests.push({ url, body });
-    if (url.includes("/rest/v1/codex_sessions?select=")) {
+    if (
+      url.includes("/rest/v1/codex_sessions?select=") ||
+      url.includes("/rest/v1/codex_session_users?select=")
+    ) {
       return new Response(JSON.stringify([]), {
         status: 200,
         headers: { "content-type": "application/json" },
@@ -710,7 +814,10 @@ Deno.test("handleRequest defaults agent to codex and clears ended_at on live eve
       ? JSON.parse(requestInit.body) as JsonObject
       : null;
     requests.push({ url, body });
-    if (url.includes("/rest/v1/codex_sessions?select=")) {
+    if (
+      url.includes("/rest/v1/codex_sessions?select=") ||
+      url.includes("/rest/v1/codex_session_users?select=")
+    ) {
       return new Response(JSON.stringify([]), {
         status: 200,
         headers: { "content-type": "application/json" },
