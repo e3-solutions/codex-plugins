@@ -802,7 +802,7 @@ def test_presence_cli_posts_real_ingest_payload_to_loopback_endpoint(tmp_path):
     assert result["published"] == 1
     assert len(received) == 1
     payload = received[0]
-    assert payload["plugin"] == {"name": "codex-session-logging", "version": "0.2.6"}
+    assert payload["plugin"] == {"name": "codex-session-logging", "version": "0.2.7"}
     assert payload["record"]["session_id"] == "live-cli"
     assert payload["event"]["event_type"] == "resident_presence"
     assert "sensitive prompt" not in json.dumps(payload)

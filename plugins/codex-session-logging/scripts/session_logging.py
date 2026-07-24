@@ -12,6 +12,7 @@ import re
 import socket
 import subprocess
 import sys
+import threading
 import urllib.error
 import urllib.request
 import uuid
@@ -39,8 +40,10 @@ DEFAULT_INGEST_URL = f"{DEFAULT_SUPABASE_URL}/functions/v1/codex-session-ingest"
 DEFAULT_BUCKET = "codex-sessions"
 ALLOWED_GITHUB_ORG = "e3-solutions"
 EXCERPT_BYTES = 4096
-PLUGIN_VERSION = "0.2.6"
+PLUGIN_VERSION = "0.2.7"
 PERMANENT_HTTP_STATUSES = {400, 413, 415, 422}
+_SESSION_UPLOAD_LOCKS: dict[str, threading.Lock] = {}
+_SESSION_UPLOAD_LOCKS_GUARD = threading.Lock()
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -814,7 +817,8 @@ def upload_claimed_record(
     record: JsonDict | None = None
     try:
         record = read_json_file(claimed_path)
-        uploader.upload_message(record, base=base)
+        with session_upload_lock(str(record.get("session_id") or "unknown-session")):
+            uploader.upload_message(record, base=base)
     except PermanentUploadError as exc:
         if record is None:
             target = dead_letter_queue_dir(base) / claimed_path.name
@@ -845,6 +849,11 @@ def dead_letter_record(base: Path, record: JsonDict, source_path: Path, exc: Exc
     record["dead_lettered_at"] = failed_at
     write_json_atomic(dead_letter_queue_dir(base) / source_path.name, record)
     source_path.unlink(missing_ok=True)
+
+
+def session_upload_lock(session_id: str) -> threading.Lock:
+    with _SESSION_UPLOAD_LOCKS_GUARD:
+        return _SESSION_UPLOAD_LOCKS.setdefault(session_id, threading.Lock())
 
 
 def try_auto_drain() -> None:
@@ -940,7 +949,10 @@ def build_ingest_payload(record: JsonDict, *, base: Path) -> JsonDict:
         "record": record,
         "client": client_context(record, base=base),
     }
-    if record.get("type") == "event":
+    if record.get("event_type") == "rollout_chunk":
+        payload["kind"] = "rollout_chunk"
+        payload["rollout_chunk"] = detail
+    elif record.get("type") == "event":
         payload["event"] = detail
     elif record.get("type") == "usage":
         payload["usage"] = detail
@@ -1110,7 +1122,20 @@ class IngestUploader:
     def upload_message(self, record: JsonDict, *, base: Path) -> None:
         payload = build_ingest_payload(record, base=base)
         validate_ingest_payload(payload)
-        self.post(payload)
+        try:
+            self.post(payload)
+        except PermanentUploadError as exc:
+            # During an automatic plugin rollout, clients can briefly reach the
+            # previous Edge Function, which reports an unknown rollout kind as
+            # HTTP 400. Retain lossless chunks for a later hook instead of
+            # dead-lettering data before the new ingest function is deployed.
+            if (
+                payload.get("kind") == "rollout_chunk"
+                and exc.status == 400
+                and "event must be an object" in str(exc)
+            ):
+                raise RuntimeError(str(exc)) from exc
+            raise
 
     def post(self, payload: JsonDict) -> None:
         headers = {

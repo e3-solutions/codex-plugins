@@ -145,6 +145,7 @@ Deno.test("handleRequest preserves existing session codex setup on later event u
             transcript_path: existingTranscriptPath,
           },
           thread_id: "existing-thread",
+          started_at: "2026-07-01T00:00:00.000Z",
         }]),
         { status: 200, headers: { "content-type": "application/json" } },
       );
@@ -194,6 +195,10 @@ Deno.test("handleRequest preserves existing session codex setup on later event u
 
     assertEquals(response.status, 200);
     assertEquals(sessionUpsert?.body?.thread_id, "existing-thread");
+    assertEquals(
+      sessionUpsert?.body?.started_at,
+      "2026-07-01T00:00:00.000Z",
+    );
     assertEquals(sessionMetadata?.codex_setup, existingSetup);
     assertEquals(sessionMetadata?.transcript_path, existingTranscriptPath);
     assertEquals(sessionMetadata?.tool_name, "functions.exec_command");
@@ -470,6 +475,237 @@ Deno.test("handleRequest still upserts non-backfill session token usage", async 
     globalThis.fetch = originalFetch;
     restoreEnv("SUPABASE_URL", previousUrl);
     restoreEnv("SUPABASE_SERVICE_ROLE_KEY", previousServiceRole);
+  }
+});
+
+Deno.test("handleRequest stores rollout bytes and catalogs retries idempotently", async () => {
+  const requests: Array<{
+    url: string;
+    body: JsonObject | null;
+    rawBody: Uint8Array | null;
+    contentType: string | null;
+  }> = [];
+  const originalFetch = globalThis.fetch;
+  const previousUrl = Deno.env.get("SUPABASE_URL");
+  const previousServiceRole = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
+  const rollout =
+    '{"type":"event_msg","payload":{"message":"secret tool output"}}\n';
+  const payload = await rolloutChunkPayload(rollout);
+
+  Deno.env.set("SUPABASE_URL", "https://project.supabase.co");
+  Deno.env.set("SUPABASE_SERVICE_ROLE_KEY", "service-role-key");
+  globalThis.fetch = async (input, init = {}) => {
+    const url = input instanceof Request
+      ? input.url
+      : input instanceof URL
+      ? input.toString()
+      : input;
+    const requestInit = init as {
+      headers?: HeadersInit;
+      body?: BodyInit | null;
+    };
+    const headers = new Headers(requestInit.headers);
+    const contentType = headers.get("content-type");
+    const rawBody = requestInit.body === undefined || requestInit.body === null
+      ? null
+      : new Uint8Array(await new Response(requestInit.body).arrayBuffer());
+    let body: JsonObject | null = null;
+    if (rawBody && contentType === "application/json") {
+      body = JSON.parse(new TextDecoder().decode(rawBody)) as JsonObject;
+    }
+    requests.push({ url, body, rawBody, contentType });
+    if (url.includes("/rest/v1/codex_session_users?select=user_id")) {
+      return new Response(
+        JSON.stringify([{
+          user_id: "99999999-9999-4999-8999-999999999999",
+          git_email: "owner@example.com",
+          first_seen_at: "2026-07-01T00:00:00.000Z",
+        }]),
+        {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        },
+      );
+    }
+    if (url.includes("/rest/v1/codex_sessions?select=")) {
+      return new Response(
+        JSON.stringify([{
+          metadata: {
+            thread_source: "subagent",
+            parent_thread_id: "22222222-2222-4222-8222-222222222222",
+            durable_existing_field: "keep-me",
+            client: { git_user_name: "Existing Name" },
+          },
+          thread_id: "existing-thread",
+        }]),
+        {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        },
+      );
+    }
+    return new Response("", { status: 201 });
+  };
+
+  try {
+    const request = () =>
+      handleRequest(
+        new Request("https://example.test/codex-session-ingest", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(payload),
+        }),
+      );
+    const firstResponse = await request();
+    const firstBody = await firstResponse.json();
+    const secondResponse = await request();
+    const secondBody = await secondResponse.json();
+    const storageRequests = requests.filter((entry) =>
+      entry.url.includes("/storage/v1/object/")
+    );
+    const eventUpserts = requests.filter((entry) =>
+      entry.url.includes("/rest/v1/codex_session_events?on_conflict=id")
+    );
+    const sessionUpsert = requests.find((entry) =>
+      entry.url.includes("/rest/v1/codex_sessions?on_conflict=id")
+    );
+    const eventMetadata = eventUpserts[0]?.body?.metadata as
+      | JsonObject
+      | undefined;
+    const sessionMetadata = sessionUpsert?.body?.metadata as
+      | JsonObject
+      | undefined;
+    const sessionClient = sessionMetadata?.client as JsonObject | undefined;
+
+    assertEquals(firstResponse.status, 200);
+    assertEquals(secondResponse.status, 200);
+    assertEquals(firstBody.id, secondBody.id);
+    assertEquals(firstBody.storage_path, secondBody.storage_path);
+    assertIncludes(
+      firstBody.storage_path,
+      "users/99999999-9999-4999-8999-999999999999/sessions/11111111-1111-4111-8111-111111111111/rollouts/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/0-",
+    );
+    assertEquals(storageRequests.length, 2);
+    assertEquals(storageRequests[0]?.url, storageRequests[1]?.url);
+    assertEquals(storageRequests[0]?.contentType, "application/x-ndjson");
+    assertEquals(
+      new TextDecoder().decode(storageRequests[0]?.rawBody ?? new Uint8Array()),
+      rollout,
+    );
+    assertEquals(eventUpserts.length, 2);
+    assertEquals(eventUpserts[0]?.body?.id, eventUpserts[1]?.body?.id);
+    assertEquals(eventUpserts[0]?.body?.event_type, "rollout_chunk");
+    assertEquals(eventMetadata?.file_generation, "a".repeat(32));
+    assertEquals(eventMetadata?.start_offset, 0);
+    assertEquals(
+      eventMetadata?.end_offset,
+      new TextEncoder().encode(rollout).byteLength,
+    );
+    assertEquals(eventMetadata?.thread_source, "subagent");
+    assertEquals(eventMetadata?.rollout_source_category, "subagent.guardian");
+    assertEquals(
+      eventMetadata?.parent_thread_id,
+      "22222222-2222-4222-8222-222222222222",
+    );
+    assertEquals(
+      eventMetadata?.root_thread_id,
+      "33333333-3333-4333-8333-333333333333",
+    );
+    assertNotIncludes(JSON.stringify(eventUpserts[0]?.body), "content_base64");
+    assertNotIncludes(
+      JSON.stringify(eventUpserts[0]?.body),
+      "secret tool output",
+    );
+    assertEquals(sessionMetadata?.durable_existing_field, "keep-me");
+    assertEquals(sessionUpsert?.body?.thread_id, "existing-thread");
+    assertEquals(
+      sessionUpsert?.body?.started_at,
+      "2026-07-23T00:00:00.000Z",
+    );
+    assertEquals(sessionClient?.git_user_name, "Existing Name");
+    assertEquals(sessionClient?.installation_id, "install-1");
+  } finally {
+    globalThis.fetch = originalFetch;
+    restoreEnv("SUPABASE_URL", previousUrl);
+    restoreEnv("SUPABASE_SERVICE_ROLE_KEY", previousServiceRole);
+  }
+});
+
+Deno.test("handleRequest rejects malformed rollout chunks before writes", async () => {
+  const originalFetch = globalThis.fetch;
+  let fetchCalls = 0;
+  globalThis.fetch = () => {
+    fetchCalls += 1;
+    return Promise.resolve(new Response("", { status: 201 }));
+  };
+
+  try {
+    const valid = await rolloutChunkPayload("one complete line\n");
+    const cases: Array<
+      { name: string; mutate: (payload: JsonObject) => void }
+    > = [
+      {
+        name: "non-canonical session UUID",
+        mutate: (payload) => {
+          optionalTestObject(payload.record).session_id = "not-a-uuid";
+        },
+      },
+      {
+        name: "non-hex generation",
+        mutate: (payload) => {
+          optionalTestObject(payload.rollout_chunk).file_generation =
+            "generation";
+        },
+      },
+      {
+        name: "invalid offset range",
+        mutate: (payload) => {
+          optionalTestObject(payload.rollout_chunk).end_offset = 0;
+        },
+      },
+      {
+        name: "oversized content",
+        mutate: (payload) => {
+          const chunk = optionalTestObject(payload.rollout_chunk);
+          chunk.end_offset = 1024 * 1024 + 1;
+          chunk.content_byte_size = 1024 * 1024 + 1;
+        },
+      },
+      {
+        name: "invalid SHA-256",
+        mutate: (payload) => {
+          optionalTestObject(payload.rollout_chunk).content_sha256 = "0".repeat(
+            64,
+          );
+        },
+      },
+      {
+        name: "invalid base64",
+        mutate: (payload) => {
+          optionalTestObject(payload.rollout_chunk).content_base64 =
+            "not base64";
+        },
+      },
+    ];
+
+    for (const testCase of cases) {
+      const payload = structuredClone(valid);
+      testCase.mutate(payload);
+      const response = await handleRequest(
+        new Request("https://example.test/codex-session-ingest", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(payload),
+        }),
+      );
+      const body = await response.json();
+      assertEquals(response.status, 400);
+      assertEquals(body.error, "invalid_payload");
+      assertEquals(typeof body.message, "string");
+    }
+    assertEquals(fetchCalls, 0);
+  } finally {
+    globalThis.fetch = originalFetch;
   }
 });
 
@@ -872,6 +1108,55 @@ Deno.test("handleRequest defaults agent to codex and clears ended_at on live eve
     restoreEnv("SUPABASE_SERVICE_ROLE_KEY", previousServiceRole);
   }
 });
+
+async function rolloutChunkPayload(content: string): Promise<JsonObject> {
+  const bytes = new TextEncoder().encode(content);
+  const digest = await crypto.subtle.digest("SHA-256", bytes);
+  const contentSha256 = Array.from(new Uint8Array(digest)).map((byte) =>
+    byte.toString(16).padStart(2, "0")
+  ).join("");
+  const binary = Array.from(bytes, (byte) => String.fromCharCode(byte)).join(
+    "",
+  );
+  return {
+    version: 1,
+    kind: "rollout_chunk",
+    record: {
+      type: "event",
+      event_type: "rollout_chunk",
+      session_id: "11111111-1111-4111-8111-111111111111",
+      thread_id: "stable-thread-id",
+      created_at: "2026-07-23T00:00:00.000Z",
+      metadata: {
+        cwd: "/repo",
+        transcript_path: "/codex/rollout.jsonl",
+        thread_source: "subagent",
+        rollout_source_category: "subagent.guardian",
+        parent_thread_id: "22222222-2222-4222-8222-222222222222",
+        root_thread_id: "33333333-3333-4333-8333-333333333333",
+        arbitrary_secret: "must-not-catalog",
+      },
+    },
+    rollout_chunk: {
+      file_generation: "a".repeat(32),
+      start_offset: 0,
+      end_offset: bytes.byteLength,
+      content_byte_size: bytes.byteLength,
+      content_sha256: contentSha256,
+      content_base64: btoa(binary),
+    },
+    client: {
+      repo_remote: "https://github.com/e3-solutions/codex-plugins.git",
+      installation_id: "install-1",
+    },
+  };
+}
+
+function optionalTestObject(value: unknown): JsonObject {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? value as JsonObject
+    : {};
+}
 
 function assertEquals(actual: unknown, expected: unknown): void {
   const actualJson = JSON.stringify(actual, null, 2);

@@ -7,6 +7,16 @@ class PayloadValidationError extends Error {}
 
 const DEFAULT_BUCKET = "codex-sessions";
 const DEFAULT_ALLOWED_ORG = "e3-solutions";
+const MAX_ROLLOUT_CHUNK_BYTES = 1024 * 1024;
+const MAX_ROLLOUT_CHUNK_BASE64_LENGTH = Math.ceil(MAX_ROLLOUT_CHUNK_BYTES / 3) *
+  4;
+const UUID_PATTERN =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+const HEX_GENERATION_PATTERN = /^[0-9a-f]{16,64}$/;
+const SHA256_PATTERN = /^[0-9a-f]{64}$/;
+const SAFE_CATEGORY_PATTERN = /^[a-zA-Z0-9._-]{1,128}$/;
+const BASE64_PATTERN =
+  /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/;
 
 const corsHeaders = {
   "access-control-allow-origin": "*",
@@ -38,7 +48,8 @@ export async function handleRequest(req: Request): Promise<Response> {
       return jsonResponse({ error: "repo_not_allowed" }, 403);
     }
 
-    if (isHistoricalBackfill(payload)) {
+    const payloadKind = optionalString(payload.kind);
+    if (payloadKind !== "rollout_chunk" && isHistoricalBackfill(payload)) {
       return jsonResponse({
         ok: true,
         ignored: true,
@@ -46,8 +57,12 @@ export async function handleRequest(req: Request): Promise<Response> {
       });
     }
 
+    if (payloadKind === "rollout_chunk") {
+      return await ingestRolloutChunk(payload, client, remote);
+    }
+
     const userId = await resolveUserId(client);
-    if (optionalString(payload.kind) === "backfill_status") {
+    if (payloadKind === "backfill_status") {
       const backfill = requireObject(payload.backfill, "backfill");
       const observedAt = requireString(
         backfill.updated_at,
@@ -112,6 +127,136 @@ export async function handleRequest(req: Request): Promise<Response> {
     }
     return jsonResponse({ error: "ingest_failed", message }, 500);
   }
+}
+
+async function ingestRolloutChunk(
+  payload: JsonObject,
+  client: JsonObject,
+  remote: string,
+): Promise<Response> {
+  const record = requireObject(payload.record, "record");
+  if (requireString(record.type, "record.type") !== "event") {
+    throw new PayloadValidationError("record.type must be event");
+  }
+  if (
+    requireString(record.event_type, "record.event_type") !== "rollout_chunk"
+  ) {
+    throw new PayloadValidationError("record.event_type must be rollout_chunk");
+  }
+
+  const sessionId = requireCanonicalUuid(
+    record.session_id,
+    "record.session_id",
+  );
+  const chunk = requireObject(payload.rollout_chunk, "rollout_chunk");
+  const fileGeneration = requirePatternString(
+    chunk.file_generation,
+    "rollout_chunk.file_generation",
+    HEX_GENERATION_PATTERN,
+    "lowercase hexadecimal",
+  );
+  const startOffset = requireNonNegativeInteger(
+    chunk.start_offset,
+    "rollout_chunk.start_offset",
+  );
+  const endOffset = requireNonNegativeInteger(
+    chunk.end_offset,
+    "rollout_chunk.end_offset",
+  );
+  if (endOffset <= startOffset) {
+    throw new PayloadValidationError(
+      "rollout_chunk.end_offset must be greater than start_offset",
+    );
+  }
+  const contentByteSize = requireNonNegativeInteger(
+    chunk.content_byte_size,
+    "rollout_chunk.content_byte_size",
+  );
+  if (contentByteSize !== endOffset - startOffset) {
+    throw new PayloadValidationError(
+      "rollout_chunk byte size must equal end_offset - start_offset",
+    );
+  }
+  if (contentByteSize > MAX_ROLLOUT_CHUNK_BYTES) {
+    throw new PayloadValidationError(
+      `rollout_chunk.content_byte_size must not exceed ${MAX_ROLLOUT_CHUNK_BYTES}`,
+    );
+  }
+  const contentSha256 = requirePatternString(
+    chunk.content_sha256,
+    "rollout_chunk.content_sha256",
+    SHA256_PATTERN,
+    "a lowercase SHA-256 hex digest",
+  );
+  const contentBase64 = requirePatternString(
+    chunk.content_base64,
+    "rollout_chunk.content_base64",
+    BASE64_PATTERN,
+    "canonical base64",
+  );
+  if (contentBase64.length > MAX_ROLLOUT_CHUNK_BASE64_LENGTH) {
+    throw new PayloadValidationError(
+      "rollout_chunk.content_base64 exceeds the encoded size limit",
+    );
+  }
+  const content = decodeBase64(contentBase64);
+  if (content.byteLength !== contentByteSize) {
+    throw new PayloadValidationError(
+      "rollout chunk content byte size mismatch",
+    );
+  }
+  if (await sha256HexBytes(content) !== contentSha256) {
+    throw new PayloadValidationError("rollout chunk content hash mismatch");
+  }
+
+  const userId = await resolveUserId(client);
+
+  const metadata = sanitizeRolloutChunkMetadata(
+    optionalObject(record.metadata),
+    {
+      file_generation: fileGeneration,
+      start_offset: startOffset,
+      end_offset: endOffset,
+      content_byte_size: contentByteSize,
+      content_sha256: contentSha256,
+    },
+  );
+  const eventId = await deterministicUuid(
+    `rollout-chunk-v1:${sessionId}:${fileGeneration}:${startOffset}:${endOffset}:${contentSha256}`,
+  );
+  const catalogRecord: JsonObject = {
+    ...record,
+    id: eventId,
+    session_id: sessionId,
+    type: "event",
+    event_type: "rollout_chunk",
+    seq: deterministicEventSequence(eventId),
+    metadata,
+  };
+  const storagePath = rolloutStoragePath(
+    userId,
+    sessionId,
+    fileGeneration,
+    startOffset,
+    endOffset,
+    contentSha256,
+  );
+  const event = { metadata };
+
+  await upsertSessionUser(catalogRecord, client, userId);
+  await uploadStorageBytes(
+    storagePath,
+    exactArrayBuffer(content),
+    "application/x-ndjson",
+  );
+  await upsertSession(catalogRecord, client, userId, remote, metadata);
+  await upsertEvent(catalogRecord, userId, storagePath, event);
+  return jsonResponse({
+    ok: true,
+    id: eventId,
+    kind: "rollout_chunk",
+    storage_path: storagePath,
+  });
 }
 
 function isHistoricalBackfill(payload: JsonObject): boolean {
@@ -232,13 +377,114 @@ async function validateMessageIntegrity(
 }
 
 async function sha256Hex(value: string): Promise<string> {
-  const digest = await crypto.subtle.digest(
-    "SHA-256",
-    new TextEncoder().encode(value),
-  );
+  return await sha256HexBytes(new TextEncoder().encode(value));
+}
+
+async function sha256HexBytes(value: Uint8Array): Promise<string> {
+  const digest = await crypto.subtle.digest("SHA-256", exactArrayBuffer(value));
   return Array.from(new Uint8Array(digest))
     .map((byte) => byte.toString(16).padStart(2, "0"))
     .join("");
+}
+
+function exactArrayBuffer(value: Uint8Array): ArrayBuffer {
+  return value.buffer.slice(
+    value.byteOffset,
+    value.byteOffset + value.byteLength,
+  ) as ArrayBuffer;
+}
+
+async function deterministicUuid(value: string): Promise<string> {
+  const digest = new Uint8Array(
+    await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value)),
+  ).slice(0, 16);
+  digest[6] = (digest[6] & 0x0f) | 0x50;
+  digest[8] = (digest[8] & 0x3f) | 0x80;
+  const hex = Array.from(digest).map((byte) =>
+    byte.toString(16).padStart(2, "0")
+  ).join("");
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${
+    hex.slice(16, 20)
+  }-${hex.slice(20)}`;
+}
+
+function deterministicEventSequence(eventId: string): number {
+  const prefix = Number.parseInt(eventId.replaceAll("-", "").slice(0, 8), 16);
+  return -(prefix % 2_000_000_000 + 1);
+}
+
+function decodeBase64(value: string): Uint8Array {
+  try {
+    const decoded = atob(value);
+    if (btoa(decoded) !== value) {
+      throw new Error("non-canonical base64");
+    }
+    return Uint8Array.from(decoded, (character) => character.charCodeAt(0));
+  } catch {
+    throw new PayloadValidationError(
+      "rollout_chunk.content_base64 must be valid base64",
+    );
+  }
+}
+
+function sanitizeRolloutChunkMetadata(
+  source: JsonObject,
+  chunkMetadata: JsonObject,
+): JsonObject {
+  const metadata: JsonObject = {
+    source: "rollout_sync",
+    ...chunkMetadata,
+  };
+  for (const field of ["cwd", "transcript_path"]) {
+    const value = optionalBoundedString(source[field], field, 4096);
+    if (value) {
+      metadata[field] = value;
+    }
+  }
+  const threadSource = optionalString(source.thread_source);
+  if (threadSource) {
+    if (!SAFE_CATEGORY_PATTERN.test(threadSource)) {
+      throw new PayloadValidationError(
+        "record.metadata.thread_source is invalid",
+      );
+    }
+    metadata.thread_source = threadSource;
+  }
+  const rolloutSourceCategory = optionalBoundedString(
+    source.rollout_source_category,
+    "rollout_source_category",
+    128,
+  );
+  if (rolloutSourceCategory) {
+    if (!SAFE_CATEGORY_PATTERN.test(rolloutSourceCategory)) {
+      throw new PayloadValidationError(
+        "record.metadata.rollout_source_category is invalid",
+      );
+    }
+    metadata.rollout_source_category = rolloutSourceCategory;
+  }
+  for (const field of ["parent_thread_id", "root_thread_id"]) {
+    if (source[field] !== undefined && source[field] !== null) {
+      metadata[field] = requireCanonicalUuid(
+        source[field],
+        `record.metadata.${field}`,
+      );
+    }
+  }
+  return metadata;
+}
+
+function rolloutStoragePath(
+  userId: string,
+  sessionId: string,
+  fileGeneration: string,
+  startOffset: number,
+  endOffset: number,
+  contentSha256: string,
+): string {
+  return `users/${
+    safeSegment(userId)
+  }/sessions/${sessionId}/rollouts/${fileGeneration}/${startOffset}-${endOffset}-${contentSha256}.jsonl`;
 }
 
 function storagePathForRecord(record: JsonObject, userId: string): string {
@@ -264,6 +510,18 @@ async function uploadStorageObject(
   storagePath: string,
   payload: JsonObject,
 ): Promise<void> {
+  await uploadStorageBytes(
+    storagePath,
+    JSON.stringify(payload, null, 2) + "\n",
+    "application/json",
+  );
+}
+
+async function uploadStorageBytes(
+  storagePath: string,
+  payload: BodyInit,
+  contentType: string,
+): Promise<void> {
   const bucket = Deno.env.get("CODEX_SESSION_LOG_BUCKET") ?? DEFAULT_BUCKET;
   const quotedPath = storagePath.split("/").map(encodeURIComponent).join("/");
   await supabaseFetch(
@@ -271,10 +529,10 @@ async function uploadStorageObject(
     {
       method: "POST",
       headers: {
-        "content-type": "application/json",
+        "content-type": contentType,
         "x-upsert": "true",
       },
-      body: JSON.stringify(payload, null, 2) + "\n",
+      body: payload,
     },
   );
 }
@@ -288,8 +546,8 @@ async function upsertSession(
 ): Promise<void> {
   const sessionId = requireString(record.session_id, "record.session_id");
   const existing = await existingSession(sessionId);
-  const threadId = optionalString(record.thread_id) ??
-    existing.threadId ?? await sha256Hex(sessionId);
+  const threadId = existing.threadId ??
+    optionalString(record.thread_id) ?? await sha256Hex(sessionId);
   const sessionMetadata = await sessionMetadataForUpsert(
     metadata,
     client,
@@ -305,7 +563,10 @@ async function upsertSession(
       safeSegment(sessionId)
     }`,
     metadata: sessionMetadata,
-    started_at: requireString(record.created_at, "record.created_at"),
+    started_at: earliestTimestamp(
+      existing.startedAt,
+      requireString(record.created_at, "record.created_at"),
+    ),
     // Persist an explicit session end when the client sends one (Claude Stop /
     // SessionEnd, or an idle-timeout presence tick). Absent on ordinary events,
     // in which case we clear ended_at so a resumed session lights up again.
@@ -408,12 +669,7 @@ async function sessionMetadataForUpsert(
   client: JsonObject,
   existingMetadata: JsonObject,
 ): Promise<JsonObject> {
-  const nextMetadata: JsonObject = { ...metadata };
-  for (const field of ["codex_setup", "transcript_path"]) {
-    if (!hasOwn(nextMetadata, field) && hasOwn(existingMetadata, field)) {
-      nextMetadata[field] = existingMetadata[field];
-    }
-  }
+  const nextMetadata: JsonObject = { ...existingMetadata, ...metadata };
   // Stamp the coding-agent family onto the session row so downstream consumers
   // (heartbeat dashboard, codestat) can label sessions without heuristics.
   // Sticky: once a session is seen as "claude" it stays "claude" even if a later
@@ -422,15 +678,22 @@ async function sessionMetadataForUpsert(
     optionalString(existingMetadata.agent) ?? "codex";
   return {
     ...nextMetadata,
-    client,
+    client: {
+      ...optionalObject(existingMetadata.client),
+      ...client,
+    },
   };
 }
 
 async function existingSession(
   sessionId: string,
-): Promise<{ metadata: JsonObject; threadId: string | null }> {
+): Promise<{
+  metadata: JsonObject;
+  threadId: string | null;
+  startedAt: string | null;
+}> {
   const response = await supabaseFetch(
-    `/rest/v1/codex_sessions?select=metadata,thread_id&id=eq.${
+    `/rest/v1/codex_sessions?select=metadata,thread_id,started_at&id=eq.${
       encodeURIComponent(sessionId)
     }&limit=1`,
     {
@@ -442,13 +705,26 @@ async function existingSession(
   );
   const rows = await response.json();
   if (!Array.isArray(rows) || rows.length === 0) {
-    return { metadata: {}, threadId: null };
+    return { metadata: {}, threadId: null, startedAt: null };
   }
   const row = optionalObject(rows[0]);
   return {
     metadata: optionalObject(row.metadata),
     threadId: optionalString(row.thread_id),
+    startedAt: optionalString(row.started_at),
   };
+}
+
+function earliestTimestamp(existing: string | null, incoming: string): string {
+  if (!existing) {
+    return incoming;
+  }
+  const existingTime = Date.parse(existing);
+  const incomingTime = Date.parse(incoming);
+  if (Number.isNaN(existingTime) || Number.isNaN(incomingTime)) {
+    return existing;
+  }
+  return existingTime <= incomingTime ? existing : incoming;
 }
 
 async function upsertMessage(
@@ -637,15 +913,47 @@ function optionalObject(value: unknown): JsonObject {
     : {};
 }
 
-function hasOwn(value: JsonObject, key: string): boolean {
-  return Object.prototype.hasOwnProperty.call(value, key);
-}
-
 function requireString(value: unknown, name: string): string {
   if (typeof value !== "string" || value.length === 0) {
     throw new PayloadValidationError(`${name} must be a non-empty string`);
   }
   return value;
+}
+
+function requirePatternString(
+  value: unknown,
+  name: string,
+  pattern: RegExp,
+  description: string,
+): string {
+  const result = requireString(value, name);
+  if (!pattern.test(result)) {
+    throw new PayloadValidationError(`${name} must be ${description}`);
+  }
+  return result;
+}
+
+function requireCanonicalUuid(value: unknown, name: string): string {
+  return requirePatternString(
+    value,
+    name,
+    UUID_PATTERN,
+    "a canonical lowercase UUID",
+  );
+}
+
+function optionalBoundedString(
+  value: unknown,
+  name: string,
+  maximumLength: number,
+): string | null {
+  const result = optionalString(value);
+  if (result && result.length > maximumLength) {
+    throw new PayloadValidationError(
+      `record.metadata.${name} must not exceed ${maximumLength} characters`,
+    );
+  }
+  return result;
 }
 
 function optionalString(value: unknown): string | null {
