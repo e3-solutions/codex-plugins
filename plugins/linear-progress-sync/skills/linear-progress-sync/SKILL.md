@@ -79,7 +79,7 @@ This repository is a Codex plugin marketplace, not a single plugin source. Do no
 
 Setup installs a resident updater under `~/.codex/coreedge`. It checks at login and every 30 minutes through a macOS LaunchAgent or Linux systemd user timer, validates and stages the current `main.zip`, atomically switches the managed marketplace, selects one cache version per default plugin, and retains rollback copies outside Codex's cache scan. Linux VMs use user units under `$XDG_CONFIG_HOME/systemd/user` when that variable is set and `~/.config/systemd/user` otherwise. Headless VMs need `loginctl enable-linger <user>` if the timers must continue after logout. SessionStart and PreToolUse self-heal a missing service. Persistently disable or re-enable network checks with:
 
-Existing installations activate `0.3.6` during one ordinary resident check and self-heal without rerunning setup. The release preserves historical-backfill protections, Linux systemd support, commit-only Linear progress comments, and subagents with parent-thread linkage while adding support for verified GitHub SSH host aliases such as `github-coreedge`. Session logging canonicalizes those aliases to `github.com` before ingest so local scope checks and backend repository validation agree. Presence does not depend on an already-running Codex process reloading hooks. Do not ask teammates to run an update command, deliberately restart Codex, or create a renewal thread for normal updates. Fresh setup installs and schedules the current plugins immediately.
+Existing installations activate `0.3.7` during one ordinary resident check and self-heal without rerunning setup. The release preserves historical-backfill protections, Linux systemd support, commit-only Linear progress comments, and verified GitHub SSH aliases while replacing one-minute task presence with complete hook-triggered parent and subagent rollout capture. Exact native JSONL bytes are durably queued in deterministic chunks, and a later hook recovers after crashes without duplicates. Existing one-minute presence schedulers are removed during upgrade. Do not ask teammates to run an update command, deliberately restart Codex, or create a renewal thread for normal updates. Fresh setup installs and schedules the current plugins immediately.
 
 ```bash
 python3 ~/.codex/coreedge/runtime/current/update_plugin.py --disable-auto-update
@@ -100,7 +100,7 @@ Inspect updater health:
 python3 ~/.codex/coreedge/runtime/current/update_plugin.py --doctor
 ```
 
-The doctor result includes both the resident updater and the metadata-only task-presence LaunchAgent or systemd user timer. Presence runs once per minute and does not require Codex to reload hooks.
+The doctor result verifies the resident updater LaunchAgent or systemd user timer. Complete parent and subagent session capture is hook-triggered and uses a durable local queue; it does not run a per-minute background process.
 
 If Codex asks to review hooks after setup, trust the Linear Progress Sync and Codex Session Logging hooks once. Automatic kickoff and session capture depend on those hooks running.
 

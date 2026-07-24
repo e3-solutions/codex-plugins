@@ -32,7 +32,7 @@ Then restart Codex or start a new Codex thread. If Codex asks to review hooks, t
 
 `setup.py` checks GitHub CLI auth, installs Linear Progress Sync and Codex Session Logging, removes legacy Core Edge hook copies from `~/.codex/hooks.json`, and registers Linear MCP. It does not log you in to Linear, so `codex mcp login linear` is still required.
 
-Linux requires a systemd-based distribution with a working user service manager. Setup writes user units under `$XDG_CONFIG_HOME/systemd/user` when that variable is set and `~/.config/systemd/user` otherwise, then enables the updater and task-presence timers without requiring root. On a headless VM where these timers must continue after logout, an administrator should enable lingering for the teammate account before setup:
+Linux requires a systemd-based distribution with a working user service manager. Setup writes the updater units under `$XDG_CONFIG_HOME/systemd/user` when that variable is set and `~/.config/systemd/user` otherwise, then enables the updater timer without requiring root. On a headless VM where updates must continue after logout, an administrator should enable lingering for the teammate account before setup:
 
 ```bash
 sudo loginctl enable-linger "$USER"
@@ -67,9 +67,9 @@ Before kickoff, file edits, write-like Bash commands, and branch creation wait u
 
 After kickoff, successful Git commits are synced back to the active Linear issue automatically. File edits and session completion never create progress comments.
 
-Setup installs a resident updater under `~/.codex/coreedge`. It runs independently of Codex tasks through macOS LaunchAgents or Linux systemd user timers: once shortly after login, every 30 minutes for updates, and every minute for metadata-only task presence. It downloads the current `main.zip`, validates and stages the default marketplace plugins, switches `~/.codex/coreedge/marketplace/current` atomically, points the registered marketplace at that stable path, and leaves only the selected version visible in each Codex plugin cache. Previous versions move to `~/.codex/coreedge/rollback/cache` so a failed activation can restore the prior state. `SessionStart` and `PreToolUse` repair a missing resident service without delaying or blocking Codex.
+Setup installs a resident updater under `~/.codex/coreedge`. It runs independently of Codex tasks through a macOS LaunchAgent or Linux systemd user timer shortly after login and every 30 minutes. It downloads the current `main.zip`, validates and stages the default marketplace plugins, switches `~/.codex/coreedge/marketplace/current` atomically, points the registered marketplace at that stable path, and leaves only the selected version visible in each Codex plugin cache. Previous versions move to `~/.codex/coreedge/rollback/cache` so a failed activation can restore the prior state. `SessionStart` and `PreToolUse` repair a missing resident service without delaying or blocking Codex.
 
-Existing installations download and activate `0.3.6` during one ordinary resident check. The release preserves historical-backfill protections, Linux systemd support, commit-only Linear progress comments, and the one-minute task-presence publisher for subagents with parent-thread linkage while adding support for verified GitHub SSH host aliases such as `github-coreedge`. Session logging canonicalizes those aliases to `github.com` before ingest so local scope checks and backend repository validation agree. Installations from before `0.3.6` self-heal without rerunning setup; fresh setup installs and schedules the current plugins immediately. Presence expires observations older than five minutes instead of replaying false activity after an outage and does not depend on an already-running Codex process reloading hooks. An already-running task keeps the skill text it loaded at creation, while hook implementations switch to the selected cache automatically and presence continues independently.
+Existing installations download and activate `0.3.7` during one ordinary resident check. The release preserves historical-backfill protections, Linux systemd support, commit-only Linear progress comments, and verified GitHub SSH aliases while replacing one-minute task presence with complete hook-triggered parent and subagent rollout capture. SQLite discovers native rollout paths; exact JSONL bytes are durably queued in deterministic chunks before the local checkpoint advances. `SessionStart`, `UserPromptSubmit`, and `Stop` recover all changes, while agent-coordination tool completions provide lower-latency subagent sync. A crash is recovered by the next hook without duplicate Storage objects or Postgres events, and existing one-minute presence schedulers are removed during upgrade. No new Supabase database migration is required. Installations from before `0.3.7` self-heal without rerunning setup; fresh setup installs and schedules the current plugins immediately.
 
 Persistently disable or re-enable automatic network update checks with:
 
@@ -107,7 +107,7 @@ To roll out a new default plugin or extension:
 
 After the one-time setup, releases are staged and activated by the resident service. No teammate reinstall, update command, or renewal thread is part of the rollout. A normal future task naturally picks up changed skill text; existing hook events use the sole selected cache version.
 
-`update_plugin.py --doctor` also verifies that the updater and metadata-only task-presence LaunchAgents or systemd user timers are installed and active.
+`update_plugin.py --doctor` verifies that the resident update LaunchAgent or systemd user timer is installed and active. Session capture health is represented by the durable local queue and advances on Codex hooks rather than a background timer.
 
 ## Optional
 

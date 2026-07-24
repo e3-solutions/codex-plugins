@@ -493,7 +493,7 @@ def test_drain_uploads_multiple_records_concurrently(tmp_path, monkeypatch):
         session_logging.capture_hook_event(
             {
                 "hook_event_name": "UserPromptSubmit",
-                "session_id": "parallel-upload",
+                "session_id": f"parallel-upload-{turn}",
                 "turn_id": f"turn-{turn}",
                 "cwd": str(repo),
                 "prompt": f"Prompt {turn}",
@@ -525,6 +525,45 @@ def test_drain_uploads_multiple_records_concurrently(tmp_path, monkeypatch):
     assert uploader.max_active > 1
     assert progress[-1]["uploaded"] == 4
     assert progress[-1]["remaining"] == 0
+
+
+def test_drain_serializes_records_within_one_session(tmp_path, monkeypatch):
+    monkeypatch.setenv("CODEX_SESSION_LOG_STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setenv("CODEX_SESSION_LOG_UPLOAD_WORKERS", "4")
+    session_logging = load_session_logging()
+    repo = init_git_repo(tmp_path / "repo", "https://github.com/e3-solutions/codex-plugins.git")
+    for turn in range(4):
+        session_logging.capture_hook_event(
+            {
+                "hook_event_name": "UserPromptSubmit",
+                "session_id": "serialized-upload",
+                "turn_id": f"turn-{turn}",
+                "cwd": str(repo),
+                "prompt": f"Prompt {turn}",
+            }
+        )
+
+    class ConcurrentUploader:
+        def __init__(self):
+            self.active = 0
+            self.max_active = 0
+            self.lock = threading.Lock()
+
+        def upload_message(self, record, *, base):
+            with self.lock:
+                self.active += 1
+                self.max_active = max(self.max_active, self.active)
+            time.sleep(0.02)
+            with self.lock:
+                self.active -= 1
+
+    uploader = ConcurrentUploader()
+    monkeypatch.setattr(session_logging.IngestUploader, "from_env", classmethod(lambda cls: uploader))
+
+    result = session_logging.drain_queue()
+
+    assert result["uploaded"] == 4
+    assert uploader.max_active == 1
 
 
 def test_concurrent_upload_workers_share_one_installation_id(tmp_path, monkeypatch):

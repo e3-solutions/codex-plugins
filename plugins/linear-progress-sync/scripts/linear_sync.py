@@ -1156,7 +1156,7 @@ def setup_plan(
             "First use lists Linear users, asks which user to save, and stores it in ~/.codex/linear-sync/user.json for all repos.",
             "First use in a repo lists Linear teams/projects, asks which project to save, and stores it in ~/.codex/linear-sync/repos.json.",
             "Repos that should not use Linear sync can be opted out with linear_start.py configure-repo --disable-linear-sync.",
-            "Resident updates run at login and every 30 minutes through macOS LaunchAgents or Linux systemd user timers; metadata-only task presence runs every minute; teammates need no renewal thread or update command.",
+            "Resident updates run at login and every 30 minutes through macOS LaunchAgents or Linux systemd user timers; complete parent and subagent session capture advances through Codex hooks without a minute poller; teammates need no renewal thread or update command.",
             "Headless Linux VMs need loginctl lingering enabled for the teammate account if resident timers must continue after logout.",
             "SessionStart remains a self-healing fallback; use update_plugin.py --disable-auto-update for a persistent opt-out.",
             "LINEAR_SYNC_AUTO_UPDATE=0 is also persisted when setup or a self-healing hook observes it.",

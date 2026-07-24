@@ -1,7 +1,7 @@
 {
   "name": "codex-session-logging",
-  "version": "0.2.6",
-  "description": "Capture live Codex sessions into user-owned Supabase session history.",
+  "version": "0.2.7",
+  "description": "Capture complete Codex parent and subagent sessions into user-owned Supabase history.",
   "author": {
     "name": "Core Edge Solution"
   },
@@ -14,8 +14,8 @@
   "hooks": "./hooks/hooks.json",
   "interface": {
     "displayName": "Codex Session Logging",
-    "shortDescription": "Capture prompt and assistant message history.",
-    "longDescription": "Codex Session Logging captures live hook payloads and publishes metadata-only task presence into a private Supabase Storage bucket with a Postgres catalog. Historical transcript backfills are disabled.",
+    "shortDescription": "Capture complete parent and subagent session history.",
+    "longDescription": "Codex Session Logging uses lifecycle hooks to incrementally publish exact parent and subagent rollout bytes into a private Supabase Storage bucket with an idempotent Postgres catalog. Historical transcript backfills are disabled.",
     "developerName": "Core Edge Solution",
     "category": "Productivity",
     "capabilities": [
@@ -23,7 +23,7 @@
       "Write"
     ],
     "defaultPrompt": [
-      "Capture Codex session messages",
+      "Capture complete Codex parent and subagent sessions",
       "Drain queued Codex session logs to Supabase"
     ],
     "brandColor": "#0F766E"
