@@ -35,8 +35,12 @@ def load_scripts_module(name: str):
     session_logging = _load_named("session_logging")
     if name == "session_logging":
         return session_logging
-    if name == "backfill_sessions":
+    if name in {"transcript_sync", "backfill_sessions"}:
         _load_named("publish_presence")
+    if name == "transcript_sync":
+        return _load_named("transcript_sync")
+    if name == "backfill_sessions":
+        _load_named("transcript_sync")
     return _load_named(name)
 
 
@@ -51,7 +55,7 @@ def restore_shared_script_modules():
     # bare names the codex-session-logging test loaders use ("session_logging",
     # etc.). Clear them on teardown so the codex tests re-import their own copies
     # instead of reusing whatever this file cached.
-    shared = ("session_logging", "publish_presence", "backfill_sessions", "presence_ticker")
+    shared = ("session_logging", "publish_presence", "backfill_sessions", "presence_ticker", "transcript_sync")
     yield
     for name in shared:
         sys.modules.pop(name, None)
@@ -601,6 +605,324 @@ def test_auto_update_falls_back_to_install_for_older_claude_code(tmp_path, monke
 
     assert result["updated"] is True
     assert commands[-1] == ["claude", "plugin", "install", "claude-session-logging@coreedge-internal"]
+
+
+def _write_claude_transcript(path: Path, repo: Path) -> None:
+    """A minimal Claude Code transcript: a user prompt, an assistant turn with
+    token usage + a tool_use, and a tool_result (user-role) turn."""
+    lines = [
+        {
+            "type": "user",
+            "uuid": "line-user-1",
+            "timestamp": "2026-07-16T00:00:00.000Z",
+            "cwd": str(repo),
+            "gitBranch": "main",
+            "sessionId": "claude-xcript",
+            "message": {"role": "user", "content": "Please refactor the auth module"},
+        },
+        {
+            "type": "assistant",
+            "uuid": "line-asst-1",
+            "timestamp": "2026-07-16T00:00:05.000Z",
+            "cwd": str(repo),
+            "message": {
+                "role": "assistant",
+                "model": "claude-opus-4-8",
+                "content": [
+                    {"type": "text", "text": "On it — reading the file first."},
+                    {"type": "tool_use", "id": "tool-1", "name": "Read", "input": {"file_path": "/auth.py"}},
+                ],
+                "usage": {
+                    "input_tokens": 100,
+                    "output_tokens": 20,
+                    "cache_read_input_tokens": 30,
+                    "cache_creation_input_tokens": 10,
+                    "service_tier": "standard",
+                },
+            },
+        },
+        {
+            "type": "user",
+            "uuid": "line-tool-1",
+            "timestamp": "2026-07-16T00:00:06.000Z",
+            "cwd": str(repo),
+            "message": {
+                "role": "user",
+                "content": [
+                    {"type": "tool_result", "tool_use_id": "tool-1", "content": "def login(): ..."},
+                ],
+            },
+        },
+    ]
+    path.write_text("\n".join(json.dumps(line) for line in lines) + "\n", encoding="utf-8")
+
+
+def _assistant_line(uuid: str, ts: str, repo: Path, *, text: str, usage: dict) -> dict:
+    return {
+        "type": "assistant",
+        "uuid": uuid,
+        "timestamp": ts,
+        "cwd": str(repo),
+        "message": {
+            "role": "assistant",
+            "model": "claude-opus-4-8",
+            "content": [{"type": "text", "text": text}],
+            "usage": usage,
+        },
+    }
+
+
+def _user_line(uuid: str, ts: str, repo: Path, text: str) -> dict:
+    return {
+        "type": "user",
+        "uuid": uuid,
+        "timestamp": ts,
+        "cwd": str(repo),
+        "gitBranch": "main",
+        "message": {"role": "user", "content": text},
+    }
+
+
+def _pending_records(session_logging, base: Path) -> list[dict]:
+    return [session_logging.read_json_file(p) for p in session_logging.pending_queue_paths(base)]
+
+
+def test_transcript_sync_emits_messages_and_usage(tmp_path, monkeypatch):
+    monkeypatch.setenv("CLAUDE_SESSION_LOG_STATE_DIR", str(tmp_path / "state"))
+    session_logging = load_scripts_module("session_logging")
+    load_scripts_module("publish_presence")
+    transcript_sync = load_scripts_module("transcript_sync")
+
+    repo = init_git_repo(tmp_path / "repo", "https://github.com/e3-solutions/codex-plugins.git")
+    transcript = tmp_path / "projects" / "-slug" / "claude-xcript.jsonl"
+    transcript.parent.mkdir(parents=True)
+    _write_claude_transcript(transcript, repo)
+
+    result = transcript_sync.sync_transcript_records("claude-xcript", transcript)
+    assert result["messages"] == 3
+    assert result["usage"] == 1
+
+    base = tmp_path / "state"
+    records = _pending_records(session_logging, base)
+    messages = [r for r in records if r["type"] == "message"]
+    usages = [r for r in records if r["type"] == "usage"]
+
+    assert {m["role"] for m in messages} == {"user", "assistant", "tool"}
+    assert all(m["metadata"]["agent"] == "claude" for m in messages)
+
+    # The plain-string user prompt hashes/sizes to its exact bytes.
+    user_msg = next(m for m in messages if m["role"] == "user")
+    prompt = "Please refactor the auth module"
+    assert user_msg["content_sha256"] == session_logging.sha256_hex(prompt)
+    assert user_msg["content_byte_size"] == len(prompt.encode("utf-8"))
+
+    # Message bodies (full parity) round-trip through build_ingest_payload and
+    # the ingest's hash check would pass (byte size matches the stored content).
+    for record in messages:
+        payload = session_logging.build_ingest_payload(record, base=base)
+        session_logging.validate_ingest_payload(payload)
+        stored = payload["message"]
+        assert stored["content_sha256"] == record["content_sha256"]
+        assert len(stored["content"].encode("utf-8")) == record["content_byte_size"]
+
+    # The assistant turn's tool_use is serialized into the stored body (parity).
+    assistant_msg = next(m for m in messages if m["role"] == "assistant")
+    assistant_body = session_logging.build_ingest_payload(assistant_msg, base=base)["message"]["content"]
+    assert "tool_use" in assistant_body and "Read" in assistant_body
+
+    assert len(usages) == 1
+    usage_payload = session_logging.build_ingest_payload(usages[0], base=base)
+    session_logging.validate_ingest_payload(usage_payload)
+    usage = usage_payload["usage"]
+    assert usage["input_tokens"] == 100
+    assert usage["cached_input_tokens"] == 30
+    assert usage["output_tokens"] == 20
+    assert usage["reasoning_output_tokens"] == 0
+    assert usage["total_tokens"] == 100 + 20 + 10 + 30
+    assert usage["model_context_window"] == 200000
+    assert usage["created_at"] == "2026-07-16T00:00:05.000Z"
+    assert usages[0]["metadata"]["agent"] == "claude"
+    assert usages[0]["metadata"]["cache_creation_input_tokens"] == 10
+    assert usages[0]["metadata"]["model"] == "claude-opus-4-8"
+    assert usages[0]["metadata"]["service_tier"] == "standard"
+
+
+def test_transcript_sync_is_idempotent(tmp_path, monkeypatch):
+    monkeypatch.setenv("CLAUDE_SESSION_LOG_STATE_DIR", str(tmp_path / "state"))
+    session_logging = load_scripts_module("session_logging")
+    load_scripts_module("publish_presence")
+    transcript_sync = load_scripts_module("transcript_sync")
+
+    repo = init_git_repo(tmp_path / "repo", "https://github.com/e3-solutions/codex-plugins.git")
+    transcript = tmp_path / "projects" / "-slug" / "claude-xcript.jsonl"
+    transcript.parent.mkdir(parents=True)
+    _write_claude_transcript(transcript, repo)
+
+    base = tmp_path / "state"
+    first = transcript_sync.sync_transcript_records("claude-xcript", transcript)
+    assert first["queued"] == 4
+    first_ids = {r["id"] for r in _pending_records(session_logging, base)}
+
+    second = transcript_sync.sync_transcript_records("claude-xcript", transcript)
+    assert second["queued"] == 0
+    second_ids = {r["id"] for r in _pending_records(session_logging, base)}
+    assert second_ids == first_ids
+
+
+def test_transcript_sync_usage_is_cumulative_session_total(tmp_path, monkeypatch):
+    monkeypatch.setenv("CLAUDE_SESSION_LOG_STATE_DIR", str(tmp_path / "state"))
+    session_logging = load_scripts_module("session_logging")
+    load_scripts_module("publish_presence")
+    transcript_sync = load_scripts_module("transcript_sync")
+
+    repo = init_git_repo(tmp_path / "repo", "https://github.com/e3-solutions/codex-plugins.git")
+    transcript = tmp_path / "projects" / "-slug" / "claude-multi.jsonl"
+    transcript.parent.mkdir(parents=True)
+    lines = [
+        _user_line("u1", "2026-07-16T00:00:00.000Z", repo, "First ask"),
+        _assistant_line(
+            "a1", "2026-07-16T00:00:05.000Z", repo, text="First answer",
+            usage={"input_tokens": 100, "output_tokens": 20, "cache_read_input_tokens": 30, "cache_creation_input_tokens": 10},
+        ),
+        _user_line("u2", "2026-07-16T00:00:10.000Z", repo, "Second ask"),
+        _assistant_line(
+            "a2", "2026-07-16T00:00:15.000Z", repo, text="Second answer",
+            usage={"input_tokens": 200, "output_tokens": 50, "cache_read_input_tokens": 60, "cache_creation_input_tokens": 5},
+        ),
+    ]
+    transcript.write_text("\n".join(json.dumps(line) for line in lines) + "\n", encoding="utf-8")
+
+    base = tmp_path / "state"
+    result = transcript_sync.sync_transcript_records("claude-multi", transcript)
+    # Two assistant turns with usage -> exactly ONE usage record.
+    assert result["usage"] == 1
+    usages = [r for r in _pending_records(session_logging, base) if r["type"] == "usage"]
+    assert len(usages) == 1
+
+    usage = session_logging.build_ingest_payload(usages[0], base=base)["usage"]
+    # Summed across both turns.
+    assert usage["output_tokens"] == 20 + 50
+    assert usage["input_tokens"] == 100 + 200
+    assert usage["cached_input_tokens"] == 30 + 60
+    assert usage["total_tokens"] == (100 + 200) + (20 + 50) + (10 + 5) + (30 + 60)
+    assert usages[0]["metadata"]["cache_creation_input_tokens"] == 10 + 5
+    assert usage["created_at"] == "2026-07-16T00:00:15.000Z"  # latest turn
+
+    # Re-running changes nothing: no new records, same row id, same totals.
+    usage_id = usages[0]["id"]
+    second = transcript_sync.sync_transcript_records("claude-multi", transcript)
+    assert second["queued"] == 0
+    usages_after = [r for r in _pending_records(session_logging, base) if r["type"] == "usage"]
+    assert len(usages_after) == 1
+    assert usages_after[0]["id"] == usage_id
+    assert session_logging.build_ingest_payload(usages_after[0], base=base)["usage"]["output_tokens"] == 70
+
+
+def test_transcript_sync_usage_accumulates_across_incremental_runs(tmp_path, monkeypatch):
+    monkeypatch.setenv("CLAUDE_SESSION_LOG_STATE_DIR", str(tmp_path / "state"))
+    session_logging = load_scripts_module("session_logging")
+    load_scripts_module("publish_presence")
+    transcript_sync = load_scripts_module("transcript_sync")
+
+    repo = init_git_repo(tmp_path / "repo", "https://github.com/e3-solutions/codex-plugins.git")
+    transcript = tmp_path / "projects" / "-slug" / "claude-live.jsonl"
+    transcript.parent.mkdir(parents=True)
+    base = tmp_path / "state"
+
+    # Turn 1 arrives; the Stop hook syncs.
+    turn1 = [
+        _user_line("u1", "2026-07-16T00:00:00.000Z", repo, "First ask"),
+        _assistant_line(
+            "a1", "2026-07-16T00:00:05.000Z", repo, text="First answer",
+            usage={"input_tokens": 100, "output_tokens": 20, "cache_read_input_tokens": 30, "cache_creation_input_tokens": 10},
+        ),
+    ]
+    transcript.write_text("\n".join(json.dumps(line) for line in turn1) + "\n", encoding="utf-8")
+    transcript_sync.sync_transcript_records("claude-live", transcript)
+    usage_after_1 = session_logging.build_ingest_payload(
+        next(r for r in _pending_records(session_logging, base) if r["type"] == "usage"), base=base
+    )["usage"]
+    assert usage_after_1["output_tokens"] == 20
+
+    # Turn 2 is appended; the next Stop hook syncs — usage must accumulate into
+    # the SAME row, not reset to just turn 2.
+    with transcript.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(_user_line("u2", "2026-07-16T00:00:10.000Z", repo, "Second ask")) + "\n")
+        handle.write(json.dumps(_assistant_line(
+            "a2", "2026-07-16T00:00:15.000Z", repo, text="Second answer",
+            usage={"input_tokens": 200, "output_tokens": 50, "cache_read_input_tokens": 60, "cache_creation_input_tokens": 5},
+        )) + "\n")
+    transcript_sync.sync_transcript_records("claude-live", transcript)
+
+    usages = [r for r in _pending_records(session_logging, base) if r["type"] == "usage"]
+    assert len(usages) == 1  # still one row (same deterministic id)
+    usage = session_logging.build_ingest_payload(usages[0], base=base)["usage"]
+    assert usage["output_tokens"] == 20 + 50
+    assert usage["input_tokens"] == 100 + 200
+    assert usage["total_tokens"] == 300 + 70 + 15 + 90
+
+
+def test_transcript_sync_skips_repos_outside_e3(tmp_path, monkeypatch):
+    monkeypatch.setenv("CLAUDE_SESSION_LOG_STATE_DIR", str(tmp_path / "state"))
+    session_logging = load_scripts_module("session_logging")
+    load_scripts_module("publish_presence")
+    transcript_sync = load_scripts_module("transcript_sync")
+
+    repo = init_git_repo(tmp_path / "repo", "https://github.com/example/other.git")
+    transcript = tmp_path / "projects" / "-slug" / "claude-xcript.jsonl"
+    transcript.parent.mkdir(parents=True)
+    _write_claude_transcript(transcript, repo)
+
+    result = transcript_sync.sync_transcript_records("claude-xcript", transcript)
+    assert result["synced"] == 0
+    assert not session_logging.pending_queue_paths(tmp_path / "state")
+
+
+def test_drain_posts_message_and_usage_records_to_shared_ingest(tmp_path, monkeypatch):
+    monkeypatch.setenv("CLAUDE_SESSION_LOG_STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setenv("CLAUDE_SESSION_LOG_INGEST_URL", "https://logs.example.test/ingest")
+    session_logging = load_scripts_module("session_logging")
+    load_scripts_module("publish_presence")
+    transcript_sync = load_scripts_module("transcript_sync")
+
+    repo = init_git_repo(tmp_path / "repo", "https://github.com/e3-solutions/codex-plugins.git")
+    transcript = tmp_path / "projects" / "-slug" / "claude-xcript.jsonl"
+    transcript.parent.mkdir(parents=True)
+    _write_claude_transcript(transcript, repo)
+    transcript_sync.sync_transcript_records("claude-xcript", transcript)
+
+    requests = []
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def read(self):
+            return b""
+
+    monkeypatch.setattr(
+        session_logging.urllib.request,
+        "urlopen",
+        lambda request, timeout: requests.append(request) or Response(),
+    )
+
+    result = session_logging.drain_queue()
+    assert result["uploaded"] == 4
+    bodies = [json.loads(r.data.decode("utf-8")) for r in requests]
+    by_type = {}
+    for body in bodies:
+        by_type.setdefault(body["record"]["type"], []).append(body)
+
+    assert len(by_type["message"]) == 3
+    assert len(by_type["usage"]) == 1
+    for body in bodies:
+        assert body["record"]["metadata"]["agent"] == "claude"
+        assert body["client"]["repo_remote"] == "https://github.com/e3-solutions/codex-plugins.git"
+    assert all("content" in body["message"] for body in by_type["message"])
+    assert by_type["usage"][0]["usage"]["total_tokens"] == 160
 
 
 def test_auto_update_is_throttled(tmp_path, monkeypatch):

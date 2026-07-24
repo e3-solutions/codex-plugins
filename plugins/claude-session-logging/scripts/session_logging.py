@@ -42,6 +42,9 @@ AGENT = "claude"
 # ingest upsertSession branch).
 END_EVENT_TYPES = frozenset({"thread_stopped", "thread_ended"})
 PERMANENT_HTTP_STATUSES = {400, 403, 413, 415, 422}
+# Byte budget for the utf8 excerpt stored alongside full-body message records
+# (matches codex-session-logging so both agents produce identical shapes).
+EXCERPT_BYTES = 4096
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -258,6 +261,19 @@ def tool_batch_size(payload: JsonDict) -> int | None:
 
 def sha256_hex(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def utf8_excerpt(content_bytes: bytes, *, limit: int = EXCERPT_BYTES) -> str:
+    return content_bytes[:limit].decode("utf-8", errors="replace")
+
+
+def deterministic_uuid(value: str) -> str:
+    """Stable v5-ish uuid from a seed string so re-emits carry the same id and
+    dedupe via the ingest's ``on_conflict=id`` (mirrors backfill_sessions)."""
+    digest = bytearray(hashlib.sha256(value.encode("utf-8")).digest()[:16])
+    digest[6] = (digest[6] & 0x0F) | 0x50
+    digest[8] = (digest[8] & 0x3F) | 0x80
+    return str(uuid.UUID(bytes=bytes(digest)))
 
 
 def copy_string(source: JsonDict, target: JsonDict, key: str, *, destination: str | None = None) -> None:
@@ -548,16 +564,27 @@ def ingest_url() -> str:
 
 
 def build_ingest_payload(record: JsonDict, *, base: Path) -> JsonDict:
-    return {
+    detail = read_json_file(base / str(record["local_content_path"]))
+    payload: JsonDict = {
         "version": 1,
         "plugin": {
             "name": PLUGIN_NAME,
             "version": PLUGIN_VERSION,
         },
         "record": record,
-        "event": read_json_file(base / str(record["local_content_path"])),
         "client": client_context(record, base=base),
     }
+    record_type = record.get("type")
+    if record_type == "message":
+        # Full prompt/response/tool bodies (FULL CODEX PARITY): the ingest
+        # verifies content_sha256/byte_size then stores + upserts codex_session_messages.
+        payload["message"] = detail
+    elif record_type == "usage":
+        # Per-turn token usage -> codex_session_usage (feeds codestat token_usage_by_agent).
+        payload["usage"] = detail
+    else:
+        payload["event"] = detail
+    return payload
 
 
 def client_context(record: JsonDict, *, base: Path) -> JsonDict:
@@ -740,8 +767,46 @@ def validate_ingest_payload(payload: JsonDict) -> None:
     if not remote_belongs_to_org(remote, allowed_github_org()):
         raise PermanentUploadError("client.repo_remote is outside the allowed GitHub org")
     record = payload.get("record") if isinstance(payload.get("record"), dict) else {}
-    if record.get("type") != "event":
-        raise PermanentUploadError("Claude session logging only uploads event records")
+    record_type = record.get("type")
+    if record_type == "event" or record_type is None:
+        return
+    if record_type == "message":
+        _validate_message_record(record)
+        return
+    if record_type == "usage":
+        _validate_usage_payload(payload)
+        return
+    raise PermanentUploadError(f"Claude session logging cannot upload record type {record_type!r}")
+
+
+def _validate_message_record(record: JsonDict) -> None:
+    if not isinstance(record.get("content_sha256"), str) or not record["content_sha256"]:
+        raise PermanentUploadError("message record requires content_sha256")
+    if not isinstance(record.get("content_byte_size"), int) or record["content_byte_size"] < 0:
+        raise PermanentUploadError("message record requires a non-negative content_byte_size")
+    if not isinstance(record.get("role"), str) or not record["role"]:
+        raise PermanentUploadError("message record requires role")
+    if not isinstance(record.get("storage_path"), str) or not record["storage_path"]:
+        raise PermanentUploadError("message record requires storage_path")
+
+
+def _validate_usage_payload(payload: JsonDict) -> None:
+    usage = payload.get("usage") if isinstance(payload.get("usage"), dict) else None
+    if usage is None:
+        raise PermanentUploadError("usage record requires a usage detail")
+    required_ints = (
+        "input_tokens",
+        "cached_input_tokens",
+        "output_tokens",
+        "reasoning_output_tokens",
+        "total_tokens",
+    )
+    for key in required_ints:
+        value = usage.get(key)
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            raise PermanentUploadError(f"usage.{key} must be a non-negative integer")
+    if not isinstance(usage.get("created_at"), str) or not usage["created_at"]:
+        raise PermanentUploadError("usage.created_at must be a non-empty string")
 
 
 class PermanentUploadError(RuntimeError):
