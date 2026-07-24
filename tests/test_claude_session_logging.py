@@ -629,7 +629,7 @@ def _write_claude_transcript(path: Path, repo: Path) -> None:
                 "role": "assistant",
                 "model": "claude-opus-4-8",
                 "content": [
-                    {"type": "text", "text": "On it — reading the file first."},
+                    {"type": "text", "text": "On it, reading the file first."},
                     {"type": "tool_use", "id": "tool-1", "name": "Read", "input": {"file_path": "/auth.py"}},
                 ],
                 "usage": {
@@ -699,7 +699,9 @@ def test_transcript_sync_emits_messages_and_usage(tmp_path, monkeypatch):
     _write_claude_transcript(transcript, repo)
 
     result = transcript_sync.sync_transcript_records("claude-xcript", transcript)
-    assert result["messages"] == 3
+    # Only the user-prompt and assistant-response TEXT turns emit rows; the
+    # tool_result (user-role) turn is skipped, matching Codex.
+    assert result["messages"] == 2
     assert result["usage"] == 1
 
     base = tmp_path / "state"
@@ -707,7 +709,8 @@ def test_transcript_sync_emits_messages_and_usage(tmp_path, monkeypatch):
     messages = [r for r in records if r["type"] == "message"]
     usages = [r for r in records if r["type"] == "usage"]
 
-    assert {m["role"] for m in messages} == {"user", "assistant", "tool"}
+    # No tool-role rows: Codex never stores tool_result bodies as messages.
+    assert {m["role"] for m in messages} == {"user", "assistant"}
     assert all(m["metadata"]["agent"] == "claude" for m in messages)
 
     # The plain-string user prompt hashes/sizes to its exact bytes.
@@ -716,8 +719,8 @@ def test_transcript_sync_emits_messages_and_usage(tmp_path, monkeypatch):
     assert user_msg["content_sha256"] == session_logging.sha256_hex(prompt)
     assert user_msg["content_byte_size"] == len(prompt.encode("utf-8"))
 
-    # Message bodies (full parity) round-trip through build_ingest_payload and
-    # the ingest's hash check would pass (byte size matches the stored content).
+    # Message bodies round-trip through build_ingest_payload and the ingest's
+    # hash check would pass (byte size matches the stored content).
     for record in messages:
         payload = session_logging.build_ingest_payload(record, base=base)
         session_logging.validate_ingest_payload(payload)
@@ -725,10 +728,14 @@ def test_transcript_sync_emits_messages_and_usage(tmp_path, monkeypatch):
         assert stored["content_sha256"] == record["content_sha256"]
         assert len(stored["content"].encode("utf-8")) == record["content_byte_size"]
 
-    # The assistant turn's tool_use is serialized into the stored body (parity).
+    # The assistant turn stores ONLY its response text; the tool_use input body
+    # (name + arguments) is dropped for PII parity with Codex.
     assistant_msg = next(m for m in messages if m["role"] == "assistant")
     assistant_body = session_logging.build_ingest_payload(assistant_msg, base=base)["message"]["content"]
-    assert "tool_use" in assistant_body and "Read" in assistant_body
+    assert assistant_body == "On it, reading the file first."
+    assert "tool_use" not in assistant_body
+    assert "Read" not in assistant_body
+    assert "/auth.py" not in assistant_body
 
     assert len(usages) == 1
     usage_payload = session_logging.build_ingest_payload(usages[0], base=base)
@@ -747,6 +754,122 @@ def test_transcript_sync_emits_messages_and_usage(tmp_path, monkeypatch):
     assert usages[0]["metadata"]["service_tier"] == "standard"
 
 
+def test_transcript_sync_drops_tool_and_thinking_bodies(tmp_path, monkeypatch):
+    """A full tool_use + tool_result + thinking round-trip must yield ONLY the
+    user-prompt and assistant-response TEXT rows (plus the usage row). No tool
+    input/output bodies and no thinking content are stored anywhere - exact PII
+    parity with Codex."""
+    monkeypatch.setenv("CLAUDE_SESSION_LOG_STATE_DIR", str(tmp_path / "state"))
+    session_logging = load_scripts_module("session_logging")
+    load_scripts_module("publish_presence")
+    transcript_sync = load_scripts_module("transcript_sync")
+
+    repo = init_git_repo(tmp_path / "repo", "https://github.com/e3-solutions/codex-plugins.git")
+    transcript = tmp_path / "projects" / "-slug" / "claude-pii.jsonl"
+    transcript.parent.mkdir(parents=True)
+    lines = [
+        {
+            "type": "user",
+            "uuid": "u1",
+            "timestamp": "2026-07-16T00:00:00.000Z",
+            "cwd": str(repo),
+            "gitBranch": "main",
+            "message": {"role": "user", "content": "Read the config and summarize it"},
+        },
+        {
+            "type": "assistant",
+            "uuid": "a1",
+            "timestamp": "2026-07-16T00:00:05.000Z",
+            "cwd": str(repo),
+            "message": {
+                "role": "assistant",
+                "model": "claude-opus-4-8",
+                "content": [
+                    {"type": "thinking", "thinking": "SECRET_REASONING should never be stored"},
+                    {"type": "text", "text": "Here is the summary."},
+                    {"type": "tool_use", "id": "t1", "name": "Read", "input": {"file_path": "/etc/SECRET_INPUT"}},
+                ],
+                "usage": {
+                    "input_tokens": 100,
+                    "output_tokens": 20,
+                    "cache_read_input_tokens": 30,
+                    "cache_creation_input_tokens": 10,
+                },
+            },
+        },
+        {
+            "type": "user",
+            "uuid": "tr1",
+            "timestamp": "2026-07-16T00:00:06.000Z",
+            "cwd": str(repo),
+            "message": {
+                "role": "user",
+                "content": [
+                    {"type": "tool_result", "tool_use_id": "t1", "content": "SECRET_OUTPUT body of the file"},
+                ],
+            },
+        },
+        {
+            "type": "assistant",
+            "uuid": "a2",
+            "timestamp": "2026-07-16T00:00:07.000Z",
+            "cwd": str(repo),
+            "message": {
+                "role": "assistant",
+                "model": "claude-opus-4-8",
+                "content": [
+                    {"type": "thinking", "thinking": "SECRET_REASONING_2 planning"},
+                    {"type": "tool_use", "id": "t2", "name": "Bash", "input": {"command": "cat SECRET_INPUT_2"}},
+                ],
+                "usage": {"input_tokens": 5, "output_tokens": 5},
+            },
+        },
+    ]
+    transcript.write_text("\n".join(json.dumps(line) for line in lines) + "\n", encoding="utf-8")
+
+    base = tmp_path / "state"
+    result = transcript_sync.sync_transcript_records("claude-pii", transcript)
+
+    records = _pending_records(session_logging, base)
+    messages = [r for r in records if r["type"] == "message"]
+    usages = [r for r in records if r["type"] == "usage"]
+
+    # Exactly two message rows: the user prompt and the one assistant turn that
+    # had real text. The tool_result turn and the tool_use/thinking-only
+    # assistant turn produce no rows.
+    assert result["messages"] == 2
+    assert len(usages) == 1
+    assert {m["role"] for m in messages} == {"user", "assistant"}
+
+    user_body = session_logging.build_ingest_payload(
+        next(m for m in messages if m["role"] == "user"), base=base
+    )["message"]["content"]
+    assistant_body = session_logging.build_ingest_payload(
+        next(m for m in messages if m["role"] == "assistant"), base=base
+    )["message"]["content"]
+    assert user_body == "Read the config and summarize it"
+    assert assistant_body == "Here is the summary."
+
+    # No thinking, tool_use, or tool_result content leaks into any stored body.
+    haystack = json.dumps([session_logging.build_ingest_payload(m, base=base) for m in messages], sort_keys=True)
+    for secret in (
+        "SECRET_REASONING",
+        "SECRET_REASONING_2",
+        "SECRET_INPUT",
+        "SECRET_INPUT_2",
+        "SECRET_OUTPUT",
+        "tool_use",
+        "tool_result",
+        "thinking",
+    ):
+        assert secret not in haystack
+
+    # Usage still accumulates across BOTH assistant turns (counts, not PII).
+    usage = session_logging.build_ingest_payload(usages[0], base=base)["usage"]
+    assert usage["input_tokens"] == 100 + 5
+    assert usage["output_tokens"] == 20 + 5
+
+
 def test_transcript_sync_is_idempotent(tmp_path, monkeypatch):
     monkeypatch.setenv("CLAUDE_SESSION_LOG_STATE_DIR", str(tmp_path / "state"))
     session_logging = load_scripts_module("session_logging")
@@ -760,7 +883,8 @@ def test_transcript_sync_is_idempotent(tmp_path, monkeypatch):
 
     base = tmp_path / "state"
     first = transcript_sync.sync_transcript_records("claude-xcript", transcript)
-    assert first["queued"] == 4
+    # 2 message rows (user + assistant text) + 1 cumulative usage row.
+    assert first["queued"] == 3
     first_ids = {r["id"] for r in _pending_records(session_logging, base)}
 
     second = transcript_sync.sync_transcript_records("claude-xcript", transcript)
@@ -910,13 +1034,13 @@ def test_drain_posts_message_and_usage_records_to_shared_ingest(tmp_path, monkey
     )
 
     result = session_logging.drain_queue()
-    assert result["uploaded"] == 4
+    assert result["uploaded"] == 3
     bodies = [json.loads(r.data.decode("utf-8")) for r in requests]
     by_type = {}
     for body in bodies:
         by_type.setdefault(body["record"]["type"], []).append(body)
 
-    assert len(by_type["message"]) == 3
+    assert len(by_type["message"]) == 2
     assert len(by_type["usage"]) == 1
     for body in bodies:
         assert body["record"]["metadata"]["agent"] == "claude"

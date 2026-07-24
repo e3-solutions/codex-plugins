@@ -576,11 +576,12 @@ def build_ingest_payload(record: JsonDict, *, base: Path) -> JsonDict:
     }
     record_type = record.get("type")
     if record_type == "message":
-        # Full prompt/response/tool bodies (FULL CODEX PARITY): the ingest
-        # verifies content_sha256/byte_size then stores + upserts codex_session_messages.
+        # User-prompt and assistant-response TEXT only (Codex capture parity): the
+        # ingest verifies content_sha256/byte_size then stores + upserts codex_session_messages.
         payload["message"] = detail
     elif record_type == "usage":
-        # Per-turn token usage -> codex_session_usage (feeds codestat token_usage_by_agent).
+        # One cumulative session-total usage row -> codex_session_usage (feeds
+        # codestat token_usage_by_agent).
         payload["usage"] = detail
     else:
         payload["event"] = detail

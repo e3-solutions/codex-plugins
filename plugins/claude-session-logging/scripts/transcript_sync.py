@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
-"""Transcript-driven capture of Claude Code prompt/response content + token usage.
+"""Transcript-driven capture of Claude Code prompt/response text + token usage.
 
 Unlike the metadata-only presence/lifecycle path, this module reads the Claude
-Code transcript (``~/.claude/projects/<slug>/<sessionId>.jsonl``) — the source of
-truth for a session — and emits full-body ``message`` records and a single
+Code transcript (``~/.claude/projects/<slug>/<sessionId>.jsonl``) - the source of
+truth for a session - and emits ``message`` records plus a single
 cumulative-session-total ``usage`` record through the plugin's existing queue,
-mirroring ``codex-session-logging``. This is the approved FULL CODEX PARITY
-behavior: the
-prompt/response/tool bodies are stored so the shared ingest can populate
+mirroring ``codex-session-logging``. Capture matches the Codex capture
+specification exactly: only user-prompt TEXT and assistant-response TEXT are
+stored. Tool input bodies, tool output bodies, and thinking/reasoning blocks are
+intentionally NOT stored, for PII parity with Codex. Tool calls are still tracked
+as lightweight metadata-only events elsewhere in the plugin (unchanged). The
+stored text plus the ``usage`` counts let the shared ingest populate
 ``codex_session_messages`` and ``codex_session_usage`` for Claude sessions, making
 the codestat ``token_usage_by_agent`` view agent-symmetric (COR-2786 / ATC).
 
@@ -74,8 +77,9 @@ def sync_transcript_records(
 
     Reads a per-session cursor (last processed line index + running token
     totals), processes only newer lines, emits one ``message`` record per
-    user/assistant/tool turn, and — when this run added new assistant-turn
-    usage — emits exactly ONE ``usage`` record carrying the cumulative session
+    user-prompt or assistant-response TEXT turn (tool-result turns and empty
+    text turns are skipped), and, when this run added new assistant-turn
+    usage, emits exactly ONE ``usage`` record carrying the cumulative session
     totals (deterministic id from the session id, so it upserts the same
     codex_session_usage row every time). Then persists the cursor. Deterministic
     ids + cursor make re-runs a no-op.
@@ -340,6 +344,7 @@ def _cumulative_usage_record(
         "input_tokens": input_tokens,
         "cached_input_tokens": cache_read,
         "output_tokens": output_tokens,
+        # Claude transcripts do not expose a separate reasoning-token count.
         "reasoning_output_tokens": 0,
         "total_tokens": total_tokens,
         "created_at": created_at,
@@ -376,8 +381,13 @@ def _role_and_content(envelope: JsonDict) -> tuple[str | None, str]:
     if not isinstance(message, dict):
         return None, ""
     raw = message.get("content")
+    # A user turn that is only a tool_result carries no user-prompt text. Codex
+    # never emits a tool-role message row, so skip it entirely (return no role).
     if line_type == "user" and _is_tool_result(raw):
-        return "tool", _serialize_content(raw)
+        return None, ""
+    # Any user/assistant turn whose serialized text is empty after dropping
+    # non-text blocks (e.g. an assistant turn that was only tool_use/thinking) is
+    # skipped by the caller, which returns None when content is empty.
     return line_type, _serialize_content(raw)
 
 
@@ -401,15 +411,18 @@ def _is_tool_result(content: object) -> bool:
 
 
 def _serialize_content(content: object) -> str:
-    """Faithfully serialize Claude message content into a stored text body.
+    """Serialize ONLY the plain-text portions of Claude message content.
 
-    Text/thinking blocks are joined as-is; tool_use / tool_result blocks are
-    rendered with a header + JSON body so nothing is lost (FULL CODEX PARITY).
+    Matches the Codex capture spec: keep user-prompt text and assistant-response
+    text (text / output_text / input_text blocks). Everything else is dropped for
+    PII parity with Codex - thinking/reasoning blocks, tool_use input bodies, and
+    tool_result output bodies contribute nothing to the stored content, and
+    unknown block types are skipped rather than serialized.
     """
     if isinstance(content, str):
         return content
     if not isinstance(content, list):
-        return "" if content is None else json.dumps(content, ensure_ascii=False, sort_keys=True)
+        return ""
 
     parts: list[str] = []
     for block in content:
@@ -417,26 +430,13 @@ def _serialize_content(content: object) -> str:
             parts.append(block)
             continue
         if not isinstance(block, dict):
-            parts.append(json.dumps(block, ensure_ascii=False, sort_keys=True))
+            # Non-text block; drop it (no PII bodies stored).
             continue
         block_type = block.get("type")
         if block_type in {"text", "output_text", "input_text"} and isinstance(block.get("text"), str):
             parts.append(block["text"])
-        elif block_type == "thinking" and isinstance(block.get("thinking"), str):
-            parts.append(block["thinking"])
-        elif block_type == "tool_use":
-            name = block.get("name")
-            header = f"[tool_use name={name} id={block.get('id')}]"
-            parts.append(header + "\n" + json.dumps(block.get("input"), ensure_ascii=False, sort_keys=True))
-        elif block_type == "tool_result":
-            header = f"[tool_result tool_use_id={block.get('tool_use_id')} is_error={block.get('is_error', False)}]"
-            body = block.get("content")
-            if isinstance(body, str):
-                parts.append(header + "\n" + body)
-            else:
-                parts.append(header + "\n" + json.dumps(body, ensure_ascii=False, sort_keys=True))
-        else:
-            parts.append(json.dumps(block, ensure_ascii=False, sort_keys=True))
+        # thinking, tool_use, tool_result, and any other block type are dropped:
+        # only real user/assistant text is stored, matching Codex.
     return "\n".join(part for part in parts if part is not None)
 
 
