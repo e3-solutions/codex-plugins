@@ -1,6 +1,6 @@
 {
   "name": "codex-session-logging",
-  "version": "0.2.7",
+  "version": "0.2.8",
   "description": "Capture complete Codex parent and subagent sessions into user-owned Supabase history.",
   "author": {
     "name": "Core Edge Solution"
@@ -15,7 +15,7 @@
   "interface": {
     "displayName": "Codex Session Logging",
     "shortDescription": "Capture complete parent and subagent session history.",
-    "longDescription": "Codex Session Logging uses lifecycle hooks to incrementally publish exact parent and subagent rollout bytes into a private Supabase Storage bucket with an idempotent Postgres catalog. Historical transcript backfills are disabled.",
+    "longDescription": "Codex Session Logging incrementally publishes exact parent and subagent rollout bytes and real cumulative token usage into private Supabase storage and Postgres. Historical transcript backfills are disabled.",
     "developerName": "Core Edge Solution",
     "category": "Productivity",
     "capabilities": [

@@ -136,6 +136,183 @@ def decoded_chunks(module, state: Path, records: list[dict]) -> bytes:
     )
 
 
+def token_count(
+    timestamp: str,
+    *,
+    input_tokens: int,
+    cached_input_tokens: int,
+    output_tokens: int,
+    reasoning_output_tokens: int = 0,
+    total_tokens: int,
+    model_context_window: int | None = 258400,
+) -> dict:
+    info = {
+        "total_token_usage": {
+            "input_tokens": input_tokens,
+            "cached_input_tokens": cached_input_tokens,
+            "output_tokens": output_tokens,
+            "reasoning_output_tokens": reasoning_output_tokens,
+            "total_tokens": total_tokens,
+        },
+    }
+    if model_context_window is not None:
+        info["model_context_window"] = model_context_window
+    return {
+        "timestamp": timestamp,
+        "type": "event_msg",
+        "payload": {"type": "token_count", "info": info},
+    }
+
+
+def test_sync_emits_deterministic_latest_real_usage_from_incremental_lines(tmp_path, monkeypatch):
+    codex_home = tmp_path / "codex"
+    rollout = tmp_path / "usage-rollout.jsonl"
+    write_rollout(
+        rollout,
+        session_id=PARENT_ID,
+        records=[
+            token_count(
+                "2026-07-26T12:00:00.000Z",
+                input_tokens=100,
+                cached_input_tokens=60,
+                output_tokens=20,
+                total_tokens=120,
+            ),
+            token_count(
+                "2026-07-26T12:01:00.000Z",
+                input_tokens=180,
+                cached_input_tokens=100,
+                output_tokens=35,
+                reasoning_output_tokens=5,
+                total_tokens=215,
+            ),
+        ],
+    )
+    create_database(codex_home / "state.sqlite", [{"id": PARENT_ID, "rollout_path": rollout}])
+    module = load_rollout_sync()
+    monkeypatch.setattr(module, "MAX_CHUNK_BYTES", 73)
+
+    first = module.sync_rollouts(codex_home=codex_home)
+    state_dir = tmp_path / "logging"
+    records = queue_records(state_dir)
+    usage_record = next(record for record in records if record.get("type") == "usage")
+    detail = json.loads((state_dir / usage_record["local_content_path"]).read_text(encoding="utf-8"))
+    expected_id = module.deterministic_uuid(f"rollout-usage:v1:{PARENT_ID}")
+
+    assert first["queued"] == len(records)
+    assert usage_record["id"] == expected_id
+    assert usage_record["local_content_path"] == f"rollout-sync/usage/{PARENT_ID}.json"
+    assert usage_record["metadata"]["source"] == "rollout_sync_usage"
+    assert usage_record["metadata"]["source"] != "historical_transcript"
+    assert detail["input_tokens"] == 80
+    assert detail["cached_input_tokens"] == 100
+    assert detail["output_tokens"] == 30
+    assert detail["reasoning_output_tokens"] == 5
+    assert detail["total_tokens"] == 215
+    assert sum(
+        detail[key]
+        for key in (
+            "input_tokens",
+            "cached_input_tokens",
+            "output_tokens",
+            "reasoning_output_tokens",
+        )
+    ) == 215
+    assert detail["created_at"] == "2026-07-26T12:01:00.000Z"
+    assert detail["model_context_window"] == 258400
+    assert module.sync_rollouts(codex_home=codex_home)["queued"] == 0
+
+
+def test_sync_updates_one_usage_record_after_a_later_append(tmp_path):
+    codex_home = tmp_path / "codex"
+    rollout = tmp_path / "usage-append.jsonl"
+    write_rollout(
+        rollout,
+        session_id=PARENT_ID,
+        records=[
+            token_count(
+                "2026-07-26T12:00:00Z",
+                input_tokens=10,
+                cached_input_tokens=4,
+                output_tokens=2,
+                total_tokens=12,
+            ),
+        ],
+    )
+    create_database(codex_home / "state.sqlite", [{"id": PARENT_ID, "rollout_path": rollout}])
+    module = load_rollout_sync()
+    module.sync_rollouts(codex_home=codex_home)
+    first_record = next(
+        record for record in queue_records(tmp_path / "logging") if record.get("type") == "usage"
+    )
+
+    with rollout.open("ab") as handle:
+        handle.write(
+            json.dumps(
+                token_count(
+                    "2026-07-26T12:05:00Z",
+                    input_tokens=20,
+                    cached_input_tokens=9,
+                    output_tokens=4,
+                    total_tokens=24,
+                    model_context_window=None,
+                ),
+                separators=(",", ":"),
+            ).encode()
+            + b"\n"
+        )
+    result = module.sync_rollouts(
+        codex_home=codex_home,
+        hook_payload={"session_id": PARENT_ID, "transcript_path": str(rollout)},
+    )
+    records = queue_records(tmp_path / "logging")
+    usage_records = [record for record in records if record.get("type") == "usage"]
+    detail = json.loads(
+        (tmp_path / "logging" / usage_records[0]["local_content_path"]).read_text(encoding="utf-8")
+    )
+
+    assert result["queued"] == 2
+    assert len(usage_records) == 1
+    assert usage_records[0]["id"] == first_record["id"]
+    assert detail["total_tokens"] == 24
+    assert "model_context_window" not in detail
+
+
+def test_incremental_usage_parser_bounds_partial_lines_and_recovers():
+    module = load_rollout_sync()
+    module.MAX_USAGE_PARTIAL_BYTES = 8
+    entry = {"usage_partial_base64": "", "usage_skip_until_newline": False}
+
+    assert module.parse_incremental_usage(
+        entry,
+        b"123456789",
+        fallback_created_at="2026-07-26T00:00:00Z",
+    ) is None
+    assert entry == {"usage_partial_base64": "", "usage_skip_until_newline": True}
+
+    valid = json.dumps(
+        token_count(
+            "2026-07-26T00:01:00Z",
+            input_tokens=1,
+            cached_input_tokens=0,
+            output_tokens=1,
+            total_tokens=2,
+        ),
+        separators=(",", ":"),
+    ).encode()
+    module.MAX_USAGE_PARTIAL_BYTES = len(valid) + 1
+    usage = module.parse_incremental_usage(
+        entry,
+        b"discarded\n" + valid + b"\n",
+        fallback_created_at="2026-07-26T00:00:00Z",
+    )
+
+    assert usage is not None
+    assert usage["total_tokens"] == 2
+    assert entry["usage_skip_until_newline"] is False
+    assert base64.b64decode(entry["usage_partial_base64"]) == b""
+
+
 def test_sync_captures_exact_parent_and_subagent_rollout_bytes_once(tmp_path):
     codex_home = tmp_path / "codex"
     parent_path = tmp_path / "rollouts" / "parent.jsonl"

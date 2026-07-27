@@ -34,7 +34,7 @@ export async function handleRequest(req: Request): Promise<Response> {
   }
 
   try {
-    const tokenError = optionalIngestTokenError(req);
+    const tokenError = ingestTokenError(req);
     if (tokenError) {
       return tokenError;
     }
@@ -61,8 +61,8 @@ export async function handleRequest(req: Request): Promise<Response> {
       return await ingestRolloutChunk(payload, client, remote);
     }
 
-    const userId = await resolveUserId(client);
     if (payloadKind === "backfill_status") {
+      const userId = await resolveUserId(client);
       const backfill = requireObject(payload.backfill, "backfill");
       const observedAt = requireString(
         backfill.updated_at,
@@ -76,16 +76,20 @@ export async function handleRequest(req: Request): Promise<Response> {
     const record = requireObject(payload.record, "record");
     const recordType = optionalString(record.type) ?? "message";
     if (recordType === "usage") {
+      const usageTokenError = ingestTokenError(req, true);
+      if (usageTokenError) {
+        return usageTokenError;
+      }
       const usage = requireObject(payload.usage, "usage");
-      await upsertSessionUser(record, client, userId);
-      await upsertSession(record, client, userId, remote);
-      await upsertSessionUsage(record, userId, usage);
+      const usageParameters = sessionUsageParameters(record, usage);
+      await upsertSessionUsage(usageParameters);
       return jsonResponse({
         ok: true,
         id: record.id,
         kind: "usage",
       });
     }
+    const userId = await resolveUserId(client);
     const storagePath = storagePathForRecord(record, userId);
 
     if (recordType === "event") {
@@ -323,10 +327,12 @@ async function requestJson(req: Request): Promise<unknown> {
   }
 }
 
-function optionalIngestTokenError(req: Request): Response | null {
+function ingestTokenError(req: Request, required = false): Response | null {
   const expected = Deno.env.get("CODEX_SESSION_LOG_INGEST_TOKEN");
   if (!expected) {
-    return null;
+    return required
+      ? jsonResponse({ error: "usage_ingest_auth_not_configured" }, 503)
+      : null;
   }
   if (req.headers.get("x-codex-session-log-token") !== expected) {
     return jsonResponse({ error: "invalid_ingest_token" }, 401);
@@ -756,45 +762,65 @@ async function upsertMessage(
   await restUpsert("codex_session_messages", row, "id");
 }
 
-async function upsertSessionUsage(
+function sessionUsageParameters(
   record: JsonObject,
-  userId: string,
   usage: JsonObject,
-): Promise<void> {
+): JsonObject {
   const modelContextWindow = optionalNonNegativeInteger(
     usage.model_context_window,
   );
-  const row: JsonObject = {
-    session_id: requireString(record.session_id, "record.session_id"),
-    user_id: userId,
-    input_tokens: requireNonNegativeInteger(
-      usage.input_tokens,
-      "usage.input_tokens",
-    ),
-    cached_input_tokens: requireNonNegativeInteger(
-      usage.cached_input_tokens,
-      "usage.cached_input_tokens",
-    ),
-    output_tokens: requireNonNegativeInteger(
-      usage.output_tokens,
-      "usage.output_tokens",
-    ),
-    reasoning_output_tokens: requireNonNegativeInteger(
-      usage.reasoning_output_tokens,
-      "usage.reasoning_output_tokens",
-    ),
-    total_tokens: requireNonNegativeInteger(
-      usage.total_tokens,
-      "usage.total_tokens",
-    ),
-    observed_at: requireString(usage.created_at, "usage.created_at"),
-    metadata: optionalObject(usage.metadata),
-    updated_at: new Date().toISOString(),
-  };
-  if (modelContextWindow !== null) {
-    row.model_context_window = modelContextWindow;
+  const inputTokens = requireNonNegativeInteger(
+    usage.input_tokens,
+    "usage.input_tokens",
+  );
+  const cachedInputTokens = requireNonNegativeInteger(
+    usage.cached_input_tokens,
+    "usage.cached_input_tokens",
+  );
+  const outputTokens = requireNonNegativeInteger(
+    usage.output_tokens,
+    "usage.output_tokens",
+  );
+  const reasoningOutputTokens = requireNonNegativeInteger(
+    usage.reasoning_output_tokens,
+    "usage.reasoning_output_tokens",
+  );
+  const totalTokens = requireNonNegativeInteger(
+    usage.total_tokens,
+    "usage.total_tokens",
+  );
+  const componentTotal = inputTokens + cachedInputTokens + outputTokens +
+    reasoningOutputTokens;
+  if (!Number.isSafeInteger(componentTotal) || componentTotal !== totalTokens) {
+    throw new PayloadValidationError(
+      "usage token components must sum exactly to usage.total_tokens",
+    );
   }
-  await restUpsert("codex_session_usage", row, "session_id");
+  return {
+    p_session_id: requireString(record.session_id, "record.session_id"),
+    p_input_tokens: inputTokens,
+    p_cached_input_tokens: cachedInputTokens,
+    p_output_tokens: outputTokens,
+    p_reasoning_output_tokens: reasoningOutputTokens,
+    p_total_tokens: totalTokens,
+    p_model_context_window: modelContextWindow,
+    p_observed_at: requireString(usage.created_at, "usage.created_at"),
+    p_metadata: optionalObject(usage.metadata),
+  };
+}
+
+async function upsertSessionUsage(parameters: JsonObject): Promise<void> {
+  await supabaseFetch(
+    "/rest/v1/rpc/upsert_codex_session_usage_latest",
+    {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "prefer": "return=minimal",
+      },
+      body: JSON.stringify(parameters),
+    },
+  );
 }
 
 async function upsertEvent(
