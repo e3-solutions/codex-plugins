@@ -168,9 +168,9 @@ def test_backfill_queues_final_cumulative_token_usage(tmp_path, monkeypatch):
     payload = backfill.build_ingest_payload(usage_record, base=tmp_path / "state")
 
     assert result["queued"] == 3
-    assert payload["usage"]["input_tokens"] == 4090
+    assert payload["usage"]["input_tokens"] == 3066
     assert payload["usage"]["cached_input_tokens"] == 1024
-    assert payload["usage"]["output_tokens"] == 52
+    assert payload["usage"]["output_tokens"] == 44
     assert payload["usage"]["reasoning_output_tokens"] == 8
     assert payload["usage"]["total_tokens"] == 4142
     assert payload["usage"]["model_context_window"] == 258400

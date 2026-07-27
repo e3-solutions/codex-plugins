@@ -441,9 +441,9 @@ Deno.test("handleRequest still upserts non-backfill session token usage", async 
             metadata: { source: "live_session" },
           },
           usage: {
-            input_tokens: 4090,
+            input_tokens: 3066,
             cached_input_tokens: 1024,
-            output_tokens: 52,
+            output_tokens: 44,
             reasoning_output_tokens: 8,
             total_tokens: 4142,
             model_context_window: 258400,
@@ -459,18 +459,86 @@ Deno.test("handleRequest still upserts non-backfill session token usage", async 
     );
     const usageUpsert = requests.find((request) =>
       request.url.includes(
-        "/rest/v1/codex_session_usage?on_conflict=session_id",
+        "/rest/v1/rpc/upsert_codex_session_usage_latest",
       )
     );
 
     assertEquals(response.status, 200);
-    assertEquals(usageUpsert?.body?.session_id, "session-usage");
-    assertEquals(usageUpsert?.body?.input_tokens, 4090);
-    assertEquals(usageUpsert?.body?.cached_input_tokens, 1024);
-    assertEquals(usageUpsert?.body?.output_tokens, 52);
-    assertEquals(usageUpsert?.body?.reasoning_output_tokens, 8);
-    assertEquals(usageUpsert?.body?.total_tokens, 4142);
-    assertEquals(usageUpsert?.body?.model_context_window, 258400);
+    assertEquals(usageUpsert?.body?.p_session_id, "session-usage");
+    assertEquals(usageUpsert?.body?.p_input_tokens, 3066);
+    assertEquals(usageUpsert?.body?.p_cached_input_tokens, 1024);
+    assertEquals(usageUpsert?.body?.p_output_tokens, 44);
+    assertEquals(usageUpsert?.body?.p_reasoning_output_tokens, 8);
+    assertEquals(usageUpsert?.body?.p_total_tokens, 4142);
+    assertEquals(usageUpsert?.body?.p_model_context_window, 258400);
+    assertEquals(
+      usageUpsert?.body?.p_observed_at,
+      "2026-07-07T00:00:00.000Z",
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+    restoreEnv("SUPABASE_URL", previousUrl);
+    restoreEnv("SUPABASE_SERVICE_ROLE_KEY", previousServiceRole);
+  }
+});
+
+Deno.test("handleRequest rejects inconsistent usage before any write", async () => {
+  const requests: Array<{ url: string; method: string }> = [];
+  const originalFetch = globalThis.fetch;
+  const previousUrl = Deno.env.get("SUPABASE_URL");
+  const previousServiceRole = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
+
+  Deno.env.set("SUPABASE_URL", "https://project.supabase.co");
+  Deno.env.set("SUPABASE_SERVICE_ROLE_KEY", "service-role-key");
+  globalThis.fetch = async (input, init = {}) => {
+    const url = input instanceof Request
+      ? input.url
+      : input instanceof URL
+      ? input.toString()
+      : input;
+    const requestInit = init as { method?: string };
+    requests.push({ url, method: String(requestInit.method ?? "GET") });
+    return new Response(JSON.stringify([]), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  };
+
+  try {
+    const response = await handleRequest(
+      new Request("https://example.test/codex-session-ingest", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          version: 1,
+          record: {
+            id: "804fd832-7779-4665-9bec-2f10462c721b",
+            type: "usage",
+            session_id: "session-usage",
+            created_at: "2026-07-07T00:00:00.000Z",
+            metadata: { source: "live_session" },
+          },
+          usage: {
+            input_tokens: 10,
+            cached_input_tokens: 5,
+            output_tokens: 2,
+            reasoning_output_tokens: 1,
+            total_tokens: 17,
+            created_at: "2026-07-07T00:00:00.000Z",
+          },
+          client: {
+            repo_remote: "https://github.com/e3-solutions/codex-plugins.git",
+            installation_id: "install-1",
+          },
+        }),
+      }),
+    );
+
+    assertEquals(response.status, 400);
+    assertEquals(
+      requests.filter((request) => request.method !== "GET"),
+      [],
+    );
   } finally {
     globalThis.fetch = originalFetch;
     restoreEnv("SUPABASE_URL", previousUrl);

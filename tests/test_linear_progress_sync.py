@@ -3050,7 +3050,7 @@ def test_real_marketplace_activates_in_isolated_codex_home_and_passes_doctor(tmp
     assert health["healthy"] is True
     assert health["issues"] == []
     assert health["cache_versions"] == {
-        "codex-session-logging": ["0.2.7"],
+        "codex-session-logging": ["0.2.8"],
         "linear-progress-sync": ["0.3.7"],
     }
     assert subprocess.run(["sh", "-n", str(resident_root / "run.sh")], check=False).returncode == 0
@@ -4612,7 +4612,7 @@ def test_readmes_register_linear_mcp_before_linear_login():
         assert "every 30 minutes" in text
         assert "historical-backfill protections" in text
         assert "self-heal without rerunning setup" in text
-        assert "No new Supabase database migration is required" in text
+        assert "monotonic usage RPC migration" in text
         assert "LINEAR_SYNC_AUTO_UPDATE=0" in text
         assert "not a single plugin source" in text
         assert "Do not install the GitHub URL or repository root directly with `codex plugin add`" in text

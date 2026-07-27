@@ -77,9 +77,10 @@ export async function handleRequest(req: Request): Promise<Response> {
     const recordType = optionalString(record.type) ?? "message";
     if (recordType === "usage") {
       const usage = requireObject(payload.usage, "usage");
+      const usageParameters = sessionUsageParameters(record, userId, usage);
       await upsertSessionUser(record, client, userId);
       await upsertSession(record, client, userId, remote);
-      await upsertSessionUsage(record, userId, usage);
+      await upsertSessionUsage(usageParameters);
       return jsonResponse({
         ok: true,
         id: record.id,
@@ -756,45 +757,67 @@ async function upsertMessage(
   await restUpsert("codex_session_messages", row, "id");
 }
 
-async function upsertSessionUsage(
+function sessionUsageParameters(
   record: JsonObject,
   userId: string,
   usage: JsonObject,
-): Promise<void> {
+): JsonObject {
   const modelContextWindow = optionalNonNegativeInteger(
     usage.model_context_window,
   );
-  const row: JsonObject = {
-    session_id: requireString(record.session_id, "record.session_id"),
-    user_id: userId,
-    input_tokens: requireNonNegativeInteger(
-      usage.input_tokens,
-      "usage.input_tokens",
-    ),
-    cached_input_tokens: requireNonNegativeInteger(
-      usage.cached_input_tokens,
-      "usage.cached_input_tokens",
-    ),
-    output_tokens: requireNonNegativeInteger(
-      usage.output_tokens,
-      "usage.output_tokens",
-    ),
-    reasoning_output_tokens: requireNonNegativeInteger(
-      usage.reasoning_output_tokens,
-      "usage.reasoning_output_tokens",
-    ),
-    total_tokens: requireNonNegativeInteger(
-      usage.total_tokens,
-      "usage.total_tokens",
-    ),
-    observed_at: requireString(usage.created_at, "usage.created_at"),
-    metadata: optionalObject(usage.metadata),
-    updated_at: new Date().toISOString(),
-  };
-  if (modelContextWindow !== null) {
-    row.model_context_window = modelContextWindow;
+  const inputTokens = requireNonNegativeInteger(
+    usage.input_tokens,
+    "usage.input_tokens",
+  );
+  const cachedInputTokens = requireNonNegativeInteger(
+    usage.cached_input_tokens,
+    "usage.cached_input_tokens",
+  );
+  const outputTokens = requireNonNegativeInteger(
+    usage.output_tokens,
+    "usage.output_tokens",
+  );
+  const reasoningOutputTokens = requireNonNegativeInteger(
+    usage.reasoning_output_tokens,
+    "usage.reasoning_output_tokens",
+  );
+  const totalTokens = requireNonNegativeInteger(
+    usage.total_tokens,
+    "usage.total_tokens",
+  );
+  const componentTotal = inputTokens + cachedInputTokens + outputTokens +
+    reasoningOutputTokens;
+  if (!Number.isSafeInteger(componentTotal) || componentTotal !== totalTokens) {
+    throw new PayloadValidationError(
+      "usage token components must sum exactly to usage.total_tokens",
+    );
   }
-  await restUpsert("codex_session_usage", row, "session_id");
+  return {
+    p_session_id: requireString(record.session_id, "record.session_id"),
+    p_user_id: userId,
+    p_input_tokens: inputTokens,
+    p_cached_input_tokens: cachedInputTokens,
+    p_output_tokens: outputTokens,
+    p_reasoning_output_tokens: reasoningOutputTokens,
+    p_total_tokens: totalTokens,
+    p_model_context_window: modelContextWindow,
+    p_observed_at: requireString(usage.created_at, "usage.created_at"),
+    p_metadata: optionalObject(usage.metadata),
+  };
+}
+
+async function upsertSessionUsage(parameters: JsonObject): Promise<void> {
+  await supabaseFetch(
+    "/rest/v1/rpc/upsert_codex_session_usage_latest",
+    {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "prefer": "return=minimal",
+      },
+      body: JSON.stringify(parameters),
+    },
+  );
 }
 
 async function upsertEvent(
