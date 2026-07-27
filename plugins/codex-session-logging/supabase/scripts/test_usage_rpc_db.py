@@ -27,6 +27,11 @@ CAPABILITY_MIGRATION = (
     / "migrations"
     / "20260727145505_bind_codex_session_installation_capability.sql"
 )
+CAPABILITY_ACL_MIGRATION = (
+    Path(__file__).resolve().parents[1]
+    / "migrations"
+    / "20260727153053_revoke_codex_session_binding_execute.sql"
+)
 RPC = """
 select public.upsert_codex_session_usage_latest(
   %s, %s, %s, %s, %s, %s, %s, %s, %s
@@ -144,6 +149,26 @@ def main() -> None:
             )
             connection.execute(USAGE_MIGRATION.read_text())
             connection.execute(CAPABILITY_MIGRATION.read_text())
+            connection.execute(
+                """
+                grant execute
+                on function public.preserve_codex_session_binding()
+                to public, anon, authenticated, service_role
+                """
+            )
+            connection.execute(CAPABILITY_ACL_MIGRATION.read_text())
+
+            trigger_signature = "public.preserve_codex_session_binding()"
+            trigger_privileges = connection.execute(
+                """
+                select
+                  has_function_privilege('anon', %s, 'execute'),
+                  has_function_privilege('authenticated', %s, 'execute'),
+                  has_function_privilege('service_role', %s, 'execute')
+                """,
+                (trigger_signature, trigger_signature, trigger_signature),
+            ).fetchone()
+            assert trigger_privileges == (False, False, False), trigger_privileges
 
             bindings = dict(
                 connection.execute(
