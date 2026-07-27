@@ -313,6 +313,33 @@ def test_incremental_usage_parser_bounds_partial_lines_and_recovers():
     assert base64.b64decode(entry["usage_partial_base64"]) == b""
 
 
+def test_incremental_usage_parser_accepts_valid_final_line_without_newline():
+    module = load_rollout_sync()
+    envelope = json.dumps(
+        token_count(
+            "2026-07-26T00:01:00Z",
+            input_tokens=8,
+            cached_input_tokens=3,
+            output_tokens=2,
+            total_tokens=10,
+        ),
+        separators=(",", ":"),
+    ).encode()
+    entry = {"usage_partial_base64": "", "usage_skip_until_newline": False}
+
+    usage = module.parse_incremental_usage(
+        entry,
+        envelope,
+        fallback_created_at="2026-07-26T00:00:00Z",
+        at_stable_end=True,
+    )
+
+    assert usage is not None
+    assert usage["input_tokens"] == 5
+    assert usage["cached_input_tokens"] == 3
+    assert usage["total_tokens"] == 10
+
+
 def test_sync_captures_exact_parent_and_subagent_rollout_bytes_once(tmp_path):
     codex_home = tmp_path / "codex"
     parent_path = tmp_path / "rollouts" / "parent.jsonl"

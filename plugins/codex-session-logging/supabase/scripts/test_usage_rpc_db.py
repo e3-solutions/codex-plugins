@@ -32,6 +32,11 @@ CAPABILITY_ACL_MIGRATION = (
     / "migrations"
     / "20260727153053_revoke_codex_session_binding_execute.sql"
 )
+REPAIR_MIGRATION = (
+    Path(__file__).resolve().parents[1]
+    / "migrations"
+    / "20260727193553_repair_additive_session_usage.sql"
+)
 RPC = """
 select public.upsert_codex_session_usage_latest(
   %s, %s, %s, %s, %s, %s, %s, %s, %s
@@ -96,6 +101,13 @@ def main() -> None:
         inserted_capability = hashlib.sha256(
             inserted_installation_id.encode()
         ).hexdigest()
+        historical_repair = str(uuid.uuid4())
+        transcript_repair = str(uuid.uuid4())
+        transcript_other_agent = str(uuid.uuid4())
+        transcript_oversized_cache = str(uuid.uuid4())
+        unknown_source = str(uuid.uuid4())
+        historical_near_miss = str(uuid.uuid4())
+        repair_owner = uuid.uuid4()
         with psycopg.connect(test_url, autocommit=True) as connection:
             connection.execute(
                 """
@@ -147,7 +159,144 @@ def main() -> None:
                     ),
                 ),
             )
+            connection.execute(
+                """
+                insert into public.codex_sessions (id, user_id)
+                values
+                  (%s, %s), (%s, %s), (%s, %s), (%s, %s), (%s, %s),
+                  (%s, %s)
+                """,
+                (
+                    historical_repair,
+                    repair_owner,
+                    transcript_repair,
+                    repair_owner,
+                    transcript_other_agent,
+                    repair_owner,
+                    transcript_oversized_cache,
+                    repair_owner,
+                    unknown_source,
+                    repair_owner,
+                    historical_near_miss,
+                    repair_owner,
+                ),
+            )
+            connection.execute(
+                """
+                insert into public.codex_session_usage (
+                  session_id, user_id, input_tokens, cached_input_tokens,
+                  output_tokens, reasoning_output_tokens, total_tokens,
+                  observed_at, metadata
+                ) values
+                  (%s, %s, 90, 60, 10, 2, 100, %s, %s),
+                  (%s, %s, 100, 30, 20, 0, 160, %s, %s),
+                  (%s, %s, 100, 30, 20, 0, 160, %s, %s),
+                  (%s, %s, 100, 30, 20, 0, 160, %s, %s),
+                  (%s, %s, 90, 60, 10, 2, 100, %s, %s),
+                  (%s, %s, 90, 60, 10, 2, 101, %s, %s)
+                """,
+                (
+                    historical_repair,
+                    repair_owner,
+                    "2026-07-27T09:00:00Z",
+                    Jsonb({"source": "historical_transcript", "agent": "codex"}),
+                    transcript_repair,
+                    repair_owner,
+                    "2026-07-27T09:00:00Z",
+                    Jsonb(
+                        {
+                            "source": "transcript_sync",
+                            "agent": "claude",
+                            "cache_creation_input_tokens": 10,
+                        }
+                    ),
+                    transcript_other_agent,
+                    repair_owner,
+                    "2026-07-27T09:00:00Z",
+                    Jsonb(
+                        {
+                            "source": "transcript_sync",
+                            "agent": "codex",
+                            "cache_creation_input_tokens": 10,
+                        }
+                    ),
+                    transcript_oversized_cache,
+                    repair_owner,
+                    "2026-07-27T09:00:00Z",
+                    Jsonb(
+                        {
+                            "source": "transcript_sync",
+                            "agent": "claude",
+                            "cache_creation_input_tokens": "9" * 20,
+                        }
+                    ),
+                    unknown_source,
+                    repair_owner,
+                    "2026-07-27T09:00:00Z",
+                    Jsonb({"source": "unknown"}),
+                    historical_near_miss,
+                    repair_owner,
+                    "2026-07-27T09:00:00Z",
+                    Jsonb({"source": "historical_transcript", "agent": "codex"}),
+                ),
+            )
             connection.execute(USAGE_MIGRATION.read_text())
+            connection.execute(REPAIR_MIGRATION.read_text())
+            connection.execute(REPAIR_MIGRATION.read_text())
+            repaired_rows = {
+                row[0]: row[1:]
+                for row in connection.execute(
+                    """
+                    select
+                      session_id, user_id, input_tokens, cached_input_tokens,
+                      output_tokens, reasoning_output_tokens, total_tokens,
+                      observed_at
+                    from public.codex_session_usage
+                    where session_id in (%s, %s, %s, %s, %s, %s)
+                    """,
+                    (
+                        historical_repair,
+                        transcript_repair,
+                        transcript_other_agent,
+                        transcript_oversized_cache,
+                        unknown_source,
+                        historical_near_miss,
+                    ),
+                ).fetchall()
+            }
+            observed = repaired_rows[historical_repair][-1]
+            assert repaired_rows == {
+                historical_repair: (repair_owner, 30, 60, 8, 2, 100, observed),
+                transcript_repair: (repair_owner, 100, 30, 20, 0, 150, observed),
+                transcript_other_agent: (
+                    repair_owner,
+                    100,
+                    30,
+                    20,
+                    0,
+                    160,
+                    observed,
+                ),
+                transcript_oversized_cache: (
+                    repair_owner,
+                    100,
+                    30,
+                    20,
+                    0,
+                    160,
+                    observed,
+                ),
+                unknown_source: (repair_owner, 90, 60, 10, 2, 100, observed),
+                historical_near_miss: (
+                    repair_owner,
+                    90,
+                    60,
+                    10,
+                    2,
+                    101,
+                    observed,
+                ),
+            }, repaired_rows
             connection.execute(CAPABILITY_MIGRATION.read_text())
             connection.execute(
                 """
