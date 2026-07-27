@@ -62,7 +62,8 @@ def main() -> None:
         missing_roles = admin.execute(
             """
             select role_name
-            from unnest(array['anon', 'authenticated', 'service_role']) role_name
+            from unnest(array['anon', 'authenticated', 'service_role'])
+              as roles(role_name)
             where not exists (select from pg_roles where rolname = role_name)
             """
         ).fetchall()
