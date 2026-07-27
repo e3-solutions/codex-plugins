@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -28,9 +29,22 @@ MAX_EVENTS_PER_SESSION = 5000
 DEFAULT_PAGE_SIZE = 200
 DEFAULT_LOOKBACK_HOURS = 72
 DEFAULT_MAX_SESSIONS = 500
+STORAGE_GET_ATTEMPTS = 3
+STORAGE_GET_BACKOFF_SECONDS = (0.25, 0.5)
+REPLAY_CHUNK_METADATA_FIELDS = (
+    "file_generation",
+    "start_offset",
+    "end_offset",
+    "content_byte_size",
+    "content_sha256",
+)
 
 
 class ReplayError(RuntimeError):
+    pass
+
+
+class TransientRequestError(ReplayError):
     pass
 
 
@@ -89,11 +103,18 @@ class SupabaseAdminClient:
         quoted_path = "/".join(
             urllib.parse.quote(piece, safe="") for piece in storage_path.split("/")
         )
-        return self.request_bytes(
-            "GET",
+        path = (
             "/storage/v1/object/authenticated/"
-            f"{urllib.parse.quote(bucket, safe='')}/{quoted_path}",
+            f"{urllib.parse.quote(bucket, safe='')}/{quoted_path}"
         )
+        for attempt in range(STORAGE_GET_ATTEMPTS):
+            try:
+                return self.request_bytes("GET", path)
+            except TransientRequestError:
+                if attempt + 1 == STORAGE_GET_ATTEMPTS:
+                    raise
+                time.sleep(STORAGE_GET_BACKOFF_SECONDS[attempt])
+        raise AssertionError("unreachable")
 
     def upsert_usage(self, parameters: JsonDict) -> None:
         self.request_json(
@@ -142,12 +163,22 @@ class SupabaseAdminClient:
             with urllib.request.urlopen(request, timeout=60) as response:
                 return response.read()
         except urllib.error.HTTPError as exc:
-            raise ReplayError(
+            error_type = TransientRequestError if 500 <= exc.code < 600 else ReplayError
+            raise error_type(
                 f"Supabase request failed {exc.code} for {safe_endpoint(path)}"
             ) from exc
         except urllib.error.URLError as exc:
-            raise ReplayError(
+            error_type = (
+                TransientRequestError
+                if isinstance(exc.reason, (ConnectionError, TimeoutError))
+                else ReplayError
+            )
+            raise error_type(
                 f"Supabase request failed for {safe_endpoint(path)}: {exc.reason}"
+            ) from exc
+        except (ConnectionError, TimeoutError) as exc:
+            raise TransientRequestError(
+                f"Supabase request failed for {safe_endpoint(path)}"
             ) from exc
 
 
@@ -219,20 +250,32 @@ def reprocess_rollout_usage(
     since_text = iso_timestamp(cutoff_time - timedelta(hours=lookback_hours))
 
     event_count = generation_count = session_count = sessions_with_usage = rpc_calls = 0
+    legacy_events_quarantined = legacy_sessions_quarantined = 0
     errors: list[str] = []
     resume_after_session = after_session
     current_session: str | None = None
     current_rows: list[JsonDict] = []
+    current_legacy_events = 0
     current_overflow = False
     truncated = False
     stopped = False
 
     def process_current() -> bool:
         nonlocal generation_count, session_count, sessions_with_usage, rpc_calls
+        nonlocal legacy_events_quarantined, legacy_sessions_quarantined
         nonlocal resume_after_session
         if current_session is None:
             return True
         session_count += 1
+        if current_legacy_events:
+            legacy_events_quarantined += current_legacy_events
+            legacy_sessions_quarantined += 1
+            errors.append(
+                f"session {current_session} contains {current_legacy_events} "
+                "legacy rollout events without replay metadata"
+            )
+            resume_after_session = current_session
+            return True
         if current_overflow:
             errors.append(
                 f"session {current_session} exceeds {MAX_EVENTS_PER_SESSION} rollout events"
@@ -261,7 +304,7 @@ def reprocess_rollout_usage(
         cutoff=cutoff_text,
         after_session=after_session,
     ):
-        session_id, _ = chunk_identity(row)
+        session_id = event_session_id(row)
         if current_session is not None and session_id != current_session:
             if not process_current():
                 stopped = True
@@ -271,10 +314,13 @@ def reprocess_rollout_usage(
                 stopped = True
                 break
             current_rows = []
+            current_legacy_events = 0
             current_overflow = False
         current_session = session_id
         event_count += 1
-        if len(current_rows) < MAX_EVENTS_PER_SESSION:
+        if is_legacy_rollout_event(row):
+            current_legacy_events += 1
+        elif len(current_rows) < MAX_EVENTS_PER_SESSION:
             current_rows.append(row)
         else:
             current_overflow = True
@@ -290,6 +336,8 @@ def reprocess_rollout_usage(
         "sessions": session_count,
         "sessions_with_usage": sessions_with_usage,
         "rpc_calls": rpc_calls,
+        "legacy_events_quarantined": legacy_events_quarantined,
+        "legacy_sessions_quarantined": legacy_sessions_quarantined,
         "errors": errors,
         "resume_after_session": resume_after_session,
         "truncated": truncated,
@@ -428,9 +476,20 @@ def cursor_filter(cursor: tuple[str, str]) -> str:
 
 
 def chunk_identity(row: JsonDict) -> tuple[str, str]:
-    session_id = required_string(row.get("session_id"), "session_id")
+    session_id = event_session_id(row)
     metadata = required_object(row.get("metadata"), f"session {session_id} metadata")
     return session_id, required_string(metadata.get("file_generation"), "file_generation")
+
+
+def event_session_id(row: JsonDict) -> str:
+    return required_string(row.get("session_id"), "session_id")
+
+
+def is_legacy_rollout_event(row: JsonDict) -> bool:
+    metadata = row.get("metadata")
+    return isinstance(metadata, dict) and all(
+        field not in metadata for field in REPLAY_CHUNK_METADATA_FIELDS
+    )
 
 
 def parse_timestamp(value: str) -> datetime:
