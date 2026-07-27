@@ -9,8 +9,8 @@ import sys
 import urllib.error
 import urllib.parse
 import urllib.request
-import uuid
 from collections import defaultdict
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -24,7 +24,10 @@ from rollout_usage import parse_cumulative_usage, usage_is_newer  # noqa: E402
 
 JsonDict = dict[str, Any]
 MAX_PARTIAL_LINE_BYTES = 1024 * 1024
-DEFAULT_PAGE_SIZE = 500
+MAX_EVENTS_PER_SESSION = 5000
+DEFAULT_PAGE_SIZE = 200
+DEFAULT_LOOKBACK_HOURS = 72
+DEFAULT_MAX_SESSIONS = 500
 
 
 class ReplayError(RuntimeError):
@@ -43,87 +46,53 @@ class SupabaseAdminClient:
             raise ReplayError("SUPABASE_URL is required")
         return cls(url, service_role_key())
 
-    def create_rollout_replay_snapshot(self) -> tuple[str, int]:
-        rows = self.request_json(
-            "POST",
-            "/rest/v1/rpc/create_codex_rollout_replay_snapshot",
-            {},
-        )
-        if not isinstance(rows, list) or len(rows) != 1:
-            raise ReplayError("snapshot RPC response must contain exactly one row")
-        row = required_object(rows[0], "snapshot RPC row")
-        return (
-            required_uuid(row.get("snapshot_id"), "snapshot_id"),
-            non_negative_integer(row.get("event_count"), "snapshot event_count"),
-        )
-
-    def rollout_replay_snapshot_event_count(self, snapshot_id: str) -> int:
-        filters = [
-            ("select", "event_count"),
-            ("snapshot_id", f"eq.{required_uuid(snapshot_id, 'snapshot_id')}"),
-            ("limit", "1"),
-        ]
-        rows = self.request_json(
-            "GET",
-            "/rest/v1/codex_rollout_replay_snapshots?"
-            + urllib.parse.urlencode(filters),
-        )
-        if not isinstance(rows, list):
-            raise ReplayError("snapshot lookup response must be a JSON array")
-        if not rows:
-            raise ReplayError(f"rollout replay snapshot {snapshot_id} does not exist")
-        row = required_object(rows[0], "snapshot lookup row")
-        return non_negative_integer(row.get("event_count"), "snapshot event_count")
-
     def iter_rollout_events(
         self,
         *,
         page_size: int,
+        since: str,
+        cutoff: str,
         after_session: str | None,
-        snapshot_id: str,
     ) -> Iterator[JsonDict]:
-        snapshot_id = required_uuid(snapshot_id, "snapshot_id")
         cursor: tuple[str, str] | None = None
         while True:
             filters = [
-                (
-                    "select",
-                    "id,session_id,user_id,storage_bucket,storage_path,metadata",
-                ),
-                ("snapshot_id", f"eq.{snapshot_id}"),
+                ("select", "id,session_id,storage_bucket,storage_path,metadata"),
+                ("event_type", "eq.rollout_chunk"),
+                ("created_at", f"gte.{since}"),
+                ("created_at", f"lte.{cutoff}"),
                 ("order", "session_id.asc,id.asc"),
                 ("limit", str(page_size)),
             ]
             if after_session:
                 filters.append(("session_id", f"gt.{after_session}"))
-            if cursor is not None:
+            if cursor:
                 filters.append(("or", cursor_filter(cursor)))
-            path = (
-                "/rest/v1/codex_rollout_replay_snapshot_events?"
-                + urllib.parse.urlencode(filters)
+            rows = self.request_json(
+                "GET",
+                "/rest/v1/codex_session_events?" + urllib.parse.urlencode(filters),
             )
-            rows = self.request_json("GET", path)
             if not isinstance(rows, list):
-                raise ReplayError("snapshot events response must be a JSON array")
+                raise ReplayError("rollout event response must be a JSON array")
             for row in rows:
                 if not isinstance(row, dict):
-                    raise ReplayError("snapshot event row must be a JSON object")
+                    raise ReplayError("rollout event row must be a JSON object")
                 yield row
             if len(rows) < page_size:
                 return
             next_cursor = event_cursor(rows[-1])
             if next_cursor == cursor:
-                raise ReplayError("snapshot event keyset cursor did not advance")
+                raise ReplayError("rollout event keyset cursor did not advance")
             cursor = next_cursor
 
     def download(self, bucket: str, storage_path: str) -> bytes:
         quoted_path = "/".join(
             urllib.parse.quote(piece, safe="") for piece in storage_path.split("/")
         )
-        quoted_bucket = urllib.parse.quote(bucket, safe="")
         return self.request_bytes(
             "GET",
-            f"/storage/v1/object/authenticated/{quoted_bucket}/{quoted_path}",
+            "/storage/v1/object/authenticated/"
+            f"{urllib.parse.quote(bucket, safe='')}/{quoted_path}",
         )
 
     def upsert_usage(self, parameters: JsonDict) -> None:
@@ -139,7 +108,7 @@ class SupabaseAdminClient:
         path: str,
         payload: JsonDict | None = None,
     ) -> object:
-        body = None if payload is None else json.dumps(payload).encode("utf-8")
+        body = None if payload is None else json.dumps(payload).encode()
         raw = self.request_bytes(
             method,
             path,
@@ -167,10 +136,7 @@ class SupabaseAdminClient:
         if content_type:
             headers["content-type"] = content_type
         request = urllib.request.Request(
-            f"{self.url}{path}",
-            method=method,
-            data=body,
-            headers=headers,
+            f"{self.url}{path}", method=method, data=body, headers=headers
         )
         try:
             with urllib.request.urlopen(request, timeout=60) as response:
@@ -202,25 +168,21 @@ class UsageJsonlStream:
         pieces = (self.partial + content).split(b"\n")
         self.partial = b""
         for line in pieces[:-1]:
-            self._parse_line(line)
+            if not line.strip() or len(line) > MAX_PARTIAL_LINE_BYTES:
+                continue
+            try:
+                envelope = json.loads(line.decode())
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                continue
+            if isinstance(envelope, dict):
+                usage = parse_cumulative_usage(envelope)
+                if usage is not None and usage_is_newer(usage, self.latest):
+                    self.latest = usage
         tail = pieces[-1]
         if len(tail) <= MAX_PARTIAL_LINE_BYTES:
             self.partial = tail
         else:
             self.skip_until_newline = True
-
-    def _parse_line(self, line: bytes) -> None:
-        if not line.strip() or len(line) > MAX_PARTIAL_LINE_BYTES:
-            return
-        try:
-            envelope = json.loads(line.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError):
-            return
-        if not isinstance(envelope, dict):
-            return
-        usage = parse_cumulative_usage(envelope)
-        if usage is not None and usage_is_newer(usage, self.latest):
-            self.latest = usage
 
 
 def service_role_key() -> str:
@@ -234,9 +196,9 @@ def service_role_key() -> str:
         except json.JSONDecodeError as exc:
             raise ReplayError("SUPABASE_SECRET_KEYS must be valid JSON") from exc
         if isinstance(parsed, dict) and isinstance(parsed.get("default"), str):
-            value = parsed["default"].strip()
-            if value:
-                return value
+            key = parsed["default"].strip()
+            if key:
+                return key
     raise ReplayError("SUPABASE_SERVICE_ROLE_KEY or SUPABASE_SECRET_KEYS.default is required")
 
 
@@ -245,74 +207,84 @@ def reprocess_rollout_usage(
     *,
     apply: bool = False,
     page_size: int = DEFAULT_PAGE_SIZE,
+    lookback_hours: int = DEFAULT_LOOKBACK_HOURS,
+    max_sessions: int = DEFAULT_MAX_SESSIONS,
     after_session: str | None = None,
-    snapshot_id: str | None = None,
+    cutoff: str | None = None,
 ) -> JsonDict:
-    if after_session is not None and snapshot_id is None:
-        raise ReplayError("--after-session requires --snapshot-id")
-    if snapshot_id is None:
-        snapshot_id, snapshot_event_count = client.create_rollout_replay_snapshot()
-    else:
-        snapshot_id = required_uuid(snapshot_id, "snapshot_id")
-        snapshot_event_count = client.rollout_replay_snapshot_event_count(snapshot_id)
+    if page_size < 1 or lookback_hours < 1 or max_sessions < 1:
+        raise ReplayError("page size, lookback hours, and max sessions must be positive")
+    cutoff_time = parse_timestamp(cutoff) if cutoff else datetime.now(timezone.utc)
+    cutoff_text = iso_timestamp(cutoff_time)
+    since_text = iso_timestamp(cutoff_time - timedelta(hours=lookback_hours))
 
-    event_count = 0
-    generation_count = 0
-    session_count = 0
-    sessions_with_usage = 0
-    rpc_calls = 0
+    event_count = generation_count = session_count = sessions_with_usage = rpc_calls = 0
     errors: list[str] = []
     resume_after_session = after_session
-    checkpoint_blocked = False
     current_session: str | None = None
     current_rows: list[JsonDict] = []
+    current_overflow = False
+    truncated = False
+    stopped = False
 
-    def process_current_session() -> None:
-        nonlocal generation_count, session_count, sessions_with_usage
-        nonlocal rpc_calls, resume_after_session, checkpoint_blocked
+    def process_current() -> bool:
+        nonlocal generation_count, session_count, sessions_with_usage, rpc_calls
+        nonlocal resume_after_session
         if current_session is None:
-            return
+            return True
         session_count += 1
-        result = reprocess_session(
-            client,
-            session_id=current_session,
-            rows=current_rows,
-        )
+        if current_overflow:
+            errors.append(
+                f"session {current_session} exceeds {MAX_EVENTS_PER_SESSION} rollout events"
+            )
+            return False
+        result = reprocess_session(client, session_id=current_session, rows=current_rows)
         generation_count += result["generations"]
         if result["errors"]:
             errors.extend(result["errors"])
-            checkpoint_blocked = True
-            return
-        usage = result.get("usage")
-        if usage is not None:
+            return False
+        if result["usage"] is not None:
             sessions_with_usage += 1
             if apply:
                 try:
                     client.upsert_usage(result["parameters"])
                 except ReplayError as exc:
                     errors.append(str(exc))
-                    checkpoint_blocked = True
-                    return
+                    return False
                 rpc_calls += 1
-        if not checkpoint_blocked:
-            resume_after_session = current_session
+        resume_after_session = current_session
+        return True
 
     for row in client.iter_rollout_events(
-        page_size=max(1, page_size),
+        page_size=page_size,
+        since=since_text,
+        cutoff=cutoff_text,
         after_session=after_session,
-        snapshot_id=snapshot_id,
     ):
-        session_id, _generation = chunk_identity(row)
+        session_id, _ = chunk_identity(row)
         if current_session is not None and session_id != current_session:
-            process_current_session()
+            if not process_current():
+                stopped = True
+                break
+            if session_count >= max_sessions:
+                truncated = True
+                stopped = True
+                break
             current_rows = []
+            current_overflow = False
         current_session = session_id
-        current_rows.append(row)
         event_count += 1
-    process_current_session()
+        if len(current_rows) < MAX_EVENTS_PER_SESSION:
+            current_rows.append(row)
+        else:
+            current_overflow = True
+    if not stopped:
+        process_current()
 
     return {
         "mode": "apply" if apply else "dry-run",
+        "since": since_text,
+        "cutoff": cutoff_text,
         "events": event_count,
         "generations": generation_count,
         "sessions": session_count,
@@ -320,8 +292,7 @@ def reprocess_rollout_usage(
         "rpc_calls": rpc_calls,
         "errors": errors,
         "resume_after_session": resume_after_session,
-        "snapshot_id": snapshot_id,
-        "snapshot_event_count": snapshot_event_count,
+        "truncated": truncated,
     }
 
 
@@ -335,14 +306,14 @@ def reprocess_session(
     for row in rows:
         row_session, generation = chunk_identity(row)
         if row_session != session_id:
-            raise ReplayError("session-group ordering changed during replay")
+            raise ReplayError("session grouping changed during replay")
         by_generation[generation].append(row)
 
-    latest: tuple[str, JsonDict, str] | None = None
+    latest: tuple[JsonDict, str] | None = None
     errors: list[str] = []
     for generation, generation_rows in sorted(by_generation.items()):
         try:
-            user_id, usage = usage_from_generation(
+            usage = usage_from_generation(
                 client,
                 session_id=session_id,
                 generation=generation,
@@ -351,52 +322,21 @@ def reprocess_session(
         except ReplayError as exc:
             errors.append(str(exc))
             continue
-        if usage is not None and (
-            latest is None or usage_is_newer(usage, latest[1])
-        ):
-            latest = (user_id, usage, generation)
+        if usage is not None and (latest is None or usage_is_newer(usage, latest[0])):
+            latest = (usage, generation)
 
     result: JsonDict = {
         "generations": len(by_generation),
         "errors": errors,
-        "usage": latest[1] if latest is not None else None,
+        "usage": latest[0] if latest else None,
     }
-    if latest is not None and not errors:
-        user_id, usage, generation = latest
+    if latest and not errors:
         result["parameters"] = usage_rpc_parameters(
             session_id=session_id,
-            user_id=user_id,
-            generation=generation,
-            usage=usage,
+            generation=latest[1],
+            usage=latest[0],
         )
     return result
-
-
-def event_cursor(row: object) -> tuple[str, str]:
-    event = required_object(row, "rollout event")
-    return (
-        required_string(event.get("session_id"), "cursor session_id"),
-        required_uuid(event.get("id"), "cursor id"),
-    )
-
-
-def cursor_filter(cursor: tuple[str, str]) -> str:
-    session_id, event_id = cursor
-    return (
-        f"(session_id.gt.{session_id},"
-        f"and(session_id.eq.{session_id},"
-        f"id.gt.{event_id}))"
-    )
-
-
-def chunk_identity(row: JsonDict) -> tuple[str, str]:
-    session_id = required_string(row.get("session_id"), "session_id")
-    metadata = required_object(row.get("metadata"), f"session {session_id} metadata")
-    generation = required_string(
-        metadata.get("file_generation"),
-        f"session {session_id} file_generation",
-    )
-    return session_id, generation
 
 
 def usage_from_generation(
@@ -405,11 +345,10 @@ def usage_from_generation(
     session_id: str,
     generation: str,
     rows: list[JsonDict],
-) -> tuple[str, JsonDict | None]:
+) -> JsonDict | None:
     chunks = [validated_chunk(row, session_id, generation) for row in rows]
     chunks.sort(key=lambda chunk: (chunk["start_offset"], chunk["end_offset"]))
     expected_offset = 0
-    user_id: str | None = None
     stream = UsageJsonlStream()
     seen_ranges: dict[tuple[int, int], str] = {}
     for chunk in chunks:
@@ -426,61 +365,29 @@ def usage_from_generation(
                 generation,
                 f"non-contiguous offset at {chunk['start_offset']}, expected {expected_offset}",
             )
-        if user_id is not None and user_id != chunk["user_id"]:
-            raise generation_error(session_id, generation, "multiple user ids")
-        user_id = chunk["user_id"]
         content = client.download(chunk["storage_bucket"], chunk["storage_path"])
         if len(content) != chunk["content_byte_size"]:
-            raise generation_error(
-                session_id,
-                generation,
-                f"byte-size mismatch at offset {chunk['start_offset']}",
-            )
+            raise generation_error(session_id, generation, "stored byte size does not match")
         if hashlib.sha256(content).hexdigest() != chunk["content_sha256"]:
-            raise generation_error(
-                session_id,
-                generation,
-                f"SHA-256 mismatch at offset {chunk['start_offset']}",
-            )
+            raise generation_error(session_id, generation, "stored SHA-256 does not match")
         stream.feed(content)
         expected_offset = chunk["end_offset"]
-    if user_id is None:
-        raise generation_error(session_id, generation, "has no chunks")
-    return user_id, stream.latest
+    return stream.latest
 
 
 def validated_chunk(row: JsonDict, session_id: str, generation: str) -> JsonDict:
     metadata = required_object(row.get("metadata"), f"session {session_id} metadata")
-    start = non_negative_integer(
-        metadata.get("start_offset"),
-        f"session {session_id} start_offset",
-    )
-    end = non_negative_integer(
-        metadata.get("end_offset"),
-        f"session {session_id} end_offset",
-    )
-    size = non_negative_integer(
-        metadata.get("content_byte_size"),
-        f"session {session_id} content_byte_size",
-    )
+    start = non_negative_integer(metadata.get("start_offset"), "start_offset")
+    end = non_negative_integer(metadata.get("end_offset"), "end_offset")
+    size = non_negative_integer(metadata.get("content_byte_size"), "content_byte_size")
     if end <= start or size != end - start:
         raise generation_error(session_id, generation, "invalid offset range or byte size")
-    digest = required_string(
-        metadata.get("content_sha256"),
-        f"session {session_id} content_sha256",
-    )
-    if len(digest) != 64 or any(character not in "0123456789abcdef" for character in digest):
+    digest = required_string(metadata.get("content_sha256"), "content_sha256")
+    if len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest):
         raise generation_error(session_id, generation, "invalid SHA-256 metadata")
     return {
-        "user_id": required_string(row.get("user_id"), f"session {session_id} user_id"),
-        "storage_bucket": required_string(
-            row.get("storage_bucket"),
-            f"session {session_id} storage_bucket",
-        ),
-        "storage_path": required_string(
-            row.get("storage_path"),
-            f"session {session_id} storage_path",
-        ),
+        "storage_bucket": required_string(row.get("storage_bucket"), "storage_bucket"),
+        "storage_path": required_string(row.get("storage_path"), "storage_path"),
         "start_offset": start,
         "end_offset": end,
         "content_byte_size": size,
@@ -488,16 +395,9 @@ def validated_chunk(row: JsonDict, session_id: str, generation: str) -> JsonDict
     }
 
 
-def usage_rpc_parameters(
-    *,
-    session_id: str,
-    user_id: str,
-    generation: str,
-    usage: JsonDict,
-) -> JsonDict:
+def usage_rpc_parameters(*, session_id: str, generation: str, usage: JsonDict) -> JsonDict:
     return {
         "p_session_id": session_id,
-        "p_user_id": user_id,
         "p_input_tokens": usage["input_tokens"],
         "p_cached_input_tokens": usage["cached_input_tokens"],
         "p_output_tokens": usage["output_tokens"],
@@ -512,6 +412,41 @@ def usage_rpc_parameters(
     }
 
 
+def event_cursor(row: object) -> tuple[str, str]:
+    event = required_object(row, "rollout event")
+    return required_string(event.get("session_id"), "session_id"), required_string(
+        event.get("id"), "id"
+    )
+
+
+def cursor_filter(cursor: tuple[str, str]) -> str:
+    session_id, event_id = cursor
+    return (
+        f"(session_id.gt.{session_id},"
+        f"and(session_id.eq.{session_id},id.gt.{event_id}))"
+    )
+
+
+def chunk_identity(row: JsonDict) -> tuple[str, str]:
+    session_id = required_string(row.get("session_id"), "session_id")
+    metadata = required_object(row.get("metadata"), f"session {session_id} metadata")
+    return session_id, required_string(metadata.get("file_generation"), "file_generation")
+
+
+def parse_timestamp(value: str) -> datetime:
+    try:
+        parsed = datetime.fromisoformat(value[:-1] + "+00:00" if value.endswith("Z") else value)
+    except ValueError as exc:
+        raise ReplayError("--cutoff must be an ISO-8601 timestamp") from exc
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def iso_timestamp(value: datetime) -> str:
+    return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
 def required_string(value: object, name: str) -> str:
     if not isinstance(value, str) or not value:
         raise ReplayError(f"{name} must be a non-empty string")
@@ -522,18 +457,6 @@ def required_object(value: object, name: str) -> JsonDict:
     if not isinstance(value, dict):
         raise ReplayError(f"{name} must be an object")
     return value
-
-
-def required_uuid(value: object, name: str) -> str:
-    text = required_string(value, name)
-    try:
-        parsed = uuid.UUID(text)
-    except ValueError as exc:
-        raise ReplayError(f"{name} must be a canonical UUID") from exc
-    canonical = str(parsed)
-    if text != canonical:
-        raise ReplayError(f"{name} must be a canonical UUID")
-    return canonical
 
 
 def non_negative_integer(value: object, name: str) -> int:
@@ -552,24 +475,16 @@ def safe_endpoint(path: str) -> str:
 
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(
-        description="Reprocess cumulative usage from stored rollout chunks (dry-run by default).",
+        description="Repair recent cumulative usage from stored rollout chunks (dry-run by default)."
     )
-    parser.add_argument(
-        "--apply",
-        action="store_true",
-        help="Write monotonic usage snapshots through the service-role-only RPC.",
-    )
+    parser.add_argument("--apply", action="store_true")
     parser.add_argument("--page-size", type=int, default=DEFAULT_PAGE_SIZE)
+    parser.add_argument("--lookback-hours", type=int, default=DEFAULT_LOOKBACK_HOURS)
+    parser.add_argument("--max-sessions", type=int, default=DEFAULT_MAX_SESSIONS)
+    parser.add_argument("--after-session", help="Resume after this completed session id.")
     parser.add_argument(
-        "--after-session",
-        help="Resume after this session id within --snapshot-id.",
-    )
-    parser.add_argument(
-        "--snapshot-id",
-        help=(
-            "Reuse the immutable snapshot_id from an interrupted run; omit it "
-            "to materialize a fresh transaction-visible rollout catalog."
-        ),
+        "--cutoff",
+        help="Fixed ISO-8601 catalog watermark; reuse the reported value when resuming.",
     )
     args = parser.parse_args(argv)
     try:
@@ -577,8 +492,10 @@ def main(argv: list[str] | None = None) -> None:
             SupabaseAdminClient.from_env(),
             apply=args.apply,
             page_size=args.page_size,
+            lookback_hours=args.lookback_hours,
+            max_sessions=args.max_sessions,
             after_session=args.after_session,
-            snapshot_id=args.snapshot_id,
+            cutoff=args.cutoff,
         )
     except ReplayError as exc:
         print(json.dumps({"error": str(exc)}, sort_keys=True))

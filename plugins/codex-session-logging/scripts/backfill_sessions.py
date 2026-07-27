@@ -13,7 +13,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterator
 
-from rollout_usage import latest_cumulative_usage
 from session_logging import (
     ALLOWED_GITHUB_ORG,
     EXCERPT_BYTES,
@@ -329,12 +328,12 @@ def import_transcript(
     if commit:
         metadata["git_commit"] = commit
 
-    final_usage = latest_cumulative_usage(
-        (envelope for _, envelope in iter_transcript(path)),
-        fallback_created_at=fallback_created_at,
-    )
+    final_usage: JsonDict | None = None
     skipped_user_lines = response_user_lines_to_skip(path)
     for line_number, envelope in iter_transcript(path):
+        usage = historical_token_usage(envelope, fallback_created_at=fallback_created_at)
+        if usage is not None:
+            final_usage = {**usage, "source_line": line_number}
         parsed = historical_message(
             envelope,
             skip_response_user=line_number in skipped_user_lines,
@@ -388,7 +387,7 @@ def import_transcript(
         newly_queued += 1
         usage_id = deterministic_uuid(f"backfill-usage-v{USAGE_VERSION}:{path.resolve()}")
         usage_path = f"users/local/sessions/{safe_segment(session_id)}/usage.json"
-        usage_metadata = dict(metadata)
+        usage_metadata = {**metadata, "source_line": final_usage.pop("source_line")}
         usage_detail: JsonDict = {
             "id": usage_id,
             "session_id": session_id,
@@ -538,6 +537,45 @@ def read_session_meta(path: Path) -> JsonDict:
     return {}
 
 
+def historical_token_usage(
+    envelope: JsonDict,
+    *,
+    fallback_created_at: str | None = None,
+) -> JsonDict | None:
+    payload = envelope.get("payload")
+    if (
+        envelope.get("type") != "event_msg"
+        or not isinstance(payload, dict)
+        or payload.get("type") != "token_count"
+    ):
+        return None
+    info = payload.get("info")
+    if not isinstance(info, dict):
+        return None
+    total = info.get("total_token_usage")
+    if not isinstance(total, dict):
+        return None
+
+    input_tokens = non_negative_int(total.get("input_tokens"))
+    output_tokens = non_negative_int(total.get("output_tokens"))
+    total_tokens = non_negative_int(total.get("total_tokens"))
+    if input_tokens is None or output_tokens is None or total_tokens is None:
+        return None
+
+    usage: JsonDict = {
+        "input_tokens": input_tokens,
+        "cached_input_tokens": non_negative_int(total.get("cached_input_tokens")) or 0,
+        "output_tokens": output_tokens,
+        "reasoning_output_tokens": non_negative_int(total.get("reasoning_output_tokens")) or 0,
+        "total_tokens": total_tokens,
+        "created_at": string_value(envelope.get("timestamp")) or fallback_created_at or now_iso(),
+    }
+    model_context_window = non_negative_int(info.get("model_context_window"))
+    if model_context_window is not None:
+        usage["model_context_window"] = model_context_window
+    return usage
+
+
 def historical_message(
     envelope: JsonDict,
     *,
@@ -615,6 +653,10 @@ def session_id_from_filename(path: Path) -> str:
 
 def string_value(value: object) -> str | None:
     return value.strip() if isinstance(value, str) and value.strip() else None
+
+
+def non_negative_int(value: object) -> int | None:
+    return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
 
 
 def drain_wait_seconds() -> float:

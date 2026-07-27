@@ -34,7 +34,7 @@ export async function handleRequest(req: Request): Promise<Response> {
   }
 
   try {
-    const tokenError = optionalIngestTokenError(req);
+    const tokenError = ingestTokenError(req);
     if (tokenError) {
       return tokenError;
     }
@@ -61,8 +61,8 @@ export async function handleRequest(req: Request): Promise<Response> {
       return await ingestRolloutChunk(payload, client, remote);
     }
 
-    const userId = await resolveUserId(client);
     if (payloadKind === "backfill_status") {
+      const userId = await resolveUserId(client);
       const backfill = requireObject(payload.backfill, "backfill");
       const observedAt = requireString(
         backfill.updated_at,
@@ -76,10 +76,12 @@ export async function handleRequest(req: Request): Promise<Response> {
     const record = requireObject(payload.record, "record");
     const recordType = optionalString(record.type) ?? "message";
     if (recordType === "usage") {
+      const usageTokenError = ingestTokenError(req, true);
+      if (usageTokenError) {
+        return usageTokenError;
+      }
       const usage = requireObject(payload.usage, "usage");
-      const usageParameters = sessionUsageParameters(record, userId, usage);
-      await upsertSessionUser(record, client, userId);
-      await upsertSession(record, client, userId, remote);
+      const usageParameters = sessionUsageParameters(record, usage);
       await upsertSessionUsage(usageParameters);
       return jsonResponse({
         ok: true,
@@ -87,6 +89,7 @@ export async function handleRequest(req: Request): Promise<Response> {
         kind: "usage",
       });
     }
+    const userId = await resolveUserId(client);
     const storagePath = storagePathForRecord(record, userId);
 
     if (recordType === "event") {
@@ -324,10 +327,12 @@ async function requestJson(req: Request): Promise<unknown> {
   }
 }
 
-function optionalIngestTokenError(req: Request): Response | null {
+function ingestTokenError(req: Request, required = false): Response | null {
   const expected = Deno.env.get("CODEX_SESSION_LOG_INGEST_TOKEN");
   if (!expected) {
-    return null;
+    return required
+      ? jsonResponse({ error: "usage_ingest_auth_not_configured" }, 503)
+      : null;
   }
   if (req.headers.get("x-codex-session-log-token") !== expected) {
     return jsonResponse({ error: "invalid_ingest_token" }, 401);
@@ -759,7 +764,6 @@ async function upsertMessage(
 
 function sessionUsageParameters(
   record: JsonObject,
-  userId: string,
   usage: JsonObject,
 ): JsonObject {
   const modelContextWindow = optionalNonNegativeInteger(
@@ -794,7 +798,6 @@ function sessionUsageParameters(
   }
   return {
     p_session_id: requireString(record.session_id, "record.session_id"),
-    p_user_id: userId,
     p_input_tokens: inputTokens,
     p_cached_input_tokens: cachedInputTokens,
     p_output_tokens: outputTokens,

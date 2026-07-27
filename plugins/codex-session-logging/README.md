@@ -34,7 +34,7 @@ Default URL:
 https://pmdfllwuctzkdjiehezq.supabase.co
 ```
 
-Apply the SQL files in `supabase/migrations` when provisioning a new project. Chunk objects use the existing private bucket and their offsets, hashes, generations, and parent/root relationships are cataloged in `codex_session_events`. Version 0.2.8 adds the service-role-only `upsert_codex_session_usage_latest` RPC; it accepts a snapshot only when neither its observation time nor its cumulative total moves backwards. The Edge Function, RPC, and database constraint all require the normalized token components to sum exactly to the reported total. A null incoming context window preserves the stored value.
+Apply the SQL files in `supabase/migrations` when provisioning a new project. Chunk objects use the existing private bucket and their offsets, hashes, generations, and parent/root relationships are cataloged in `codex_session_events`. Version 0.2.8 adds the service-role-only `upsert_codex_session_usage_latest` RPC. It derives the immutable owner from `codex_sessions` and accepts a snapshot only when neither its observation time nor cumulative total moves backwards. The Edge Function, RPC, and database constraint require the normalized token components to sum exactly to the reported total.
 
 Deploy the ingest Edge Function from `supabase/functions/codex-session-ingest` after the migration. The function owns the Supabase admin key server-side and uses the developer's git email as the initial user key when available. If `CODEX_SESSION_LOG_USER_EMAIL_MAP` contains the email, that mapped Supabase Auth user id is used; otherwise the function derives a stable UUID from the email. When git email is not configured, the plugin sends a persistent local installation id so sessions still track without per-user setup.
 
@@ -43,12 +43,11 @@ supabase db push --project-ref pmdfllwuctzkdjiehezq
 supabase functions deploy codex-session-ingest --project-ref pmdfllwuctzkdjiehezq
 supabase secrets set \
   --project-ref pmdfllwuctzkdjiehezq \
-  CODEX_SESSION_LOG_USER_EMAIL_MAP='{"user@e3.solutions":"00000000-0000-0000-0000-000000000000"}'
+  CODEX_SESSION_LOG_USER_EMAIL_MAP='{"user@e3.solutions":"00000000-0000-0000-0000-000000000000"}' \
+  CODEX_SESSION_LOG_INGEST_TOKEN='<shared ingest secret>'
 ```
 
-To recover usage from rollout chunks that were stored before 0.2.8, run the admin replay in dry-run mode first. A service-role-only RPC materializes the transaction-visible `rollout_chunk` catalog into immutable snapshot rows before the first page is read. The replay keyset-paginates that snapshot by session and event id, keeps only one session in memory at a time, verifies contiguous offsets, byte sizes, and hashes, and never prints rollout contents. Concurrent commits—including backdated events or inserts that reserved an earlier sequence—cannot enter the current snapshot and become visible on the next fresh run. To resume an interrupted snapshot, pass both its reported `resume_after_session` as `--after-session` and its `snapshot_id` as `--snapshot-id`. `--apply` invokes the monotonic usage RPC once per session, so reruns are idempotent.
-
-Replay snapshots contain only the existing sanitized event catalog metadata and private Storage paths, never rollout payload bytes. They are service-role-readable and retained until explicitly removed. After a replay and any possible resume are complete, call the service-role-only `delete_codex_rollout_replay_snapshot(snapshot_id)` RPC; deletion cascades to its catalog rows. The `created_at` index supports scheduled retention cleanup if an operator later adds a TTL job.
+To recover usage from rollout chunks stored before 0.2.8, run the bounded admin replay in dry-run mode first. It reads the existing event catalog with a fixed cutoff and keyset cursor, defaults to the previous 72 hours and 500 sessions, verifies chunk offsets, sizes, and hashes, and makes no database writes unless `--apply` is passed. A resume must reuse the reported `cutoff` with `--cutoff` and the reported `resume_after_session` with `--after-session`. A later fresh run safely picks up concurrent catalog inserts; the monotonic RPC makes reruns idempotent.
 
 ```bash
 SUPABASE_URL=https://pmdfllwuctzkdjiehezq.supabase.co \
@@ -60,11 +59,18 @@ SUPABASE_SERVICE_ROLE_KEY=... \
 python3 plugins/codex-session-logging/supabase/scripts/reprocess_rollout_usage.py --apply
 ```
 
+The opt-in local database check creates a disposable database, applies the migration, and verifies grants, owner conflicts, and concurrent monotonic updates:
+
+```bash
+CODEX_SESSION_LOG_TEST_DATABASE_URL=postgresql://postgres:postgres@127.0.0.1:54322/postgres \
+python3 plugins/codex-session-logging/supabase/scripts/test_usage_rpc_db.py
+```
+
 The email map is optional for the first rollout and can be added later to merge deterministic ids into real Auth users. The function reads `SUPABASE_SECRET_KEYS` by default, with `SUPABASE_SERVICE_ROLE_KEY` as a legacy fallback. Do not put either key on developer machines or in the plugin package.
 
 ## Environment
 
-No local environment variables are required for normal installs.
+The shared ingest token is required to publish usage rows; unsigned usage requests fail closed. The uploader already sends it when configured.
 
 Optional:
 
@@ -74,7 +80,7 @@ export CODEX_SESSION_LOG_BUCKET=codex-sessions
 export CODEX_SESSION_LOG_INGEST_URL=https://pmdfllwuctzkdjiehezq.supabase.co/functions/v1/codex-session-ingest
 export CODEX_SESSION_LOG_AUTO_UPLOAD=0
 export CODEX_SESSION_LOG_UPLOAD_WORKERS=4
-export CODEX_SESSION_LOG_INGEST_TOKEN=<only-if-the-function-requires-one>
+export CODEX_SESSION_LOG_INGEST_TOKEN=<shared ingest secret>
 ```
 
 An explicit `CODEX_SESSION_LOG_AUTO_UPLOAD=0` or `=1` is persisted in

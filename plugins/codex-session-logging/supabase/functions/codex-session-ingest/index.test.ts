@@ -399,9 +399,11 @@ Deno.test("handleRequest still upserts non-backfill session token usage", async 
   const originalFetch = globalThis.fetch;
   const previousUrl = Deno.env.get("SUPABASE_URL");
   const previousServiceRole = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
+  const previousIngestToken = Deno.env.get("CODEX_SESSION_LOG_INGEST_TOKEN");
 
   Deno.env.set("SUPABASE_URL", "https://project.supabase.co");
   Deno.env.set("SUPABASE_SERVICE_ROLE_KEY", "service-role-key");
+  Deno.env.set("CODEX_SESSION_LOG_INGEST_TOKEN", "usage-secret");
   globalThis.fetch = async (input, init = {}) => {
     const url = input instanceof Request
       ? input.url
@@ -429,7 +431,10 @@ Deno.test("handleRequest still upserts non-backfill session token usage", async 
     const response = await handleRequest(
       new Request("https://example.test/codex-session-ingest", {
         method: "POST",
-        headers: { "content-type": "application/json" },
+        headers: {
+          "content-type": "application/json",
+          "x-codex-session-log-token": "usage-secret",
+        },
         body: JSON.stringify({
           version: 1,
           record: {
@@ -471,6 +476,7 @@ Deno.test("handleRequest still upserts non-backfill session token usage", async 
     assertEquals(usageUpsert?.body?.p_reasoning_output_tokens, 8);
     assertEquals(usageUpsert?.body?.p_total_tokens, 4142);
     assertEquals(usageUpsert?.body?.p_model_context_window, 258400);
+    assertEquals(usageUpsert?.body?.p_user_id, undefined);
     assertEquals(
       usageUpsert?.body?.p_observed_at,
       "2026-07-07T00:00:00.000Z",
@@ -479,6 +485,7 @@ Deno.test("handleRequest still upserts non-backfill session token usage", async 
     globalThis.fetch = originalFetch;
     restoreEnv("SUPABASE_URL", previousUrl);
     restoreEnv("SUPABASE_SERVICE_ROLE_KEY", previousServiceRole);
+    restoreEnv("CODEX_SESSION_LOG_INGEST_TOKEN", previousIngestToken);
   }
 });
 
@@ -487,9 +494,11 @@ Deno.test("handleRequest rejects inconsistent usage before any write", async () 
   const originalFetch = globalThis.fetch;
   const previousUrl = Deno.env.get("SUPABASE_URL");
   const previousServiceRole = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
+  const previousIngestToken = Deno.env.get("CODEX_SESSION_LOG_INGEST_TOKEN");
 
   Deno.env.set("SUPABASE_URL", "https://project.supabase.co");
   Deno.env.set("SUPABASE_SERVICE_ROLE_KEY", "service-role-key");
+  Deno.env.set("CODEX_SESSION_LOG_INGEST_TOKEN", "usage-secret");
   globalThis.fetch = async (input, init = {}) => {
     const url = input instanceof Request
       ? input.url
@@ -508,7 +517,10 @@ Deno.test("handleRequest rejects inconsistent usage before any write", async () 
     const response = await handleRequest(
       new Request("https://example.test/codex-session-ingest", {
         method: "POST",
-        headers: { "content-type": "application/json" },
+        headers: {
+          "content-type": "application/json",
+          "x-codex-session-log-token": "usage-secret",
+        },
         body: JSON.stringify({
           version: 1,
           record: {
@@ -543,6 +555,46 @@ Deno.test("handleRequest rejects inconsistent usage before any write", async () 
     globalThis.fetch = originalFetch;
     restoreEnv("SUPABASE_URL", previousUrl);
     restoreEnv("SUPABASE_SERVICE_ROLE_KEY", previousServiceRole);
+    restoreEnv("CODEX_SESSION_LOG_INGEST_TOKEN", previousIngestToken);
+  }
+});
+
+Deno.test("handleRequest fails closed for unsigned usage", async () => {
+  const previousIngestToken = Deno.env.get("CODEX_SESSION_LOG_INGEST_TOKEN");
+  Deno.env.delete("CODEX_SESSION_LOG_INGEST_TOKEN");
+  try {
+    const response = await handleRequest(
+      new Request("https://example.test/codex-session-ingest", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          record: {
+            id: "804fd832-7779-4665-9bec-2f10462c721b",
+            type: "usage",
+            session_id: "session-usage",
+            created_at: "2026-07-07T00:00:00.000Z",
+          },
+          usage: {
+            input_tokens: 1,
+            cached_input_tokens: 0,
+            output_tokens: 1,
+            reasoning_output_tokens: 0,
+            total_tokens: 2,
+            created_at: "2026-07-07T00:00:00.000Z",
+          },
+          client: {
+            repo_remote: "https://github.com/e3-solutions/codex-plugins.git",
+          },
+        }),
+      }),
+    );
+
+    assertEquals(response.status, 503);
+    assertEquals(await response.json(), {
+      error: "usage_ingest_auth_not_configured",
+    });
+  } finally {
+    restoreEnv("CODEX_SESSION_LOG_INGEST_TOKEN", previousIngestToken);
   }
 });
 
