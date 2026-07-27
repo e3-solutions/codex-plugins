@@ -531,6 +531,7 @@ def sync_rollout_file(
                 entry,
                 content,
                 fallback_created_at=str(descriptor["created_at"]),
+                at_stable_end=end_offset >= stable_end,
             )
             if usage is not None and queue_rollout_usage(
                 base,
@@ -634,6 +635,7 @@ def parse_incremental_usage(
     content: bytes,
     *,
     fallback_created_at: str,
+    at_stable_end: bool = False,
 ) -> JsonDict | None:
     """Parse complete JSONL lines while retaining at most 1 MiB of a tail."""
     if bool(entry.get("usage_skip_until_newline")):
@@ -668,6 +670,18 @@ def parse_incremental_usage(
             continue
         if isinstance(envelope, dict):
             parsed_envelopes.append(envelope)
+
+    # A valid final JSONL record does not require a trailing newline. Keep the
+    # tail for a possible later append, but parse it once when this read reached
+    # the current stable EOF. Queue idempotency makes a later newline harmless.
+    if at_stable_end and tail.strip() and len(tail) <= MAX_USAGE_PARTIAL_BYTES:
+        try:
+            envelope = json.loads(tail.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            pass
+        else:
+            if isinstance(envelope, dict):
+                parsed_envelopes.append(envelope)
 
     if len(tail) <= MAX_USAGE_PARTIAL_BYTES:
         entry["usage_partial_base64"] = base64.b64encode(tail).decode("ascii")

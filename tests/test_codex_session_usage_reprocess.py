@@ -205,6 +205,28 @@ def test_replay_rejects_non_contiguous_chunks_without_writing():
     assert client.upserts == []
 
 
+def test_replay_recovers_valid_final_token_count_without_newline():
+    replay = load_module("reprocess_rollout_usage_no_newline", REPROCESS)
+    session_id = "11111111-1111-4111-8111-111111111111"
+    raw = json.dumps(
+        usage_envelope("2026-07-26T10:00:00Z", 100),
+        separators=(",", ":"),
+    ).encode()
+    events, objects = stored_generation(session_id, "d" * 16, raw, cuts=(19,))
+    client = FakeClient(events, objects)
+
+    result = replay.reprocess_rollout_usage(
+        client,
+        apply=True,
+        cutoff="2026-07-27T00:00:00Z",
+    )
+
+    assert result["sessions_with_usage"] == 1
+    assert result["rpc_calls"] == 1
+    assert client.upserts[0]["p_session_id"] == session_id
+    assert client.upserts[0]["p_total_tokens"] == 100
+
+
 def test_replay_quarantines_exact_legacy_session_and_continues():
     replay = load_module("reprocess_rollout_usage_legacy", REPROCESS)
     legacy_session = "11111111-1111-4111-8111-111111111111"
@@ -419,3 +441,23 @@ def test_usage_rpc_migration_derives_owner_and_is_service_role_only():
     assert "excluded.total_tokens >= public.codex_session_usage.total_tokens" in sql
     assert "excluded.observed_at >= public.codex_session_usage.observed_at" in sql
     assert "codex_rollout_replay_snapshot" not in sql
+
+
+def test_additive_repair_migration_is_source_and_pattern_gated():
+    migration = next(
+        (PLUGIN / "supabase" / "migrations").glob(
+            "*repair_additive_session_usage.sql"
+        )
+    )
+    sql = migration.read_text().lower()
+
+    assert "metadata ->> 'source' = 'historical_transcript'" in sql
+    assert "input_tokens >= cached_input_tokens" in sql
+    assert "output_tokens >= reasoning_output_tokens" in sql
+    assert "metadata ->> 'source' = 'transcript_sync'" in sql
+    assert "metadata ->> 'agent' = 'claude'" in sql
+    assert "cache_creation_input_tokens" in sql
+    assert "'^[0-9]{1,19}$'" in sql
+    assert "<= 9223372036854775807::numeric" in sql
+    assert "total_tokens::numeric" in sql
+    assert "validate constraint" not in sql

@@ -318,7 +318,11 @@ def _cumulative_usage_record(
     output_tokens = int(totals["output_tokens"])
     cache_read = int(totals["cache_read"])
     cache_creation = int(totals["cache_creation"])
-    total_tokens = input_tokens + output_tokens + cache_creation + cache_read
+    # Keep the stored columns additive. Anthropic reports cache creation as a
+    # separate billing detail; this schema has a dedicated component only for
+    # cache reads, so preserve cache creation in metadata without folding it
+    # into either the fresh-input headline or total_tokens.
+    total_tokens = input_tokens + output_tokens + cache_read
     created_at = totals.get("created_at") or session_logging.now_iso()
     model = totals.get("model")
     service_tier = totals.get("service_tier")

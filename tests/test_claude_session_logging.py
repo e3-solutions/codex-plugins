@@ -745,7 +745,16 @@ def test_transcript_sync_emits_messages_and_usage(tmp_path, monkeypatch):
     assert usage["cached_input_tokens"] == 30
     assert usage["output_tokens"] == 20
     assert usage["reasoning_output_tokens"] == 0
-    assert usage["total_tokens"] == 100 + 20 + 10 + 30
+    assert usage["total_tokens"] == 100 + 20 + 30
+    assert usage["total_tokens"] == sum(
+        usage[key]
+        for key in (
+            "input_tokens",
+            "cached_input_tokens",
+            "output_tokens",
+            "reasoning_output_tokens",
+        )
+    )
     assert usage["model_context_window"] == 200000
     assert usage["created_at"] == "2026-07-16T00:00:05.000Z"
     assert usages[0]["metadata"]["agent"] == "claude"
@@ -928,7 +937,7 @@ def test_transcript_sync_usage_is_cumulative_session_total(tmp_path, monkeypatch
     assert usage["output_tokens"] == 20 + 50
     assert usage["input_tokens"] == 100 + 200
     assert usage["cached_input_tokens"] == 30 + 60
-    assert usage["total_tokens"] == (100 + 200) + (20 + 50) + (10 + 5) + (30 + 60)
+    assert usage["total_tokens"] == (100 + 200) + (20 + 50) + (30 + 60)
     assert usages[0]["metadata"]["cache_creation_input_tokens"] == 10 + 5
     assert usage["created_at"] == "2026-07-16T00:00:15.000Z"  # latest turn
 
@@ -983,7 +992,7 @@ def test_transcript_sync_usage_accumulates_across_incremental_runs(tmp_path, mon
     usage = session_logging.build_ingest_payload(usages[0], base=base)["usage"]
     assert usage["output_tokens"] == 20 + 50
     assert usage["input_tokens"] == 100 + 200
-    assert usage["total_tokens"] == 300 + 70 + 15 + 90
+    assert usage["total_tokens"] == 300 + 70 + 90
 
 
 def test_transcript_sync_skips_repos_outside_e3(tmp_path, monkeypatch):
@@ -1046,7 +1055,7 @@ def test_drain_posts_message_and_usage_records_to_shared_ingest(tmp_path, monkey
         assert body["record"]["metadata"]["agent"] == "claude"
         assert body["client"]["repo_remote"] == "https://github.com/e3-solutions/codex-plugins.git"
     assert all("content" in body["message"] for body in by_type["message"])
-    assert by_type["usage"][0]["usage"]["total_tokens"] == 160
+    assert by_type["usage"][0]["usage"]["total_tokens"] == 150
 
 
 def test_auto_update_is_throttled(tmp_path, monkeypatch):

@@ -199,21 +199,31 @@ class UsageJsonlStream:
         pieces = (self.partial + content).split(b"\n")
         self.partial = b""
         for line in pieces[:-1]:
-            if not line.strip() or len(line) > MAX_PARTIAL_LINE_BYTES:
-                continue
-            try:
-                envelope = json.loads(line.decode())
-            except (UnicodeDecodeError, json.JSONDecodeError):
-                continue
-            if isinstance(envelope, dict):
-                usage = parse_cumulative_usage(envelope)
-                if usage is not None and usage_is_newer(usage, self.latest):
-                    self.latest = usage
+            self._accept_line(line)
         tail = pieces[-1]
         if len(tail) <= MAX_PARTIAL_LINE_BYTES:
             self.partial = tail
         else:
             self.skip_until_newline = True
+
+    def finish(self) -> JsonDict | None:
+        """Parse one complete final JSON value even without a newline."""
+        if not self.skip_until_newline:
+            self._accept_line(self.partial)
+        self.partial = b""
+        return self.latest
+
+    def _accept_line(self, line: bytes) -> None:
+        if not line.strip() or len(line) > MAX_PARTIAL_LINE_BYTES:
+            return
+        try:
+            envelope = json.loads(line.decode())
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return
+        if isinstance(envelope, dict):
+            usage = parse_cumulative_usage(envelope)
+            if usage is not None and usage_is_newer(usage, self.latest):
+                self.latest = usage
 
 
 def service_role_key() -> str:
@@ -420,7 +430,7 @@ def usage_from_generation(
             raise generation_error(session_id, generation, "stored SHA-256 does not match")
         stream.feed(content)
         expected_offset = chunk["end_offset"]
-    return stream.latest
+    return stream.finish()
 
 
 def validated_chunk(row: JsonDict, session_id: str, generation: str) -> JsonDict:
