@@ -4,8 +4,11 @@ import hashlib
 import importlib.util
 import json
 import sys
+import urllib.error
 import uuid
 from pathlib import Path
+
+import pytest
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -77,6 +80,7 @@ class FakeClient:
         self.objects = objects
         self.upserts: list[dict] = []
         self.queries: list[dict] = []
+        self.downloads: list[tuple[str, str]] = []
 
     def iter_rollout_events(self, **query):
         self.queries.append(query)
@@ -86,6 +90,7 @@ class FakeClient:
         yield from sorted(rows, key=lambda row: (row["session_id"], row["id"]))
 
     def download(self, bucket: str, storage_path: str) -> bytes:
+        self.downloads.append((bucket, storage_path))
         return self.objects[(bucket, storage_path)]
 
     def upsert_usage(self, parameters: dict) -> None:
@@ -198,6 +203,169 @@ def test_replay_rejects_non_contiguous_chunks_without_writing():
     assert result["rpc_calls"] == 0
     assert "non-contiguous offset" in result["errors"][0]
     assert client.upserts == []
+
+
+def test_replay_quarantines_exact_legacy_session_and_continues():
+    replay = load_module("reprocess_rollout_usage_legacy", REPROCESS)
+    legacy_session = "11111111-1111-4111-8111-111111111111"
+    valid_session = "22222222-2222-4222-8222-222222222222"
+    tail_events, tail_objects = stored_generation(
+        legacy_session,
+        "a" * 16,
+        rollout_bytes(usage_envelope("2026-07-26T10:05:00Z", 220)),
+    )
+    tail = tail_events[0]
+    size = tail["metadata"]["content_byte_size"]
+    tail["metadata"]["start_offset"] = 1024
+    tail["metadata"]["end_offset"] = 1024 + size
+    legacy = {
+        **tail,
+        "id": "00000000-0000-4000-8000-000000000001",
+        "storage_path": "legacy/event.json",
+        "metadata": {"source": "pre-specialized-ingest"},
+    }
+    valid_events, valid_objects = stored_generation(
+        valid_session,
+        "b" * 16,
+        rollout_bytes(usage_envelope("2026-07-26T10:06:00Z", 300)),
+    )
+
+    apply_client = FakeClient(
+        [legacy, tail, *valid_events],
+        {**tail_objects, **valid_objects},
+    )
+    applied = replay.reprocess_rollout_usage(
+        apply_client,
+        apply=True,
+        cutoff="2026-07-27T00:00:00Z",
+    )
+    assert applied["legacy_events_quarantined"] == 1
+    assert applied["legacy_sessions_quarantined"] == 1
+    assert len(applied["errors"]) == 1
+    assert "legacy rollout events" in applied["errors"][0]
+    assert applied["sessions_with_usage"] == 1
+    assert applied["rpc_calls"] == 1
+    assert applied["resume_after_session"] == valid_session
+    assert apply_client.downloads == [
+        ("codex-sessions", valid_events[0]["storage_path"])
+    ]
+    assert [row["p_session_id"] for row in apply_client.upserts] == [valid_session]
+
+
+def test_replay_does_not_classify_partial_chunk_metadata_as_legacy():
+    replay = load_module("reprocess_rollout_usage_partial", REPROCESS)
+    session_id = "11111111-1111-4111-8111-111111111111"
+    client = FakeClient(
+        [
+            {
+                "id": "00000000-0000-4000-8000-000000000001",
+                "session_id": session_id,
+                "storage_bucket": "codex-sessions",
+                "storage_path": "partial/chunk.jsonl",
+                "metadata": {"start_offset": 0},
+            }
+        ],
+        {},
+    )
+
+    with pytest.raises(replay.ReplayError, match="file_generation"):
+        replay.reprocess_rollout_usage(
+            client,
+            apply=True,
+            cutoff="2026-07-27T00:00:00Z",
+        )
+    assert client.downloads == []
+    assert client.upserts == []
+
+
+class FakeHttpResponse:
+    def __init__(
+        self, content: bytes = b"ok", read_error: Exception | None = None
+    ) -> None:
+        self.content = content
+        self.read_error = read_error
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return False
+
+    def read(self) -> bytes:
+        if self.read_error is not None:
+            raise self.read_error
+        return self.content
+
+
+@pytest.mark.parametrize(
+    "failure",
+    ["read-reset", "http-503"],
+)
+def test_storage_download_retries_transient_failures(monkeypatch, failure):
+    replay = load_module("reprocess_rollout_usage_retry", REPROCESS)
+    calls = 0
+    delays: list[float] = []
+
+    def urlopen(_request, timeout):
+        nonlocal calls
+        assert timeout == 60
+        calls += 1
+        if calls == 1:
+            if failure == "read-reset":
+                return FakeHttpResponse(read_error=ConnectionResetError("reset"))
+            raise urllib.error.HTTPError(
+                "https://example", 503, "unavailable", None, None
+            )
+        return FakeHttpResponse()
+
+    monkeypatch.setattr(replay.urllib.request, "urlopen", urlopen)
+    monkeypatch.setattr(replay.time, "sleep", delays.append)
+    client = replay.SupabaseAdminClient("https://example.supabase.co", "secret")
+
+    assert client.download("bucket", "path") == b"ok"
+    assert calls == 2
+    assert delays == [0.25]
+
+
+def test_storage_download_stops_after_three_transient_failures(monkeypatch):
+    replay = load_module("reprocess_rollout_usage_retry_limit", REPROCESS)
+    calls = 0
+    delays: list[float] = []
+
+    def urlopen(_request, timeout):
+        nonlocal calls
+        assert timeout == 60
+        calls += 1
+        raise ConnectionResetError("reset")
+
+    monkeypatch.setattr(replay.urllib.request, "urlopen", urlopen)
+    monkeypatch.setattr(replay.time, "sleep", delays.append)
+    client = replay.SupabaseAdminClient("https://example.supabase.co", "secret")
+
+    with pytest.raises(replay.TransientRequestError):
+        client.download("bucket", "path")
+    assert calls == 3
+    assert delays == [0.25, 0.5]
+
+
+def test_rpc_transient_failure_is_not_retried(monkeypatch):
+    replay = load_module("reprocess_rollout_usage_no_rpc_retry", REPROCESS)
+    calls = 0
+
+    def urlopen(_request, timeout):
+        nonlocal calls
+        assert timeout == 60
+        calls += 1
+        raise urllib.error.HTTPError(
+            "https://example", 503, "request failed", None, None
+        )
+
+    monkeypatch.setattr(replay.urllib.request, "urlopen", urlopen)
+    client = replay.SupabaseAdminClient("https://example.supabase.co", "secret")
+
+    with pytest.raises(replay.ReplayError):
+        client.upsert_usage({"p_session_id": "session"})
+    assert calls == 1
 
 
 def test_supabase_replay_uses_catalog_cutoff_and_keyset_without_snapshot_writes():
