@@ -2,6 +2,14 @@ import { userIdForClientIdentity } from "./client_identity.ts";
 import { sanitizeEventPayload } from "./event_sanitizer.ts";
 
 type JsonObject = Record<string, unknown>;
+type ExistingSession = {
+  found: boolean;
+  installationCapabilitySha256: string | null;
+  metadata: JsonObject;
+  startedAt: string | null;
+  threadId: string | null;
+  userId: string | null;
+};
 
 class PayloadValidationError extends Error {}
 
@@ -12,6 +20,8 @@ const MAX_ROLLOUT_CHUNK_BASE64_LENGTH = Math.ceil(MAX_ROLLOUT_CHUNK_BYTES / 3) *
   4;
 const UUID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+const UUID_V4_PATTERN =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const HEX_GENERATION_PATTERN = /^[0-9a-f]{16,64}$/;
 const SHA256_PATTERN = /^[0-9a-f]{64}$/;
 const SAFE_CATEGORY_PATTERN = /^[a-zA-Z0-9._-]{1,128}$/;
@@ -76,12 +86,11 @@ export async function handleRequest(req: Request): Promise<Response> {
     const record = requireObject(payload.record, "record");
     const recordType = optionalString(record.type) ?? "message";
     if (recordType === "usage") {
-      const usageTokenError = ingestTokenError(req, true);
-      if (usageTokenError) {
-        return usageTokenError;
-      }
       const usage = requireObject(payload.usage, "usage");
       const usageParameters = sessionUsageParameters(record, usage);
+      if (!await usageCapabilityMatches(record, client)) {
+        return jsonResponse({ error: "usage_ingest_retryable" }, 503);
+      }
       await upsertSessionUsage(usageParameters);
       return jsonResponse({
         ok: true,
@@ -90,6 +99,12 @@ export async function handleRequest(req: Request): Promise<Response> {
       });
     }
     const userId = await resolveUserId(client);
+    const existing = await existingSession(
+      requireString(record.session_id, "record.session_id"),
+    );
+    if (existing.found && existing.userId !== userId) {
+      return jsonResponse({ error: "session_rejected" }, 422);
+    }
     const storagePath = storagePathForRecord(record, userId);
 
     if (recordType === "event") {
@@ -102,6 +117,7 @@ export async function handleRequest(req: Request): Promise<Response> {
         client,
         userId,
         remote,
+        existing,
         optionalObject(sanitizedEvent.metadata),
       );
       await upsertEvent(record, userId, storagePath, sanitizedEvent);
@@ -116,7 +132,7 @@ export async function handleRequest(req: Request): Promise<Response> {
     await validateMessageIntegrity(record, message);
     await upsertSessionUser(record, client, userId);
     await uploadStorageObject(storagePath, message);
-    await upsertSession(record, client, userId, remote);
+    await upsertSession(record, client, userId, remote, existing);
     await upsertMessage(record, userId, storagePath);
 
     return jsonResponse({
@@ -214,6 +230,10 @@ async function ingestRolloutChunk(
   }
 
   const userId = await resolveUserId(client);
+  const existing = await existingSession(sessionId);
+  if (existing.found && existing.userId !== userId) {
+    return jsonResponse({ error: "session_rejected" }, 422);
+  }
 
   const metadata = sanitizeRolloutChunkMetadata(
     optionalObject(record.metadata),
@@ -253,7 +273,14 @@ async function ingestRolloutChunk(
     exactArrayBuffer(content),
     "application/x-ndjson",
   );
-  await upsertSession(catalogRecord, client, userId, remote, metadata);
+  await upsertSession(
+    catalogRecord,
+    client,
+    userId,
+    remote,
+    existing,
+    metadata,
+  );
   await upsertEvent(catalogRecord, userId, storagePath, event);
   return jsonResponse({
     ok: true,
@@ -327,12 +354,10 @@ async function requestJson(req: Request): Promise<unknown> {
   }
 }
 
-function ingestTokenError(req: Request, required = false): Response | null {
+function ingestTokenError(req: Request): Response | null {
   const expected = Deno.env.get("CODEX_SESSION_LOG_INGEST_TOKEN");
   if (!expected) {
-    return required
-      ? jsonResponse({ error: "usage_ingest_auth_not_configured" }, 503)
-      : null;
+    return null;
   }
   if (req.headers.get("x-codex-session-log-token") !== expected) {
     return jsonResponse({ error: "invalid_ingest_token" }, 401);
@@ -548,12 +573,15 @@ async function upsertSession(
   client: JsonObject,
   userId: string,
   remote: string,
+  existing: ExistingSession,
   metadata = optionalObject(record.metadata),
 ): Promise<void> {
   const sessionId = requireString(record.session_id, "record.session_id");
-  const existing = await existingSession(sessionId);
   const threadId = existing.threadId ??
     optionalString(record.thread_id) ?? await sha256Hex(sessionId);
+  const installationCapabilitySha256 = existing.found
+    ? existing.installationCapabilitySha256
+    : await installationCapabilityDigest(client.installation_id);
   const sessionMetadata = await sessionMetadataForUpsert(
     metadata,
     client,
@@ -562,6 +590,7 @@ async function upsertSession(
   const row = {
     id: sessionId,
     thread_id: threadId,
+    installation_capability_sha256: installationCapabilitySha256,
     user_id: userId,
     repo: remote,
     branch: optionalString(client.git_branch),
@@ -693,13 +722,9 @@ async function sessionMetadataForUpsert(
 
 async function existingSession(
   sessionId: string,
-): Promise<{
-  metadata: JsonObject;
-  threadId: string | null;
-  startedAt: string | null;
-}> {
+): Promise<ExistingSession> {
   const response = await supabaseFetch(
-    `/rest/v1/codex_sessions?select=metadata,thread_id,started_at&id=eq.${
+    `/rest/v1/codex_sessions?select=metadata,thread_id,started_at,installation_capability_sha256,user_id&id=eq.${
       encodeURIComponent(sessionId)
     }&limit=1`,
     {
@@ -711,14 +736,64 @@ async function existingSession(
   );
   const rows = await response.json();
   if (!Array.isArray(rows) || rows.length === 0) {
-    return { metadata: {}, threadId: null, startedAt: null };
+    return {
+      found: false,
+      installationCapabilitySha256: null,
+      metadata: {},
+      threadId: null,
+      startedAt: null,
+      userId: null,
+    };
   }
   const row = optionalObject(rows[0]);
   return {
+    found: true,
+    installationCapabilitySha256: optionalString(
+      row.installation_capability_sha256,
+    ),
     metadata: optionalObject(row.metadata),
     threadId: optionalString(row.thread_id),
     startedAt: optionalString(row.started_at),
+    userId: optionalString(row.user_id),
   };
+}
+
+async function installationCapabilityDigest(
+  value: unknown,
+): Promise<string | null> {
+  const installationId = optionalString(value);
+  return installationId && UUID_V4_PATTERN.test(installationId)
+    ? await sha256Hex(installationId)
+    : null;
+}
+
+async function usageCapabilityMatches(
+  record: JsonObject,
+  client: JsonObject,
+): Promise<boolean> {
+  const incomingDigest = await installationCapabilityDigest(
+    client.installation_id,
+  );
+  if (!incomingDigest) {
+    return false;
+  }
+  const existing = await existingSession(
+    requireString(record.session_id, "record.session_id"),
+  );
+  const storedDigest = existing.installationCapabilitySha256;
+  if (!existing.found || !storedDigest || !SHA256_PATTERN.test(storedDigest)) {
+    return false;
+  }
+  return constantTimeEqual(incomingDigest, storedDigest);
+}
+
+function constantTimeEqual(left: string, right: string): boolean {
+  let difference = left.length ^ right.length;
+  for (let index = 0; index < 64; index += 1) {
+    difference |= (left.charCodeAt(index) || 0) ^
+      (right.charCodeAt(index) || 0);
+  }
+  return difference === 0;
 }
 
 function earliestTimestamp(existing: string | null, incoming: string): string {
