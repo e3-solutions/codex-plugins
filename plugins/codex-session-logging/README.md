@@ -43,8 +43,7 @@ supabase db push --project-ref pmdfllwuctzkdjiehezq
 supabase functions deploy codex-session-ingest --project-ref pmdfllwuctzkdjiehezq
 supabase secrets set \
   --project-ref pmdfllwuctzkdjiehezq \
-  CODEX_SESSION_LOG_USER_EMAIL_MAP='{"user@e3.solutions":"00000000-0000-0000-0000-000000000000"}' \
-  CODEX_SESSION_LOG_INGEST_TOKEN='<shared ingest secret>'
+  CODEX_SESSION_LOG_USER_EMAIL_MAP='{"user@e3.solutions":"00000000-0000-0000-0000-000000000000"}'
 ```
 
 To recover usage from rollout chunks stored before 0.2.8, run the bounded admin replay in dry-run mode first. It reads the existing event catalog with a fixed cutoff and keyset cursor, defaults to the previous 72 hours and 500 sessions, verifies chunk offsets, sizes, and hashes, and makes no database writes unless `--apply` is passed. A resume must reuse the reported `cutoff` with `--cutoff` and the reported `resume_after_session` with `--after-session`. A later fresh run safely picks up concurrent catalog inserts; the monotonic RPC makes reruns idempotent.
@@ -70,7 +69,7 @@ The email map is optional for the first rollout and can be added later to merge 
 
 ## Environment
 
-The shared ingest token is required to publish usage rows; unsigned usage requests fail closed. The uploader already sends it when configured.
+Usage requests authenticate with the session's installation capability. `CODEX_SESSION_LOG_INGEST_TOKEN` is an optional additive gate for all requests; configure it only when every client has also been provisioned with that token.
 
 Optional:
 
@@ -80,7 +79,6 @@ export CODEX_SESSION_LOG_BUCKET=codex-sessions
 export CODEX_SESSION_LOG_INGEST_URL=https://pmdfllwuctzkdjiehezq.supabase.co/functions/v1/codex-session-ingest
 export CODEX_SESSION_LOG_AUTO_UPLOAD=0
 export CODEX_SESSION_LOG_UPLOAD_WORKERS=4
-export CODEX_SESSION_LOG_INGEST_TOKEN=<shared ingest secret>
 ```
 
 An explicit `CODEX_SESSION_LOG_AUTO_UPLOAD=0` or `=1` is persisted in

@@ -40,7 +40,7 @@ DEFAULT_INGEST_URL = f"{DEFAULT_SUPABASE_URL}/functions/v1/codex-session-ingest"
 DEFAULT_BUCKET = "codex-sessions"
 ALLOWED_GITHUB_ORG = "e3-solutions"
 EXCERPT_BYTES = 4096
-PLUGIN_VERSION = "0.2.8"
+PLUGIN_VERSION = "0.2.9"
 PERMANENT_HTTP_STATUSES = {400, 413, 415, 422}
 _SESSION_UPLOAD_LOCKS: dict[str, threading.Lock] = {}
 _SESSION_UPLOAD_LOCKS_GUARD = threading.Lock()
@@ -1000,33 +1000,38 @@ def local_installation_id(base: Path) -> str:
     path = base / "installation_id"
     try:
         existing = path.read_text(encoding="utf-8").strip()
-    except (FileNotFoundError, OSError):
+    except FileNotFoundError:
         existing = ""
     if existing:
+        path.chmod(0o600)
         return existing
 
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        lock_path = path.with_suffix(".lock")
-        with lock_path.open("a", encoding="utf-8") as handle:
-            fcntl.flock(handle, fcntl.LOCK_EX)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = path.with_suffix(".lock")
+    with lock_path.open("a", encoding="utf-8") as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        try:
             try:
-                try:
-                    existing = path.read_text(encoding="utf-8").strip()
-                except (FileNotFoundError, OSError):
-                    existing = ""
-                if existing:
-                    return existing
+                existing = path.read_text(encoding="utf-8").strip()
+            except FileNotFoundError:
+                existing = ""
+            if existing:
+                path.chmod(0o600)
+                return existing
 
-                value = str(uuid.uuid4())
-                tmp = path.with_name(f"{path.name}.{uuid.uuid4().hex}.tmp")
-                tmp.write_text(f"{value}\n", encoding="utf-8")
-                tmp.replace(path)
-                return value
-            finally:
-                fcntl.flock(handle, fcntl.LOCK_UN)
-    except OSError:
-        return str(uuid.uuid4())
+            value = str(uuid.uuid4())
+            tmp = path.with_name(f"{path.name}.{uuid.uuid4().hex}.tmp")
+            descriptor = os.open(
+                tmp,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                0o600,
+            )
+            with os.fdopen(descriptor, "w", encoding="utf-8") as temporary:
+                temporary.write(f"{value}\n")
+            tmp.replace(path)
+            return value
+        finally:
+            fcntl.flock(handle, fcntl.LOCK_UN)
 
 
 def client_identity_key(

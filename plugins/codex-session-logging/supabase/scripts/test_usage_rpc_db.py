@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
 import threading
 import uuid
@@ -16,10 +17,15 @@ from psycopg.types.json import Jsonb
 
 
 DATABASE_URL_ENV = "CODEX_SESSION_LOG_TEST_DATABASE_URL"
-MIGRATION = (
+USAGE_MIGRATION = (
     Path(__file__).resolve().parents[1]
     / "migrations"
     / "20260727053107_upsert_codex_session_usage_latest.sql"
+)
+CAPABILITY_MIGRATION = (
+    Path(__file__).resolve().parents[1]
+    / "migrations"
+    / "20260727145505_bind_codex_session_installation_capability.sql"
 )
 RPC = """
 select public.upsert_codex_session_usage_latest(
@@ -72,12 +78,26 @@ def main() -> None:
         admin.execute(sql.SQL("create database {}").format(sql.Identifier(database_name)))
 
     try:
+        bound_session = str(uuid.uuid4())
+        unbound_session = str(uuid.uuid4())
+        bound_owner = uuid.uuid4()
+        unbound_owner = uuid.uuid4()
+        installation_id = str(uuid.uuid4())
+        expected_capability = hashlib.sha256(installation_id.encode()).hexdigest()
+        inserted_without_digest = str(uuid.uuid4())
+        inserted_with_wrong_digest = str(uuid.uuid4())
+        inserted_owner = uuid.uuid4()
+        inserted_installation_id = str(uuid.uuid4())
+        inserted_capability = hashlib.sha256(
+            inserted_installation_id.encode()
+        ).hexdigest()
         with psycopg.connect(test_url, autocommit=True) as connection:
             connection.execute(
                 """
                 create table public.codex_sessions (
                   id text primary key,
-                  user_id uuid not null
+                  user_id uuid not null,
+                  metadata jsonb not null default '{}'::jsonb
                 );
                 create table public.codex_session_usage (
                   session_id text primary key references public.codex_sessions(id),
@@ -98,7 +118,142 @@ def main() -> None:
                 grant select, insert, update on public.codex_session_usage to service_role;
                 """
             )
-            connection.execute(MIGRATION.read_text())
+            connection.execute(
+                """
+                insert into public.codex_sessions (id, user_id, metadata)
+                values
+                  (%s, %s, %s),
+                  (%s, %s, %s)
+                """,
+                (
+                    bound_session,
+                    bound_owner,
+                    Jsonb({"client": {"installation_id": installation_id}}),
+                    unbound_session,
+                    unbound_owner,
+                    Jsonb(
+                        {
+                            "client": {
+                                "installation_id": (
+                                    "11111111-1111-1111-8111-111111111111"
+                                )
+                            }
+                        }
+                    ),
+                ),
+            )
+            connection.execute(USAGE_MIGRATION.read_text())
+            connection.execute(CAPABILITY_MIGRATION.read_text())
+
+            bindings = dict(
+                connection.execute(
+                    """
+                    select id, installation_capability_sha256
+                    from public.codex_sessions
+                    where id in (%s, %s)
+                    """,
+                    (bound_session, unbound_session),
+                ).fetchall()
+            )
+            assert bindings == {
+                bound_session: expected_capability,
+                unbound_session: None,
+            }, bindings
+
+            inserted_metadata = Jsonb(
+                {"client": {"installation_id": inserted_installation_id}}
+            )
+            connection.execute(
+                """
+                insert into public.codex_sessions (id, user_id, metadata)
+                values (%s, %s, %s)
+                """,
+                (inserted_without_digest, inserted_owner, inserted_metadata),
+            )
+            connection.execute(
+                """
+                insert into public.codex_sessions (
+                  id, user_id, metadata, installation_capability_sha256
+                ) values (%s, %s, %s, %s)
+                """,
+                (
+                    inserted_with_wrong_digest,
+                    inserted_owner,
+                    inserted_metadata,
+                    "f" * 64,
+                ),
+            )
+            inserted_bindings = dict(
+                connection.execute(
+                    """
+                    select id, installation_capability_sha256
+                    from public.codex_sessions
+                    where id in (%s, %s)
+                    """,
+                    (inserted_without_digest, inserted_with_wrong_digest),
+                ).fetchall()
+            )
+            assert inserted_bindings == {
+                inserted_without_digest: inserted_capability,
+                inserted_with_wrong_digest: inserted_capability,
+            }, inserted_bindings
+
+            replacement_owner = uuid.uuid4()
+            replacement_capability = "f" * 64
+            connection.execute(
+                """
+                update public.codex_sessions
+                set user_id = %s, installation_capability_sha256 = %s
+                where id in (%s, %s)
+                """,
+                (
+                    replacement_owner,
+                    replacement_capability,
+                    bound_session,
+                    unbound_session,
+                ),
+            )
+            connection.execute(
+                """
+                update public.codex_sessions
+                set
+                  user_id = %s,
+                  installation_capability_sha256 = case
+                    when id = %s then null
+                    else %s
+                  end
+                where id in (%s, %s)
+                """,
+                (
+                    replacement_owner,
+                    inserted_without_digest,
+                    replacement_capability,
+                    inserted_without_digest,
+                    inserted_with_wrong_digest,
+                ),
+            )
+            preserved = {
+                row[0]: (row[1], row[2])
+                for row in connection.execute(
+                    """
+                    select id, user_id, installation_capability_sha256
+                    from public.codex_sessions
+                    where id in (%s, %s, %s, %s)
+                    """,
+                    (
+                        bound_session,
+                        unbound_session,
+                        inserted_without_digest,
+                        inserted_with_wrong_digest,
+                    ),
+                ).fetchall()
+            }
+            assert preserved == {
+                bound_session: (bound_owner, expected_capability),
+                unbound_session: (unbound_owner, None),
+                inserted_without_digest: (inserted_owner, inserted_capability),
+                inserted_with_wrong_digest: (inserted_owner, inserted_capability),
+            }, preserved
 
             signature = (
                 "public.upsert_codex_session_usage_latest(text,bigint,bigint,"
@@ -120,7 +275,10 @@ def main() -> None:
             concurrent_session = str(uuid.uuid4())
             conflict_session = str(uuid.uuid4())
             connection.execute(
-                "insert into public.codex_sessions values (%s, %s), (%s, %s)",
+                """
+                insert into public.codex_sessions (id, user_id)
+                values (%s, %s), (%s, %s)
+                """,
                 (concurrent_session, owner, conflict_session, owner),
             )
             connection.execute(

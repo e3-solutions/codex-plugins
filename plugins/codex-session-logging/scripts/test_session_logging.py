@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -63,6 +64,41 @@ class RemoteBelongsToOrgTests(unittest.TestCase):
             context["repo_remote"],
             "https://github.com/e3-solutions/negotiation.git",
         )
+
+
+class InstallationIdPermissionsTests(unittest.TestCase):
+    def test_existing_installation_id_is_tightened_to_owner_only(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            path = base / "installation_id"
+            path.write_text("existing-id\n", encoding="utf-8")
+            path.chmod(0o644)
+
+            self.assertEqual(session_logging.local_installation_id(base), "existing-id")
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+
+    def test_existing_installation_id_chmod_failure_raises(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            path = base / "installation_id"
+            path.write_text("existing-id\n", encoding="utf-8")
+
+            with (
+                patch.object(Path, "chmod", side_effect=OSError("denied")),
+                self.assertRaises(OSError),
+            ):
+                session_logging.local_installation_id(base)
+
+            self.assertEqual(path.read_text(encoding="utf-8").strip(), "existing-id")
+
+    def test_new_installation_id_is_created_owner_only(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory) / "state"
+
+            value = session_logging.local_installation_id(base)
+
+            self.assertEqual((base / "installation_id").read_text().strip(), value)
+            self.assertEqual((base / "installation_id").stat().st_mode & 0o777, 0o600)
 
 
 if __name__ == "__main__":

@@ -115,6 +115,7 @@ Deno.test("handleRequest preserves existing session codex setup on later event u
   const originalFetch = globalThis.fetch;
   const previousUrl = Deno.env.get("SUPABASE_URL");
   const previousServiceRole = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
+  const existingUserId = "11111111-1111-4111-8111-111111111111";
   const existingSetup = {
     settings: { model: "gpt-5.5" },
     plugins: [{ name: "codex-session-logging@coreedge-local", enabled: true }],
@@ -134,10 +135,13 @@ Deno.test("handleRequest preserves existing session codex setup on later event u
       ? JSON.parse(requestInit.body) as JsonObject
       : null;
     requests.push({ url, body });
-    if (
-      url.includes("/rest/v1/codex_sessions?select=") ||
-      url.includes("/rest/v1/codex_session_users?select=")
-    ) {
+    if (url.includes("/rest/v1/codex_session_users?select=")) {
+      return new Response(JSON.stringify([{ user_id: existingUserId }]), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    }
+    if (url.includes("/rest/v1/codex_sessions?select=")) {
       return new Response(
         JSON.stringify([{
           metadata: {
@@ -146,6 +150,7 @@ Deno.test("handleRequest preserves existing session codex setup on later event u
           },
           thread_id: "existing-thread",
           started_at: "2026-07-01T00:00:00.000Z",
+          user_id: existingUserId,
         }]),
         { status: 200, headers: { "content-type": "application/json" } },
       );
@@ -284,6 +289,10 @@ Deno.test("handleRequest upserts session user identity rollup", async () => {
 
     assertEquals(response.status, 200);
     assertEquals(sessionUpsert?.body?.thread_id, "thread-users");
+    assertEquals(
+      sessionUpsert?.body?.installation_capability_sha256,
+      await testSha256Hex("2ae2052b-f419-47d5-b76a-fe5afdbe4394"),
+    );
     assertEquals(userUpsert?.body, {
       user_id: sessionUpsert?.body?.user_id,
       first_seen_at: "2026-07-07T00:00:00.000Z",
@@ -394,16 +403,18 @@ Deno.test("handleRequest reuses the email-backed user for an existing installati
   }
 });
 
-Deno.test("handleRequest still upserts non-backfill session token usage", async () => {
+Deno.test("handleRequest accepts usage with matching capability and configured token", async () => {
   const requests: Array<{ url: string; body: JsonObject | null }> = [];
   const originalFetch = globalThis.fetch;
   const previousUrl = Deno.env.get("SUPABASE_URL");
   const previousServiceRole = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
   const previousIngestToken = Deno.env.get("CODEX_SESSION_LOG_INGEST_TOKEN");
+  const installationId = "2ae2052b-f419-47d5-b76a-fe5afdbe4394";
+  const capability = await testSha256Hex(installationId);
 
   Deno.env.set("SUPABASE_URL", "https://project.supabase.co");
   Deno.env.set("SUPABASE_SERVICE_ROLE_KEY", "service-role-key");
-  Deno.env.set("CODEX_SESSION_LOG_INGEST_TOKEN", "usage-secret");
+  Deno.env.set("CODEX_SESSION_LOG_INGEST_TOKEN", "global-secret");
   globalThis.fetch = async (input, init = {}) => {
     const url = input instanceof Request
       ? input.url
@@ -415,14 +426,16 @@ Deno.test("handleRequest still upserts non-backfill session token usage", async 
       ? JSON.parse(requestInit.body) as JsonObject
       : null;
     requests.push({ url, body });
-    if (
-      url.includes("/rest/v1/codex_sessions?select=") ||
-      url.includes("/rest/v1/codex_session_users?select=")
-    ) {
-      return new Response(JSON.stringify([]), {
-        status: 200,
-        headers: { "content-type": "application/json" },
-      });
+    if (url.includes("/rest/v1/codex_sessions?select=")) {
+      return new Response(
+        JSON.stringify([{
+          installation_capability_sha256: capability,
+        }]),
+        {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        },
+      );
     }
     return new Response("", { status: 201 });
   };
@@ -433,7 +446,7 @@ Deno.test("handleRequest still upserts non-backfill session token usage", async 
         method: "POST",
         headers: {
           "content-type": "application/json",
-          "x-codex-session-log-token": "usage-secret",
+          "x-codex-session-log-token": "global-secret",
         },
         body: JSON.stringify({
           version: 1,
@@ -457,7 +470,7 @@ Deno.test("handleRequest still upserts non-backfill session token usage", async 
           },
           client: {
             repo_remote: "https://github.com/e3-solutions/codex-plugins.git",
-            installation_id: "install-1",
+            installation_id: installationId,
           },
         }),
       }),
@@ -498,7 +511,7 @@ Deno.test("handleRequest rejects inconsistent usage before any write", async () 
 
   Deno.env.set("SUPABASE_URL", "https://project.supabase.co");
   Deno.env.set("SUPABASE_SERVICE_ROLE_KEY", "service-role-key");
-  Deno.env.set("CODEX_SESSION_LOG_INGEST_TOKEN", "usage-secret");
+  Deno.env.delete("CODEX_SESSION_LOG_INGEST_TOKEN");
   globalThis.fetch = async (input, init = {}) => {
     const url = input instanceof Request
       ? input.url
@@ -517,10 +530,7 @@ Deno.test("handleRequest rejects inconsistent usage before any write", async () 
     const response = await handleRequest(
       new Request("https://example.test/codex-session-ingest", {
         method: "POST",
-        headers: {
-          "content-type": "application/json",
-          "x-codex-session-log-token": "usage-secret",
-        },
+        headers: { "content-type": "application/json" },
         body: JSON.stringify({
           version: 1,
           record: {
@@ -540,7 +550,7 @@ Deno.test("handleRequest rejects inconsistent usage before any write", async () 
           },
           client: {
             repo_remote: "https://github.com/e3-solutions/codex-plugins.git",
-            installation_id: "install-1",
+            installation_id: "2ae2052b-f419-47d5-b76a-fe5afdbe4394",
           },
         }),
       }),
@@ -559,41 +569,114 @@ Deno.test("handleRequest rejects inconsistent usage before any write", async () 
   }
 });
 
-Deno.test("handleRequest fails closed for unsigned usage", async () => {
+Deno.test("handleRequest returns one retryable failure for usage capability errors", async () => {
+  const originalFetch = globalThis.fetch;
+  const previousUrl = Deno.env.get("SUPABASE_URL");
+  const previousServiceRole = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
   const previousIngestToken = Deno.env.get("CODEX_SESSION_LOG_INGEST_TOKEN");
+  const installationId = "2ae2052b-f419-47d5-b76a-fe5afdbe4394";
+  const otherCapability = await testSha256Hex(
+    "11111111-1111-4111-8111-111111111111",
+  );
+  const scenarios: Array<{
+    installationId?: string;
+    rows: JsonObject[];
+  }> = [
+    { rows: [] },
+    { installationId: "not-a-uuid", rows: [] },
+    { installationId, rows: [] },
+    { installationId, rows: [{}] },
+    {
+      installationId,
+      rows: [{ installation_capability_sha256: otherCapability }],
+    },
+  ];
+
+  Deno.env.set("SUPABASE_URL", "https://project.supabase.co");
+  Deno.env.set("SUPABASE_SERVICE_ROLE_KEY", "service-role-key");
   Deno.env.delete("CODEX_SESSION_LOG_INGEST_TOKEN");
   try {
-    const response = await handleRequest(
-      new Request("https://example.test/codex-session-ingest", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({
-          record: {
-            id: "804fd832-7779-4665-9bec-2f10462c721b",
-            type: "usage",
-            session_id: "session-usage",
-            created_at: "2026-07-07T00:00:00.000Z",
-          },
-          usage: {
-            input_tokens: 1,
-            cached_input_tokens: 0,
-            output_tokens: 1,
-            reasoning_output_tokens: 0,
-            total_tokens: 2,
-            created_at: "2026-07-07T00:00:00.000Z",
-          },
-          client: {
-            repo_remote: "https://github.com/e3-solutions/codex-plugins.git",
-          },
+    for (const scenario of scenarios) {
+      let writes = 0;
+      globalThis.fetch = async (_input, init = {}) => {
+        const requestInit = init as { method?: string };
+        if (requestInit.method !== "GET") {
+          writes += 1;
+        }
+        return new Response(JSON.stringify(scenario.rows), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      };
+      const client: JsonObject = {
+        repo_remote: "https://github.com/e3-solutions/codex-plugins.git",
+      };
+      if (scenario.installationId) {
+        client.installation_id = scenario.installationId;
+      }
+      const response = await handleRequest(
+        new Request("https://example.test/codex-session-ingest", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            record: {
+              type: "usage",
+              session_id: "session-usage",
+            },
+            usage: {
+              input_tokens: 1,
+              cached_input_tokens: 0,
+              output_tokens: 1,
+              reasoning_output_tokens: 0,
+              total_tokens: 2,
+              created_at: "2026-07-07T00:00:00.000Z",
+            },
+            client,
+          }),
         }),
-      }),
-    );
+      );
 
-    assertEquals(response.status, 503);
-    assertEquals(await response.json(), {
-      error: "usage_ingest_auth_not_configured",
-    });
+      assertEquals(response.status, 503);
+      assertEquals(await response.json(), { error: "usage_ingest_retryable" });
+      assertEquals(writes, 0);
+    }
   } finally {
+    globalThis.fetch = originalFetch;
+    restoreEnv("SUPABASE_URL", previousUrl);
+    restoreEnv("SUPABASE_SERVICE_ROLE_KEY", previousServiceRole);
+    restoreEnv("CODEX_SESSION_LOG_INGEST_TOKEN", previousIngestToken);
+  }
+});
+
+Deno.test("handleRequest retains the configured token check for all requests", async () => {
+  const originalFetch = globalThis.fetch;
+  const previousIngestToken = Deno.env.get("CODEX_SESSION_LOG_INGEST_TOKEN");
+  let fetchCalls = 0;
+  Deno.env.set("CODEX_SESSION_LOG_INGEST_TOKEN", "global-secret");
+  globalThis.fetch = () => {
+    fetchCalls += 1;
+    return Promise.resolve(new Response("", { status: 201 }));
+  };
+  try {
+    for (
+      const payload of [
+        { client: {} },
+        { client: {}, record: { type: "usage" } },
+      ]
+    ) {
+      const response = await handleRequest(
+        new Request("https://example.test/codex-session-ingest", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(payload),
+        }),
+      );
+      assertEquals(response.status, 401);
+      assertEquals(await response.json(), { error: "invalid_ingest_token" });
+    }
+    assertEquals(fetchCalls, 0);
+  } finally {
+    globalThis.fetch = originalFetch;
     restoreEnv("CODEX_SESSION_LOG_INGEST_TOKEN", previousIngestToken);
   }
 });
@@ -657,6 +740,7 @@ Deno.test("handleRequest stores rollout bytes and catalogs retries idempotently"
             client: { git_user_name: "Existing Name" },
           },
           thread_id: "existing-thread",
+          user_id: "99999999-9999-4999-8999-999999999999",
         }]),
         {
           status: 200,
@@ -748,6 +832,78 @@ Deno.test("handleRequest stores rollout bytes and catalogs retries idempotently"
     globalThis.fetch = originalFetch;
     restoreEnv("SUPABASE_URL", previousUrl);
     restoreEnv("SUPABASE_SERVICE_ROLE_KEY", previousServiceRole);
+  }
+});
+
+Deno.test("handleRequest rejects existing event and rollout owner mismatches before writes", async () => {
+  const originalFetch = globalThis.fetch;
+  const previousUrl = Deno.env.get("SUPABASE_URL");
+  const previousServiceRole = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
+  const previousIngestToken = Deno.env.get("CODEX_SESSION_LOG_INGEST_TOKEN");
+  const eventPayload = {
+    record: {
+      id: "804fd832-7779-4665-9bec-2f10462c721b",
+      type: "event",
+      session_id: "existing-event-session",
+      seq: 1,
+      event_type: "tool_call_started",
+      created_at: "2026-07-27T00:00:00.000Z",
+      metadata: { tool_name: "shell", tool_phase: "started" },
+    },
+    event: { metadata: { tool_name: "shell", tool_phase: "started" } },
+    client: {
+      repo_remote: "https://github.com/e3-solutions/codex-plugins.git",
+      installation_id: "install-1",
+    },
+  };
+  const rolloutPayload = await rolloutChunkPayload("complete rollout line\n");
+  let writes = 0;
+
+  Deno.env.set("SUPABASE_URL", "https://project.supabase.co");
+  Deno.env.set("SUPABASE_SERVICE_ROLE_KEY", "service-role-key");
+  Deno.env.delete("CODEX_SESSION_LOG_INGEST_TOKEN");
+  globalThis.fetch = async (input, init = {}) => {
+    const url = input instanceof Request
+      ? input.url
+      : input instanceof URL
+      ? input.toString()
+      : input;
+    const requestInit = init as { method?: string };
+    if (requestInit.method !== "GET") {
+      writes += 1;
+    }
+    const rows = url.includes("/rest/v1/codex_session_users?select=")
+      ? [{
+        user_id: "11111111-1111-4111-8111-111111111111",
+        first_seen_at: "2026-07-01T00:00:00.000Z",
+      }]
+      : [{ user_id: "22222222-2222-4222-8222-222222222222" }];
+    return new Response(JSON.stringify(rows), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  };
+
+  try {
+    for (const payload of [eventPayload, rolloutPayload]) {
+      writes = 0;
+      const response = await handleRequest(
+        new Request("https://example.test/codex-session-ingest", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(payload),
+        }),
+      );
+
+      assertEquals(response.status, 422);
+      assertEquals(await response.json(), { error: "session_rejected" });
+      assertEquals(writes, 0);
+    }
+  } finally {
+    globalThis.fetch = originalFetch;
+    restoreEnv("SUPABASE_URL", previousUrl);
+    restoreEnv("SUPABASE_SERVICE_ROLE_KEY", previousServiceRole);
+    restoreEnv("CODEX_SESSION_LOG_INGEST_TOKEN", previousIngestToken);
   }
 });
 
@@ -1270,6 +1426,16 @@ async function rolloutChunkPayload(content: string): Promise<JsonObject> {
       installation_id: "install-1",
     },
   };
+}
+
+async function testSha256Hex(value: string): Promise<string> {
+  const digest = await crypto.subtle.digest(
+    "SHA-256",
+    new TextEncoder().encode(value),
+  );
+  return Array.from(new Uint8Array(digest)).map((byte) =>
+    byte.toString(16).padStart(2, "0")
+  ).join("");
 }
 
 function optionalTestObject(value: unknown): JsonObject {
