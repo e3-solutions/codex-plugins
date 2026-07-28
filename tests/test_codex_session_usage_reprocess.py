@@ -566,6 +566,13 @@ def test_observation_migration_is_append_only_indexed_and_keeps_old_rpc():
     assert "enable row level security" in sql
     assert "from pg_catalog.pg_roles" in sql
     assert "create role codestat_ro nologin" in sql
+    assert "grant usage on schema public to codestat_ro" in sql
+    for source_table in (
+        "public.codex_sessions",
+        "public.codex_session_messages",
+        "public.codex_session_users",
+    ):
+        assert f"on {source_table}\n  for select\n  to codestat_ro" in sql
     assert "to codestat_ro\n  using (true)" in sql
     assert "to codestat_ro;" in sql
     assert "grant select, insert" in sql

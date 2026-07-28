@@ -507,6 +507,9 @@ def main() -> None:
             observation_privileges = connection.execute(
                 """
                 select
+                  has_schema_privilege(
+                    'codestat_ro', 'public', 'usage'
+                  ),
                   has_table_privilege(
                     'anon',
                     'public.codex_session_usage_observations',
@@ -590,6 +593,7 @@ def main() -> None:
                 """
             ).fetchone()
             assert codestat_source_access == (
+                True,
                 True,
                 True,
                 True,

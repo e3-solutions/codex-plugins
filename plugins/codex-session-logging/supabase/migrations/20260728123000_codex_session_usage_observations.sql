@@ -31,6 +31,8 @@ begin
 end
 $$;
 
+grant usage on schema public to codestat_ro;
+
 create index codex_session_usage_observations_observed_session_idx
   on public.codex_session_usage_observations (
     observed_at desc,
