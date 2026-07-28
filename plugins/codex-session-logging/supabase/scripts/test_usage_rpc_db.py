@@ -560,6 +560,42 @@ def main() -> None:
                 False,
             ), observation_privileges
 
+            codestat_source_access = connection.execute(
+                """
+                select
+                  has_table_privilege(
+                    'codestat_ro', 'public.codex_sessions', 'select'
+                  ),
+                  has_table_privilege(
+                    'codestat_ro', 'public.codex_session_messages', 'select'
+                  ),
+                  has_table_privilege(
+                    'codestat_ro', 'public.codex_session_users', 'select'
+                  ),
+                  (
+                    select count(*)
+                    from pg_policies
+                    where schemaname = 'public'
+                      and tablename in (
+                        'codex_sessions',
+                        'codex_session_messages',
+                        'codex_session_users',
+                        'codex_session_usage_observations'
+                      )
+                      and cmd = 'SELECT'
+                      and permissive = 'PERMISSIVE'
+                      and 'codestat_ro'::name = any(roles)
+                      and coalesce(btrim(qual), 'true') in ('true', '(true)')
+                  )
+                """
+            ).fetchone()
+            assert codestat_source_access == (
+                True,
+                True,
+                True,
+                4,
+            ), codestat_source_access
+
             owner = uuid.uuid4()
             wrong_owner = uuid.uuid4()
             concurrent_session = str(uuid.uuid4())
@@ -670,6 +706,16 @@ def main() -> None:
             ]
         with psycopg.connect(test_url) as connection:
             connection.execute("set role codestat_ro")
+            for table in (
+                "codex_sessions",
+                "codex_session_messages",
+                "codex_session_users",
+            ):
+                connection.execute(
+                    sql.SQL("select count(*) from public.{}").format(
+                        sql.Identifier(table)
+                    )
+                ).fetchone()
             assert connection.execute(
                 """
                 select count(*)

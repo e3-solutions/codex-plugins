@@ -59,6 +59,24 @@ create policy "Codestat can read Codex session usage observations"
   to codestat_ro
   using (true);
 
+create policy "Codestat can read Codex sessions"
+  on public.codex_sessions
+  for select
+  to codestat_ro
+  using (true);
+
+create policy "Codestat can read Codex session messages"
+  on public.codex_session_messages
+  for select
+  to codestat_ro
+  using (true);
+
+create policy "Codestat can read Codex session users"
+  on public.codex_session_users
+  for select
+  to codestat_ro
+  using (true);
+
 revoke all privileges
   on public.codex_session_usage_observations
   from anon, authenticated, service_role, codestat_ro;
@@ -72,7 +90,10 @@ grant select, insert
   to service_role;
 
 grant select
-  on public.codex_session_usage_observations
+  on public.codex_session_usage_observations,
+    public.codex_sessions,
+    public.codex_session_messages,
+    public.codex_session_users
   to codestat_ro;
 
 create or replace function public.upsert_codex_session_usage_latest(
