@@ -581,6 +581,8 @@ def test_observation_migration_is_append_only_indexed_and_keeps_old_rpc():
     assert "create or replace function public.upsert_codex_session_usage_latest(" in sql
     assert "on conflict (id) do nothing" in sql
     assert "at time zone 'utc'" in sql
+    assert "pg_catalog.substring(observation_digest, 1, 16)" in sql
+    assert "pg_catalog.substring(observation_digest from" not in sql
     assert "excluded.input_tokens >= public.codex_session_usage.input_tokens" in sql
     assert (
         "excluded.cached_input_tokens\n      >= "

@@ -185,15 +185,15 @@ begin
     (pg_catalog.get_byte(observation_digest, 8) & 63) | 128
   );
   observation_hex := pg_catalog.encode(
-    pg_catalog.substring(observation_digest from 1 for 16),
+    pg_catalog.substring(observation_digest, 1, 16),
     'hex'
   );
   observation_id := (
-    pg_catalog.substring(observation_hex from 1 for 8) || '-'
-    || pg_catalog.substring(observation_hex from 9 for 4) || '-'
-    || pg_catalog.substring(observation_hex from 13 for 4) || '-'
-    || pg_catalog.substring(observation_hex from 17 for 4) || '-'
-    || pg_catalog.substring(observation_hex from 21 for 12)
+    pg_catalog.substring(observation_hex, 1, 8) || '-'
+    || pg_catalog.substring(observation_hex, 9, 4) || '-'
+    || pg_catalog.substring(observation_hex, 13, 4) || '-'
+    || pg_catalog.substring(observation_hex, 17, 4) || '-'
+    || pg_catalog.substring(observation_hex, 21, 12)
   )::uuid;
 
   insert into public.codex_session_usage_observations (
