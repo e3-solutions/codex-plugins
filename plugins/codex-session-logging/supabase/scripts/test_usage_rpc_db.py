@@ -22,6 +22,11 @@ USAGE_MIGRATION = (
     / "migrations"
     / "20260727053107_upsert_codex_session_usage_latest.sql"
 )
+OBSERVATION_MIGRATION = (
+    Path(__file__).resolve().parents[1]
+    / "migrations"
+    / "20260728123000_codex_session_usage_observations.sql"
+)
 CAPABILITY_MIGRATION = (
     Path(__file__).resolve().parents[1]
     / "migrations"
@@ -44,17 +49,58 @@ select public.upsert_codex_session_usage_latest(
 """
 
 
-def invoke(database_url: str, session_id: str, total: int, observed_at: str) -> None:
+def invoke(
+    database_url: str,
+    session_id: str,
+    total: int,
+    observed_at: str,
+    *,
+    timezone_name: str | None = None,
+) -> None:
+    invoke_usage(
+        database_url,
+        session_id,
+        input_tokens=total - 20,
+        cached_input_tokens=10,
+        output_tokens=8,
+        reasoning_output_tokens=2,
+        observed_at=observed_at,
+        timezone_name=timezone_name,
+    )
+
+
+def invoke_usage(
+    database_url: str,
+    session_id: str,
+    *,
+    input_tokens: int,
+    cached_input_tokens: int,
+    output_tokens: int,
+    reasoning_output_tokens: int,
+    observed_at: str,
+    timezone_name: str | None = None,
+) -> None:
     with psycopg.connect(database_url, autocommit=True) as connection:
         connection.execute("set role service_role")
+        if timezone_name:
+            connection.execute(
+                "select set_config('timezone', %s, false)",
+                (timezone_name,),
+            )
+        total = (
+            input_tokens
+            + cached_input_tokens
+            + output_tokens
+            + reasoning_output_tokens
+        )
         connection.execute(
             RPC,
             (
                 session_id,
-                total - 20,
-                10,
-                8,
-                2,
+                input_tokens,
+                cached_input_tokens,
+                output_tokens,
+                reasoning_output_tokens,
                 total,
                 258400,
                 observed_at,
@@ -73,6 +119,7 @@ def main() -> None:
     database_name = f"codex_usage_test_{uuid.uuid4().hex}"
     test_parameters = {**parameters, "dbname": database_name}
     test_url = psycopg.conninfo.make_conninfo(**test_parameters)
+    created_codestat_role = False
 
     with psycopg.connect(**admin_parameters, autocommit=True) as admin:
         missing_roles = admin.execute(
@@ -85,6 +132,12 @@ def main() -> None:
         ).fetchall()
         if missing_roles:
             raise SystemExit("local Supabase roles are missing")
+        codestat_role_exists = admin.execute(
+            "select exists (select from pg_roles where rolname = 'codestat_ro')"
+        ).fetchone()[0]
+        if not codestat_role_exists:
+            admin.execute("create role codestat_ro")
+            created_codestat_role = True
         admin.execute(sql.SQL("create database {}").format(sql.Identifier(database_name)))
 
     try:
@@ -111,6 +164,12 @@ def main() -> None:
         with psycopg.connect(test_url, autocommit=True) as connection:
             connection.execute(
                 """
+                create schema auth;
+                create function auth.uid()
+                returns uuid
+                language sql
+                stable
+                as 'select null::uuid';
                 create table public.codex_sessions (
                   id text primary key,
                   user_id uuid not null,
@@ -243,6 +302,7 @@ def main() -> None:
             connection.execute(USAGE_MIGRATION.read_text())
             connection.execute(REPAIR_MIGRATION.read_text())
             connection.execute(REPAIR_MIGRATION.read_text())
+            connection.execute(OBSERVATION_MIGRATION.read_text())
             repaired_rows = {
                 row[0]: row[1:]
                 for row in connection.execute(
@@ -444,6 +504,102 @@ def main() -> None:
             ).fetchone()
             assert privileges == (False, False, True), privileges
 
+            observation_privileges = connection.execute(
+                """
+                select
+                  has_schema_privilege(
+                    'codestat_ro', 'public', 'usage'
+                  ),
+                  has_table_privilege(
+                    'anon',
+                    'public.codex_session_usage_observations',
+                    'select'
+                  ),
+                  has_table_privilege(
+                    'authenticated',
+                    'public.codex_session_usage_observations',
+                    'select'
+                  ),
+                  has_table_privilege(
+                    'authenticated',
+                    'public.codex_session_usage_observations',
+                    'insert'
+                  ),
+                  has_table_privilege(
+                    'service_role',
+                    'public.codex_session_usage_observations',
+                    'insert'
+                  ),
+                  has_table_privilege(
+                    'service_role',
+                    'public.codex_session_usage_observations',
+                    'update'
+                  ),
+                  has_table_privilege(
+                    'service_role',
+                    'public.codex_session_usage_observations',
+                    'delete'
+                  ),
+                  has_table_privilege(
+                    'codestat_ro',
+                    'public.codex_session_usage_observations',
+                    'select'
+                  ),
+                  has_table_privilege(
+                    'codestat_ro',
+                    'public.codex_session_usage_observations',
+                    'insert'
+                  )
+                """
+            ).fetchone()
+            assert observation_privileges == (
+                False,
+                True,
+                False,
+                True,
+                False,
+                False,
+                True,
+                False,
+            ), observation_privileges
+
+            codestat_source_access = connection.execute(
+                """
+                select
+                  has_table_privilege(
+                    'codestat_ro', 'public.codex_sessions', 'select'
+                  ),
+                  has_table_privilege(
+                    'codestat_ro', 'public.codex_session_messages', 'select'
+                  ),
+                  has_table_privilege(
+                    'codestat_ro', 'public.codex_session_users', 'select'
+                  ),
+                  (
+                    select count(*)
+                    from pg_policies
+                    where schemaname = 'public'
+                      and tablename in (
+                        'codex_sessions',
+                        'codex_session_messages',
+                        'codex_session_users',
+                        'codex_session_usage_observations'
+                      )
+                      and cmd = 'SELECT'
+                      and permissive = 'PERMISSIVE'
+                      and 'codestat_ro'::name = any(roles)
+                      and coalesce(btrim(qual), 'true') in ('true', '(true)')
+                  )
+                """
+            ).fetchone()
+            assert codestat_source_access == (
+                True,
+                True,
+                True,
+                True,
+                4,
+            ), codestat_source_access
+
             owner = uuid.uuid4()
             wrong_owner = uuid.uuid4()
             concurrent_session = str(uuid.uuid4())
@@ -498,6 +654,80 @@ def main() -> None:
             assert row[0] == owner
             assert row[1] == 200
             assert row[2].isoformat() == "2026-07-27T10:05:00+00:00"
+
+        invoke(
+            test_url,
+            concurrent_session,
+            150,
+            "2026-07-27T10:02:00Z",
+            timezone_name="UTC",
+        )
+        invoke(
+            test_url,
+            concurrent_session,
+            150,
+            "2026-07-27T03:02:00-07:00",
+            timezone_name="America/Los_Angeles",
+        )
+        invoke_usage(
+            test_url,
+            concurrent_session,
+            input_tokens=179,
+            cached_input_tokens=20,
+            output_tokens=15,
+            reasoning_output_tokens=6,
+            observed_at="2026-07-27T10:06:00Z",
+        )
+        with psycopg.connect(test_url) as connection:
+            latest = connection.execute(
+                """
+                select total_tokens, observed_at
+                from public.codex_session_usage
+                where session_id = %s
+                """,
+                (concurrent_session,),
+            ).fetchone()
+            observations = connection.execute(
+                """
+                select
+                  input_tokens + cached_input_tokens
+                    + output_tokens + reasoning_output_tokens as total_tokens,
+                  observed_at
+                from public.codex_session_usage_observations
+                where session_id = %s
+                order by observed_at
+                """,
+                (concurrent_session,),
+            ).fetchall()
+            assert latest is not None
+            assert latest[0] == 200
+            assert latest[1].isoformat() == "2026-07-27T10:05:00+00:00"
+            assert [(row[0], row[1].isoformat()) for row in observations] == [
+                (100, "2026-07-27T10:00:00+00:00"),
+                (150, "2026-07-27T10:02:00+00:00"),
+                (200, "2026-07-27T10:05:00+00:00"),
+                (220, "2026-07-27T10:06:00+00:00"),
+            ]
+        with psycopg.connect(test_url) as connection:
+            connection.execute("set role codestat_ro")
+            for table in (
+                "codex_sessions",
+                "codex_session_messages",
+                "codex_session_users",
+            ):
+                connection.execute(
+                    sql.SQL("select count(*) from public.{}").format(
+                        sql.Identifier(table)
+                    )
+                ).fetchone()
+            assert connection.execute(
+                """
+                select count(*)
+                from public.codex_session_usage_observations
+                where session_id = %s
+                """,
+                (concurrent_session,),
+            ).fetchone()[0] == 4
         print("usage RPC database integration: PASS")
     finally:
         with psycopg.connect(**admin_parameters, autocommit=True) as admin:
@@ -506,6 +736,8 @@ def main() -> None:
                 (database_name,),
             )
             admin.execute(sql.SQL("drop database {}").format(sql.Identifier(database_name)))
+            if created_codestat_role:
+                admin.execute("drop role codestat_ro")
 
 
 if __name__ == "__main__":

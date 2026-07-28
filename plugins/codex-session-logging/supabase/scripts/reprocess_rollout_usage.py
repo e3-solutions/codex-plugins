@@ -11,6 +11,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from collections import defaultdict
+from concurrent.futures import Future, ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterator
@@ -20,7 +21,11 @@ PLUGIN_SCRIPTS = Path(__file__).resolve().parents[2] / "scripts"
 if str(PLUGIN_SCRIPTS) not in sys.path:
     sys.path.insert(0, str(PLUGIN_SCRIPTS))
 
-from rollout_usage import parse_cumulative_usage, usage_is_newer  # noqa: E402
+from rollout_usage import (  # noqa: E402
+    parse_cumulative_usage,
+    usage_is_newer,
+    usage_observation_id,
+)
 
 
 JsonDict = dict[str, Any]
@@ -29,6 +34,8 @@ MAX_EVENTS_PER_SESSION = 5000
 DEFAULT_PAGE_SIZE = 200
 DEFAULT_LOOKBACK_HOURS = 72
 DEFAULT_MAX_SESSIONS = 500
+DEFAULT_WORKERS = 1
+MAX_WORKERS = 4
 STORAGE_GET_ATTEMPTS = 3
 STORAGE_GET_BACKOFF_SECONDS = (0.25, 0.5)
 REPLAY_CHUNK_METADATA_FIELDS = (
@@ -186,7 +193,7 @@ class UsageJsonlStream:
     def __init__(self) -> None:
         self.partial = b""
         self.skip_until_newline = False
-        self.latest: JsonDict | None = None
+        self.observations: list[JsonDict] = []
 
     def feed(self, content: bytes) -> None:
         if self.skip_until_newline:
@@ -206,12 +213,12 @@ class UsageJsonlStream:
         else:
             self.skip_until_newline = True
 
-    def finish(self) -> JsonDict | None:
+    def finish(self) -> list[JsonDict]:
         """Parse one complete final JSON value even without a newline."""
         if not self.skip_until_newline:
             self._accept_line(self.partial)
         self.partial = b""
-        return self.latest
+        return self.observations
 
     def _accept_line(self, line: bytes) -> None:
         if not line.strip() or len(line) > MAX_PARTIAL_LINE_BYTES:
@@ -222,8 +229,8 @@ class UsageJsonlStream:
             return
         if isinstance(envelope, dict):
             usage = parse_cumulative_usage(envelope)
-            if usage is not None and usage_is_newer(usage, self.latest):
-                self.latest = usage
+            if usage is not None:
+                self.observations.append(usage)
 
 
 def service_role_key() -> str:
@@ -252,14 +259,18 @@ def reprocess_rollout_usage(
     max_sessions: int = DEFAULT_MAX_SESSIONS,
     after_session: str | None = None,
     cutoff: str | None = None,
+    workers: int = DEFAULT_WORKERS,
 ) -> JsonDict:
     if page_size < 1 or lookback_hours < 1 or max_sessions < 1:
         raise ReplayError("page size, lookback hours, and max sessions must be positive")
+    if workers < 1 or workers > MAX_WORKERS:
+        raise ReplayError(f"workers must be between 1 and {MAX_WORKERS}")
     cutoff_time = parse_timestamp(cutoff) if cutoff else datetime.now(timezone.utc)
     cutoff_text = iso_timestamp(cutoff_time)
     since_text = iso_timestamp(cutoff_time - timedelta(hours=lookback_hours))
 
     event_count = generation_count = session_count = sessions_with_usage = rpc_calls = 0
+    observation_count = 0
     legacy_events_quarantined = legacy_sessions_quarantined = 0
     errors: list[str] = []
     resume_after_session = after_session
@@ -269,73 +280,121 @@ def reprocess_rollout_usage(
     current_overflow = False
     truncated = False
     stopped = False
+    pending_sessions: list[tuple[str, list[JsonDict], int, bool]] = []
+    executor = ThreadPoolExecutor(max_workers=workers) if workers > 1 else None
 
-    def process_current() -> bool:
+    def queue_current() -> None:
+        if current_session is not None:
+            pending_sessions.append(
+                (
+                    current_session,
+                    list(current_rows),
+                    current_legacy_events,
+                    current_overflow,
+                )
+            )
+
+    def process_pending() -> bool:
         nonlocal generation_count, session_count, sessions_with_usage, rpc_calls
+        nonlocal observation_count
         nonlocal legacy_events_quarantined, legacy_sessions_quarantined
         nonlocal resume_after_session
-        if current_session is None:
+        if not pending_sessions:
             return True
-        session_count += 1
-        if current_legacy_events:
-            legacy_events_quarantined += current_legacy_events
-            legacy_sessions_quarantined += 1
-            errors.append(
-                f"session {current_session} contains {current_legacy_events} "
-                "legacy rollout events without replay metadata"
+        futures: list[Future[JsonDict] | None] = []
+        for session_id, rows, legacy_events, overflow in pending_sessions:
+            if legacy_events or overflow or executor is None:
+                futures.append(None)
+            else:
+                futures.append(
+                    executor.submit(
+                        reprocess_session,
+                        client,
+                        session_id=session_id,
+                        rows=rows,
+                    )
+                )
+
+        for (session_id, rows, legacy_events, overflow), future in zip(
+            pending_sessions, futures
+        ):
+            session_count += 1
+            if legacy_events:
+                legacy_events_quarantined += legacy_events
+                legacy_sessions_quarantined += 1
+                errors.append(
+                    f"session {session_id} contains {legacy_events} "
+                    "legacy rollout events without replay metadata"
+                )
+                resume_after_session = session_id
+                continue
+            if overflow:
+                errors.append(
+                    f"session {session_id} exceeds {MAX_EVENTS_PER_SESSION} rollout events"
+                )
+                return False
+            result = (
+                future.result()
+                if future is not None
+                else reprocess_session(client, session_id=session_id, rows=rows)
             )
-            resume_after_session = current_session
-            return True
-        if current_overflow:
-            errors.append(
-                f"session {current_session} exceeds {MAX_EVENTS_PER_SESSION} rollout events"
-            )
-            return False
-        result = reprocess_session(client, session_id=current_session, rows=current_rows)
-        generation_count += result["generations"]
-        if result["errors"]:
-            errors.extend(result["errors"])
-            return False
-        if result["usage"] is not None:
-            sessions_with_usage += 1
-            if apply:
-                try:
-                    client.upsert_usage(result["parameters"])
-                except ReplayError as exc:
-                    errors.append(str(exc))
-                    return False
-                rpc_calls += 1
-        resume_after_session = current_session
+            generation_count += result["generations"]
+            if result["errors"]:
+                errors.extend(result["errors"])
+                return False
+            if result["usage"] is not None:
+                sessions_with_usage += 1
+                observation_count += len(result["parameters"])
+                if apply:
+                    for parameters in result["parameters"]:
+                        try:
+                            client.upsert_usage(parameters)
+                        except ReplayError as exc:
+                            errors.append(str(exc))
+                            return False
+                        rpc_calls += 1
+            resume_after_session = session_id
+        pending_sessions.clear()
         return True
 
-    for row in client.iter_rollout_events(
-        page_size=page_size,
-        since=since_text,
-        cutoff=cutoff_text,
-        after_session=after_session,
-    ):
-        session_id = event_session_id(row)
-        if current_session is not None and session_id != current_session:
-            if not process_current():
-                stopped = True
-                break
-            if session_count >= max_sessions:
-                truncated = True
-                stopped = True
-                break
-            current_rows = []
-            current_legacy_events = 0
-            current_overflow = False
-        current_session = session_id
-        event_count += 1
-        if is_legacy_rollout_event(row):
-            current_legacy_events += 1
-        elif len(current_rows) < MAX_EVENTS_PER_SESSION:
-            current_rows.append(row)
-        else:
-            current_overflow = True
-    if not stopped:
-        process_current()
+    try:
+        for row in client.iter_rollout_events(
+            page_size=page_size,
+            since=since_text,
+            cutoff=cutoff_text,
+            after_session=after_session,
+        ):
+            session_id = event_session_id(row)
+            if current_session is not None and session_id != current_session:
+                queue_current()
+                if (
+                    len(pending_sessions) >= workers
+                    or session_count + len(pending_sessions) >= max_sessions
+                ):
+                    if not process_pending():
+                        stopped = True
+                        break
+                if session_count >= max_sessions:
+                    truncated = True
+                    stopped = True
+                    break
+                current_rows = []
+                current_legacy_events = 0
+                current_overflow = False
+            current_session = session_id
+            event_count += 1
+            if is_legacy_rollout_event(row):
+                current_legacy_events += 1
+            elif len(current_rows) < MAX_EVENTS_PER_SESSION:
+                current_rows.append(row)
+            else:
+                current_overflow = True
+        if not stopped:
+            queue_current()
+            process_pending()
+    finally:
+        if executor is not None:
+            executor.shutdown(wait=True)
 
     return {
         "mode": "apply" if apply else "dry-run",
@@ -345,6 +404,7 @@ def reprocess_rollout_usage(
         "generations": generation_count,
         "sessions": session_count,
         "sessions_with_usage": sessions_with_usage,
+        "observations": observation_count,
         "rpc_calls": rpc_calls,
         "legacy_events_quarantined": legacy_events_quarantined,
         "legacy_sessions_quarantined": legacy_sessions_quarantined,
@@ -368,10 +428,11 @@ def reprocess_session(
         by_generation[generation].append(row)
 
     latest: tuple[JsonDict, str] | None = None
+    observations: dict[str, tuple[JsonDict, str]] = {}
     errors: list[str] = []
     for generation, generation_rows in sorted(by_generation.items()):
         try:
-            usage = usage_from_generation(
+            generation_usage = usage_from_generation(
                 client,
                 session_id=session_id,
                 generation=generation,
@@ -380,8 +441,11 @@ def reprocess_session(
         except ReplayError as exc:
             errors.append(str(exc))
             continue
-        if usage is not None and (latest is None or usage_is_newer(usage, latest[0])):
-            latest = (usage, generation)
+        for usage in generation_usage:
+            observation_id = usage_observation_id(session_id, usage)
+            observations.setdefault(observation_id, (usage, generation))
+            if latest is None or usage_is_newer(usage, latest[0]):
+                latest = (usage, generation)
 
     result: JsonDict = {
         "generations": len(by_generation),
@@ -389,11 +453,19 @@ def reprocess_session(
         "usage": latest[0] if latest else None,
     }
     if latest and not errors:
-        result["parameters"] = usage_rpc_parameters(
-            session_id=session_id,
-            generation=latest[1],
-            usage=latest[0],
-        )
+        result["parameters"] = [
+            usage_rpc_parameters(
+                session_id=session_id,
+                generation=generation,
+                usage=usage,
+            )
+            for _observation_id, (usage, generation) in sorted(
+                observations.items(),
+                key=lambda item: (str(item[1][0]["created_at"]), item[0]),
+            )
+        ]
+    else:
+        result["parameters"] = []
     return result
 
 
@@ -403,7 +475,7 @@ def usage_from_generation(
     session_id: str,
     generation: str,
     rows: list[JsonDict],
-) -> JsonDict | None:
+) -> list[JsonDict]:
     chunks = [validated_chunk(row, session_id, generation) for row in rows]
     chunks.sort(key=lambda chunk: (chunk["start_offset"], chunk["end_offset"]))
     expected_offset = 0
@@ -550,6 +622,12 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--page-size", type=int, default=DEFAULT_PAGE_SIZE)
     parser.add_argument("--lookback-hours", type=int, default=DEFAULT_LOOKBACK_HOURS)
     parser.add_argument("--max-sessions", type=int, default=DEFAULT_MAX_SESSIONS)
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=DEFAULT_WORKERS,
+        help=f"Concurrent session readers (1-{MAX_WORKERS}; default: 1).",
+    )
     parser.add_argument("--after-session", help="Resume after this completed session id.")
     parser.add_argument(
         "--cutoff",
@@ -565,6 +643,7 @@ def main(argv: list[str] | None = None) -> None:
             max_sessions=args.max_sessions,
             after_session=args.after_session,
             cutoff=args.cutoff,
+            workers=args.workers,
         )
     except ReplayError as exc:
         print(json.dumps({"error": str(exc)}, sort_keys=True))
