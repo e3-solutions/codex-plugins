@@ -471,7 +471,6 @@ def sync_rollout_file(
     key = str(descriptor["session_id"])
     previous = files.get(key) if isinstance(files.get(key), dict) else {}
     queued = 0
-    usage_queued = False
     with path.open("rb") as handle:
         stat = os.fstat(handle.fileno())
         reset = file_was_replaced(handle, path, stat, previous)
@@ -527,20 +526,19 @@ def sync_rollout_file(
                 content=content,
             )
             session_logging.enqueue_record(base, record)
-            usage = parse_incremental_usage(
+            usages = parse_incremental_usage(
                 entry,
                 content,
-                fallback_created_at=str(descriptor["created_at"]),
                 at_stable_end=end_offset >= stable_end,
             )
-            if usage is not None and queue_rollout_usage(
-                base,
-                descriptor=descriptor,
-                usage=usage,
-            ):
-                if not usage_queued:
+            for usage in usages:
+                if queue_rollout_usage(
+                    base,
+                    descriptor=descriptor,
+                    usage=usage,
+                    generation=str(entry["generation"]),
+                ):
                     queued += 1
-                    usage_queued = True
             entry["offset"] = end_offset
             write_state(base, state)
             offset = end_offset
@@ -634,16 +632,15 @@ def parse_incremental_usage(
     entry: JsonDict,
     content: bytes,
     *,
-    fallback_created_at: str,
     at_stable_end: bool = False,
-) -> JsonDict | None:
+) -> list[JsonDict]:
     """Parse complete JSONL lines while retaining at most 1 MiB of a tail."""
     if bool(entry.get("usage_skip_until_newline")):
         newline = content.find(b"\n")
         if newline < 0:
             entry["usage_partial_base64"] = ""
             entry["usage_skip_until_newline"] = True
-            return None
+            return []
         content = content[newline + 1 :]
         entry["usage_skip_until_newline"] = False
 
@@ -690,10 +687,7 @@ def parse_incremental_usage(
         entry["usage_partial_base64"] = ""
         entry["usage_skip_until_newline"] = True
 
-    return rollout_usage.latest_cumulative_usage(
-        parsed_envelopes,
-        fallback_created_at=fallback_created_at,
-    )
+    return rollout_usage.cumulative_usage_observations(parsed_envelopes)
 
 
 def queue_rollout_usage(
@@ -701,32 +695,28 @@ def queue_rollout_usage(
     *,
     descriptor: JsonDict,
     usage: JsonDict,
+    generation: str,
 ) -> bool:
     session_id = str(descriptor["session_id"])
-    usage_path = f"rollout-sync/usage/{session_id}.json"
-    path = base / usage_path
-    try:
-        existing_detail = session_logging.read_json_file(path)
-    except (FileNotFoundError, OSError, ValueError, json.JSONDecodeError):
-        existing_detail = None
-    if existing_detail is not None and not rollout_usage.usage_is_newer(
-        usage,
-        existing_detail,
-    ):
-        return False
-
-    event_id = deterministic_uuid(f"rollout-usage:v1:{session_id}")
+    event_id = rollout_usage.usage_observation_id(session_id, usage)
     thread_id = session_logging.sha256_hex(str(descriptor["path"]))
-    metadata = {
+    record_metadata = {
         **descriptor["metadata"],
         "source": "rollout_sync_usage",
+        "file_generation": generation,
     }
+    usage_metadata = {
+        "source": "rollout_sync_usage",
+        "file_generation": generation,
+    }
+    if isinstance(descriptor["metadata"].get("agent"), str):
+        usage_metadata["agent"] = descriptor["metadata"]["agent"]
     detail: JsonDict = {
         "id": event_id,
         "session_id": session_id,
         "thread_id": thread_id,
         **usage,
-        "metadata": metadata,
+        "metadata": usage_metadata,
     }
     record: JsonDict = {
         "id": event_id,
@@ -735,20 +725,12 @@ def queue_rollout_usage(
         "thread_id": thread_id,
         "hook_event_name": "RolloutSync",
         "created_at": usage["created_at"],
-        "metadata": metadata,
-        "local_content_path": usage_path,
+        "metadata": record_metadata,
+        "usage": detail,
         "uploaded_at": None,
     }
-    session_logging.write_json_atomic(path, detail)
     session_logging.enqueue_record(base, record)
     return True
-
-
-def deterministic_uuid(value: str) -> str:
-    digest = bytearray(hashlib.sha256(value.encode("utf-8")).digest()[:16])
-    digest[6] = (digest[6] & 0x0F) | 0x50
-    digest[8] = (digest[8] & 0x3F) | 0x80
-    return str(UUID(bytes=bytes(digest)))
 
 
 def read_state(base: Path) -> JsonDict:

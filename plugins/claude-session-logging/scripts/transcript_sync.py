@@ -3,8 +3,8 @@
 
 Unlike the metadata-only presence/lifecycle path, this module reads the Claude
 Code transcript (``~/.claude/projects/<slug>/<sessionId>.jsonl``) - the source of
-truth for a session - and emits ``message`` records plus a single
-cumulative-session-total ``usage`` record through the plugin's existing queue,
+truth for a session - and emits ``message`` records plus immutable
+cumulative-session-total ``usage`` observations through the plugin's existing queue,
 mirroring ``codex-session-logging``. Capture matches the Codex capture
 specification exactly: only user-prompt TEXT and assistant-response TEXT are
 stored. Tool input bodies, tool output bodies, and thinking/reasoning blocks are
@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import fcntl
 import json
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -78,11 +79,9 @@ def sync_transcript_records(
     Reads a per-session cursor (last processed line index + running token
     totals), processes only newer lines, emits one ``message`` record per
     user-prompt or assistant-response TEXT turn (tool-result turns and empty
-    text turns are skipped), and, when this run added new assistant-turn
-    usage, emits exactly ONE ``usage`` record carrying the cumulative session
-    totals (deterministic id from the session id, so it upserts the same
-    codex_session_usage row every time). Then persists the cursor. Deterministic
-    ids + cursor make re-runs a no-op.
+    text turns are skipped), and emits an immutable cumulative ``usage`` record
+    for every new assistant usage snapshot. Then it persists the cursor.
+    Observation-specific deterministic ids + cursor make re-runs a no-op.
 
     ``source`` stamps ``metadata.source`` (live sync uses ``transcript_sync`` so
     the ingest writes the rows; the historical backfill passes
@@ -151,22 +150,17 @@ def sync_transcript_records(
             turn_usage = _extract_turn_usage(envelope)
             if turn_usage is not None:
                 _accumulate_usage(totals, turn_usage)
+                usage_record = _cumulative_usage_record(
+                    target=target,
+                    base=base,
+                    safe_session=safe_session,
+                    totals=totals,
+                    source=source,
+                )
+                session_logging.enqueue_record(base, usage_record)
+                usage_count += 1
+                queued += 1
                 new_usage_turns += 1
-
-        # Emit exactly ONE usage record carrying the running session totals when
-        # this run added new assistant-turn usage. Deterministic id from the
-        # session id alone -> it upserts the same row every time (idempotent).
-        if new_usage_turns:
-            usage_record = _cumulative_usage_record(
-                target=target,
-                base=base,
-                safe_session=safe_session,
-                totals=totals,
-                source=source,
-            )
-            session_logging.enqueue_record(base, usage_record)
-            usage_count += 1
-            queued += 1
 
         if highest_index > last_index or new_usage_turns:
             _write_cursor(
@@ -265,14 +259,15 @@ def _extract_turn_usage(envelope: JsonDict) -> JsonDict | None:
         return None
     input_tokens = _non_negative_int(usage.get("input_tokens"))
     output_tokens = _non_negative_int(usage.get("output_tokens"))
-    if input_tokens is None or output_tokens is None:
+    created_at = _aware_observed_at(envelope.get("timestamp"))
+    if input_tokens is None or output_tokens is None or created_at is None:
         return None
     return {
         "input_tokens": input_tokens,
         "output_tokens": output_tokens,
         "cache_read": _non_negative_int(usage.get("cache_read_input_tokens")) or 0,
         "cache_creation": _non_negative_int(usage.get("cache_creation_input_tokens")) or 0,
-        "created_at": _string(envelope.get("timestamp")) or session_logging.now_iso(),
+        "created_at": created_at,
         "model": _string(message.get("model")),
         "service_tier": _string(usage.get("service_tier")),
     }
@@ -323,7 +318,9 @@ def _cumulative_usage_record(
     # cache reads, so preserve cache creation in metadata without folding it
     # into either the fresh-input headline or total_tokens.
     total_tokens = input_tokens + output_tokens + cache_read
-    created_at = totals.get("created_at") or session_logging.now_iso()
+    created_at = _aware_observed_at(totals.get("created_at"))
+    if created_at is None:
+        raise ValueError("cumulative usage requires an aware observation timestamp")
     model = totals.get("model")
     service_tier = totals.get("service_tier")
 
@@ -334,12 +331,23 @@ def _cumulative_usage_record(
         metadata["service_tier"] = service_tier
     metadata["cache_creation_input_tokens"] = cache_creation
 
-    # Session-only id so re-emits upsert the same codex_session_usage row.
+    identity = json.dumps(
+        [
+            session_id,
+            created_at,
+            input_tokens,
+            cache_read,
+            output_tokens,
+            0,
+        ],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
     record_id = session_logging.deterministic_uuid(
-        f"claude-transcript-v{SYNC_VERSION}:{session_id}:usage"
+        f"claude-transcript-v{SYNC_VERSION}:usage:{identity}"
     )
     thread_id = session_logging.sha256_hex(transcript_path)
-    storage_path = f"users/local/sessions/{safe_session}/usage.json"
+    storage_path = f"users/local/sessions/{safe_session}/usage/{record_id}.json"
 
     detail: JsonDict = {
         "id": record_id,
@@ -372,6 +380,21 @@ def _cumulative_usage_record(
         "local_content_path": storage_path,
         "uploaded_at": None,
     }
+
+
+def _aware_observed_at(value: object) -> str | None:
+    text = _string(value)
+    if text is None:
+        return None
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        return None
+    return parsed.astimezone(timezone.utc).isoformat(timespec="microseconds").replace(
+        "+00:00", "Z"
+    )
 
 
 # --- transcript parsing ----------------------------------------------------
