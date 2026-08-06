@@ -2828,7 +2828,6 @@ def git_tokens_are_write_like(tokens: list[str]) -> bool:
         "commit",
         "merge",
         "mv",
-        "pull",
         "push",
         "rebase",
         "reset",

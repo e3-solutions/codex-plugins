@@ -1169,6 +1169,27 @@ def test_pre_tool_guard_allows_unbound_repo_read_only_commands(tmp_path, monkeyp
         assert decision.blocked is False, command
 
 
+def test_pre_tool_guard_allows_repository_sync_without_active_state(tmp_path, monkeypatch):
+    state_dir = tmp_path / "state"
+    config_dir = tmp_path / "config"
+    monkeypatch.setenv("LINEAR_SYNC_STATE_DIR", str(state_dir))
+    monkeypatch.setenv("LINEAR_SYNC_CONFIG_DIR", str(config_dir))
+    repo = init_git_repo(tmp_path / "repo", branch="arya/no-linear-binding")
+
+    commands = [
+        "git fetch --all --prune",
+        "git pull",
+        "git pull --ff-only origin main",
+    ]
+
+    for command in commands:
+        decision = linear_sync.pre_tool_guard_decision(
+            {"tool_name": "Bash", "command": command},
+            root=repo,
+        )
+        assert decision.blocked is False, command
+
+
 def test_pre_tool_guard_allows_unknown_non_write_bash_without_active_state(tmp_path, monkeypatch):
     monkeypatch.setenv("LINEAR_SYNC_STATE_DIR", str(tmp_path))
     bind_linear_repo(tmp_path, tmp_path, monkeypatch)
