@@ -745,9 +745,18 @@ def test_transcript_sync_emits_messages_and_usage(tmp_path, monkeypatch):
     assert usage["cached_input_tokens"] == 30
     assert usage["output_tokens"] == 20
     assert usage["reasoning_output_tokens"] == 0
-    assert usage["total_tokens"] == 100 + 20 + 10 + 30
+    assert usage["total_tokens"] == 100 + 20 + 30
+    assert usage["total_tokens"] == sum(
+        usage[key]
+        for key in (
+            "input_tokens",
+            "cached_input_tokens",
+            "output_tokens",
+            "reasoning_output_tokens",
+        )
+    )
     assert usage["model_context_window"] == 200000
-    assert usage["created_at"] == "2026-07-16T00:00:05.000Z"
+    assert usage["created_at"] == "2026-07-16T00:00:05.000000Z"
     assert usages[0]["metadata"]["agent"] == "claude"
     assert usages[0]["metadata"]["cache_creation_input_tokens"] == 10
     assert usages[0]["metadata"]["model"] == "claude-opus-4-8"
@@ -838,7 +847,7 @@ def test_transcript_sync_drops_tool_and_thinking_bodies(tmp_path, monkeypatch):
     # had real text. The tool_result turn and the tool_use/thinking-only
     # assistant turn produce no rows.
     assert result["messages"] == 2
-    assert len(usages) == 1
+    assert len(usages) == 2
     assert {m["role"] for m in messages} == {"user", "assistant"}
 
     user_body = session_logging.build_ingest_payload(
@@ -865,7 +874,10 @@ def test_transcript_sync_drops_tool_and_thinking_bodies(tmp_path, monkeypatch):
         assert secret not in haystack
 
     # Usage still accumulates across BOTH assistant turns (counts, not PII).
-    usage = session_logging.build_ingest_payload(usages[0], base=base)["usage"]
+    usage = session_logging.build_ingest_payload(
+        max(usages, key=lambda record: record["created_at"]),
+        base=base,
+    )["usage"]
     assert usage["input_tokens"] == 100 + 5
     assert usage["output_tokens"] == 20 + 5
 
@@ -918,28 +930,98 @@ def test_transcript_sync_usage_is_cumulative_session_total(tmp_path, monkeypatch
 
     base = tmp_path / "state"
     result = transcript_sync.sync_transcript_records("claude-multi", transcript)
-    # Two assistant turns with usage -> exactly ONE usage record.
-    assert result["usage"] == 1
+    # Every assistant usage snapshot remains independently replayable.
+    assert result["usage"] == 2
     usages = [r for r in _pending_records(session_logging, base) if r["type"] == "usage"]
-    assert len(usages) == 1
+    assert len(usages) == 2
+    assert len({record["id"] for record in usages}) == 2
+    assert len({record["local_content_path"] for record in usages}) == 2
 
-    usage = session_logging.build_ingest_payload(usages[0], base=base)["usage"]
+    latest_record = max(usages, key=lambda record: record["created_at"])
+    usage = session_logging.build_ingest_payload(latest_record, base=base)["usage"]
     # Summed across both turns.
     assert usage["output_tokens"] == 20 + 50
     assert usage["input_tokens"] == 100 + 200
     assert usage["cached_input_tokens"] == 30 + 60
-    assert usage["total_tokens"] == (100 + 200) + (20 + 50) + (10 + 5) + (30 + 60)
-    assert usages[0]["metadata"]["cache_creation_input_tokens"] == 10 + 5
-    assert usage["created_at"] == "2026-07-16T00:00:15.000Z"  # latest turn
+    assert usage["total_tokens"] == (100 + 200) + (20 + 50) + (30 + 60)
+    assert latest_record["metadata"]["cache_creation_input_tokens"] == 10 + 5
+    assert usage["created_at"] == "2026-07-16T00:00:15.000000Z"  # latest turn
 
     # Re-running changes nothing: no new records, same row id, same totals.
-    usage_id = usages[0]["id"]
+    usage_ids = {record["id"] for record in usages}
     second = transcript_sync.sync_transcript_records("claude-multi", transcript)
     assert second["queued"] == 0
     usages_after = [r for r in _pending_records(session_logging, base) if r["type"] == "usage"]
-    assert len(usages_after) == 1
-    assert usages_after[0]["id"] == usage_id
-    assert session_logging.build_ingest_payload(usages_after[0], base=base)["usage"]["output_tokens"] == 70
+    assert len(usages_after) == 2
+    assert {record["id"] for record in usages_after} == usage_ids
+    assert session_logging.build_ingest_payload(
+        max(usages_after, key=lambda record: record["created_at"]),
+        base=base,
+    )["usage"]["output_tokens"] == 70
+
+
+def test_claude_usage_requires_and_canonicalizes_aware_event_time(tmp_path):
+    session_logging = load_scripts_module("session_logging")
+    transcript_sync = load_scripts_module("transcript_sync")
+    usage = {"input_tokens": 10, "output_tokens": 2}
+    missing = _assistant_line(
+        "missing", "", tmp_path, text="missing time", usage=usage
+    )
+    missing.pop("timestamp")
+    naive = _assistant_line(
+        "naive",
+        "2026-07-16T00:00:05",
+        tmp_path,
+        text="naive time",
+        usage=usage,
+    )
+    offset = _assistant_line(
+        "offset",
+        "2026-07-15T17:00:05-07:00",
+        tmp_path,
+        text="aware time",
+        usage=usage,
+    )
+    equivalent = _assistant_line(
+        "utc",
+        "2026-07-16T00:00:05Z",
+        tmp_path,
+        text="aware time",
+        usage=usage,
+    )
+
+    assert transcript_sync._extract_turn_usage(missing) is None
+    assert transcript_sync._extract_turn_usage(naive) is None
+    offset_usage = transcript_sync._extract_turn_usage(offset)
+    utc_usage = transcript_sync._extract_turn_usage(equivalent)
+    assert offset_usage is not None
+    assert utc_usage is not None
+    assert offset_usage["created_at"] == utc_usage["created_at"] == (
+        "2026-07-16T00:00:05.000000Z"
+    )
+
+    target = {
+        "session_id": "claude-aware-time",
+        "transcript_path": str(tmp_path / "transcript.jsonl"),
+        "cwd": str(tmp_path),
+        "git_branch": "main",
+    }
+    records = []
+    for turn_usage in (offset_usage, utc_usage):
+        totals = transcript_sync._load_usage_totals(None)
+        transcript_sync._accumulate_usage(totals, turn_usage)
+        records.append(
+            transcript_sync._cumulative_usage_record(
+                target=target,
+                base=tmp_path,
+                safe_session="claude-aware-time",
+                totals=totals,
+            )
+        )
+    assert records[0]["id"] == records[1]["id"]
+    assert records[0]["created_at"] == records[1]["created_at"]
+    payload = session_logging.build_ingest_payload(records[0], base=tmp_path)
+    assert payload["usage"]["created_at"] == "2026-07-16T00:00:05.000000Z"
 
 
 def test_transcript_sync_usage_accumulates_across_incremental_runs(tmp_path, monkeypatch):
@@ -963,13 +1045,17 @@ def test_transcript_sync_usage_accumulates_across_incremental_runs(tmp_path, mon
     ]
     transcript.write_text("\n".join(json.dumps(line) for line in turn1) + "\n", encoding="utf-8")
     transcript_sync.sync_transcript_records("claude-live", transcript)
+    first_record = next(
+        r for r in _pending_records(session_logging, base) if r["type"] == "usage"
+    )
+    first_detail = session_logging.build_ingest_payload(first_record, base=base)["usage"]
     usage_after_1 = session_logging.build_ingest_payload(
-        next(r for r in _pending_records(session_logging, base) if r["type"] == "usage"), base=base
+        first_record, base=base
     )["usage"]
     assert usage_after_1["output_tokens"] == 20
 
     # Turn 2 is appended; the next Stop hook syncs — usage must accumulate into
-    # the SAME row, not reset to just turn 2.
+    # a new immutable cumulative observation without replacing the pending first.
     with transcript.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(_user_line("u2", "2026-07-16T00:00:10.000Z", repo, "Second ask")) + "\n")
         handle.write(json.dumps(_assistant_line(
@@ -979,11 +1065,17 @@ def test_transcript_sync_usage_accumulates_across_incremental_runs(tmp_path, mon
     transcript_sync.sync_transcript_records("claude-live", transcript)
 
     usages = [r for r in _pending_records(session_logging, base) if r["type"] == "usage"]
-    assert len(usages) == 1  # still one row (same deterministic id)
-    usage = session_logging.build_ingest_payload(usages[0], base=base)["usage"]
+    assert len(usages) == 2
+    assert len({record["id"] for record in usages}) == 2
+    assert first_record["id"] in {record["id"] for record in usages}
+    assert session_logging.build_ingest_payload(first_record, base=base)["usage"] == first_detail
+    usage = session_logging.build_ingest_payload(
+        max(usages, key=lambda record: record["created_at"]),
+        base=base,
+    )["usage"]
     assert usage["output_tokens"] == 20 + 50
     assert usage["input_tokens"] == 100 + 200
-    assert usage["total_tokens"] == 300 + 70 + 15 + 90
+    assert usage["total_tokens"] == 300 + 70 + 90
 
 
 def test_transcript_sync_skips_repos_outside_e3(tmp_path, monkeypatch):
@@ -1046,7 +1138,7 @@ def test_drain_posts_message_and_usage_records_to_shared_ingest(tmp_path, monkey
         assert body["record"]["metadata"]["agent"] == "claude"
         assert body["client"]["repo_remote"] == "https://github.com/e3-solutions/codex-plugins.git"
     assert all("content" in body["message"] for body in by_type["message"])
-    assert by_type["usage"][0]["usage"]["total_tokens"] == 160
+    assert by_type["usage"][0]["usage"]["total_tokens"] == 150
 
 
 def test_auto_update_is_throttled(tmp_path, monkeypatch):

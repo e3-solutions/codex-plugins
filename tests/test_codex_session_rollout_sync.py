@@ -164,7 +164,7 @@ def token_count(
     }
 
 
-def test_sync_emits_deterministic_latest_real_usage_from_incremental_lines(tmp_path, monkeypatch):
+def test_sync_emits_every_deterministic_real_usage_observation(tmp_path):
     codex_home = tmp_path / "codex"
     rollout = tmp_path / "usage-rollout.jsonl"
     write_rollout(
@@ -190,20 +190,33 @@ def test_sync_emits_deterministic_latest_real_usage_from_incremental_lines(tmp_p
     )
     create_database(codex_home / "state.sqlite", [{"id": PARENT_ID, "rollout_path": rollout}])
     module = load_rollout_sync()
-    monkeypatch.setattr(module, "MAX_CHUNK_BYTES", 73)
+    module.MAX_CHUNK_BYTES = 1024 * 1024
 
     first = module.sync_rollouts(codex_home=codex_home)
     state_dir = tmp_path / "logging"
     records = queue_records(state_dir)
-    usage_record = next(record for record in records if record.get("type") == "usage")
-    detail = json.loads((state_dir / usage_record["local_content_path"]).read_text(encoding="utf-8"))
-    expected_id = module.deterministic_uuid(f"rollout-usage:v1:{PARENT_ID}")
+    usage_records = sorted(
+        (record for record in records if record.get("type") == "usage"),
+        key=lambda record: record["created_at"],
+    )
+    detail = usage_records[-1]["usage"]
 
     assert first["queued"] == len(records)
-    assert usage_record["id"] == expected_id
-    assert usage_record["local_content_path"] == f"rollout-sync/usage/{PARENT_ID}.json"
-    assert usage_record["metadata"]["source"] == "rollout_sync_usage"
-    assert usage_record["metadata"]["source"] != "historical_transcript"
+    assert len(usage_records) == 2
+    assert len({record["id"] for record in usage_records}) == 2
+    assert all(
+        record["id"]
+        == module.rollout_usage.usage_observation_id(PARENT_ID, record["usage"])
+        for record in usage_records
+    )
+    assert all(record["metadata"]["source"] == "rollout_sync_usage" for record in usage_records)
+    assert all("local_content_path" not in record for record in usage_records)
+    ingest_payload = module.session_logging.build_ingest_payload(
+        usage_records[-1],
+        base=state_dir,
+    )
+    assert ingest_payload["usage"] == detail
+    assert "usage" not in ingest_payload["record"]
     assert detail["input_tokens"] == 80
     assert detail["cached_input_tokens"] == 100
     assert detail["output_tokens"] == 30
@@ -220,10 +233,16 @@ def test_sync_emits_deterministic_latest_real_usage_from_incremental_lines(tmp_p
     ) == 215
     assert detail["created_at"] == "2026-07-26T12:01:00.000Z"
     assert detail["model_context_window"] == 258400
+    assert [
+        record["created_at"]
+        for record in usage_records
+        if record["created_at"] > "2026-07-26T12:00:00.000Z"
+        and record["created_at"] <= "2026-07-26T12:01:00.000Z"
+    ] == ["2026-07-26T12:01:00.000Z"]
     assert module.sync_rollouts(codex_home=codex_home)["queued"] == 0
 
 
-def test_sync_updates_one_usage_record_after_a_later_append(tmp_path):
+def test_sync_appends_a_distinct_usage_record_after_a_later_append(tmp_path):
     codex_home = tmp_path / "codex"
     rollout = tmp_path / "usage-append.jsonl"
     write_rollout(
@@ -266,14 +285,16 @@ def test_sync_updates_one_usage_record_after_a_later_append(tmp_path):
         hook_payload={"session_id": PARENT_ID, "transcript_path": str(rollout)},
     )
     records = queue_records(tmp_path / "logging")
-    usage_records = [record for record in records if record.get("type") == "usage"]
-    detail = json.loads(
-        (tmp_path / "logging" / usage_records[0]["local_content_path"]).read_text(encoding="utf-8")
+    usage_records = sorted(
+        (record for record in records if record.get("type") == "usage"),
+        key=lambda record: record["created_at"],
     )
+    detail = usage_records[-1]["usage"]
 
     assert result["queued"] == 2
-    assert len(usage_records) == 1
+    assert len(usage_records) == 2
     assert usage_records[0]["id"] == first_record["id"]
+    assert usage_records[1]["id"] != first_record["id"]
     assert detail["total_tokens"] == 24
     assert "model_context_window" not in detail
 
@@ -286,8 +307,7 @@ def test_incremental_usage_parser_bounds_partial_lines_and_recovers():
     assert module.parse_incremental_usage(
         entry,
         b"123456789",
-        fallback_created_at="2026-07-26T00:00:00Z",
-    ) is None
+    ) == []
     assert entry == {"usage_partial_base64": "", "usage_skip_until_newline": True}
 
     valid = json.dumps(
@@ -301,16 +321,75 @@ def test_incremental_usage_parser_bounds_partial_lines_and_recovers():
         separators=(",", ":"),
     ).encode()
     module.MAX_USAGE_PARTIAL_BYTES = len(valid) + 1
-    usage = module.parse_incremental_usage(
+    usages = module.parse_incremental_usage(
         entry,
         b"discarded\n" + valid + b"\n",
-        fallback_created_at="2026-07-26T00:00:00Z",
     )
 
-    assert usage is not None
-    assert usage["total_tokens"] == 2
+    assert len(usages) == 1
+    assert usages[0]["total_tokens"] == 2
     assert entry["usage_skip_until_newline"] is False
     assert base64.b64decode(entry["usage_partial_base64"]) == b""
+
+
+def test_incremental_usage_parser_accepts_valid_final_line_without_newline():
+    module = load_rollout_sync()
+    envelope = json.dumps(
+        token_count(
+            "2026-07-26T00:01:00Z",
+            input_tokens=8,
+            cached_input_tokens=3,
+            output_tokens=2,
+            total_tokens=10,
+        ),
+        separators=(",", ":"),
+    ).encode()
+    entry = {"usage_partial_base64": "", "usage_skip_until_newline": False}
+
+    usages = module.parse_incremental_usage(
+        entry,
+        envelope,
+        at_stable_end=True,
+    )
+
+    assert len(usages) == 1
+    assert usages[0]["input_tokens"] == 5
+    assert usages[0]["cached_input_tokens"] == 3
+    assert usages[0]["total_tokens"] == 10
+
+
+def test_incremental_usage_requires_an_aware_envelope_timestamp():
+    module = load_rollout_sync()
+    missing = token_count(
+        "2026-07-26T00:01:00Z",
+        input_tokens=8,
+        cached_input_tokens=3,
+        output_tokens=2,
+        total_tokens=10,
+    )
+    missing.pop("timestamp")
+    naive = {
+        **missing,
+        "timestamp": "2026-07-26T00:01:00",
+    }
+    aware = {
+        **missing,
+        "timestamp": "2026-07-25T17:01:00-07:00",
+    }
+    entry = {"usage_partial_base64": "", "usage_skip_until_newline": False}
+    content = b"".join(
+        json.dumps(envelope, separators=(",", ":")).encode() + b"\n"
+        for envelope in (missing, naive, aware)
+    )
+
+    usages = module.parse_incremental_usage(
+        entry,
+        content,
+        at_stable_end=True,
+    )
+
+    assert len(usages) == 1
+    assert usages[0]["created_at"] == "2026-07-25T17:01:00-07:00"
 
 
 def test_sync_captures_exact_parent_and_subagent_rollout_bytes_once(tmp_path):

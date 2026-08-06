@@ -4,6 +4,7 @@ import hashlib
 import importlib.util
 import json
 import sys
+import threading
 import urllib.error
 import uuid
 from pathlib import Path
@@ -72,6 +73,17 @@ def test_shared_parser_normalizes_inclusive_components_and_is_monotonic():
     invalid = usage_envelope("2026-07-26T10:05:00Z", 100)
     invalid["payload"]["info"]["total_token_usage"]["total_tokens"] = 101
     assert usage.parse_cumulative_usage(invalid) is None
+    missing_timestamp = usage_envelope("2026-07-26T10:05:00Z", 100)
+    missing_timestamp.pop("timestamp")
+    assert usage.parse_cumulative_usage(missing_timestamp) is None
+    assert usage.parse_cumulative_usage(
+        usage_envelope("2026-07-26T10:05:00", 100)
+    ) is None
+    equivalent = dict(parsed)
+    equivalent["created_at"] = "2026-07-26T03:00:00-07:00"
+    assert usage.usage_observation_id("session", parsed) == usage.usage_observation_id(
+        "session", equivalent
+    )
 
 
 class FakeClient:
@@ -95,6 +107,18 @@ class FakeClient:
 
     def upsert_usage(self, parameters: dict) -> None:
         self.upserts.append(parameters)
+
+
+class ParallelFakeClient(FakeClient):
+    def __init__(self, events: list[dict], objects: dict[tuple[str, str], bytes]):
+        super().__init__(events, objects)
+        self.download_barrier = threading.Barrier(2)
+        self.download_threads: set[int] = set()
+
+    def download(self, bucket: str, storage_path: str) -> bytes:
+        self.download_threads.add(threading.get_ident())
+        self.download_barrier.wait(timeout=2)
+        return super().download(bucket, storage_path)
 
 
 def stored_generation(
@@ -181,6 +205,48 @@ def test_replay_is_bounded_dry_run_then_applies_once_without_owner_input():
     assert "p_user_id" not in client.upserts[0]
 
 
+def test_replay_reads_independent_sessions_with_bounded_workers():
+    replay = load_module("reprocess_rollout_usage_workers", REPROCESS)
+    first = "11111111-1111-4111-8111-111111111111"
+    second = "22222222-2222-4222-8222-222222222222"
+    first_events, first_objects = stored_generation(
+        first,
+        "a" * 16,
+        rollout_bytes(usage_envelope("2026-07-26T10:05:00Z", 220)),
+    )
+    second_events, second_objects = stored_generation(
+        second,
+        "b" * 16,
+        rollout_bytes(usage_envelope("2026-07-26T10:06:00Z", 300)),
+    )
+    client = ParallelFakeClient(
+        [*first_events, *second_events],
+        {**first_objects, **second_objects},
+    )
+
+    result = replay.reprocess_rollout_usage(
+        client,
+        cutoff="2026-07-27T00:00:00Z",
+        workers=2,
+    )
+
+    assert result["sessions"] == 2
+    assert result["observations"] == 2
+    assert len(client.download_threads) == 2
+
+
+@pytest.mark.parametrize("workers", [0, 5])
+def test_replay_rejects_unbounded_worker_counts(workers):
+    replay = load_module(f"reprocess_rollout_usage_workers_{workers}", REPROCESS)
+
+    with pytest.raises(replay.ReplayError, match="workers must be between 1 and 4"):
+        replay.reprocess_rollout_usage(
+            FakeClient([], {}),
+            cutoff="2026-07-27T00:00:00Z",
+            workers=workers,
+        )
+
+
 def test_replay_rejects_non_contiguous_chunks_without_writing():
     replay = load_module("reprocess_rollout_usage_gap", REPROCESS)
     session_id = "11111111-1111-4111-8111-111111111111"
@@ -203,6 +269,60 @@ def test_replay_rejects_non_contiguous_chunks_without_writing():
     assert result["rpc_calls"] == 0
     assert "non-contiguous offset" in result["errors"][0]
     assert client.upserts == []
+
+
+def test_replay_recovers_valid_final_token_count_without_newline():
+    replay = load_module("reprocess_rollout_usage_no_newline", REPROCESS)
+    session_id = "11111111-1111-4111-8111-111111111111"
+    raw = json.dumps(
+        usage_envelope("2026-07-26T10:00:00Z", 100),
+        separators=(",", ":"),
+    ).encode()
+    events, objects = stored_generation(session_id, "d" * 16, raw, cuts=(19,))
+    client = FakeClient(events, objects)
+
+    result = replay.reprocess_rollout_usage(
+        client,
+        apply=True,
+        cutoff="2026-07-27T00:00:00Z",
+    )
+
+    assert result["sessions_with_usage"] == 1
+    assert result["rpc_calls"] == 1
+    assert client.upserts[0]["p_session_id"] == session_id
+    assert client.upserts[0]["p_total_tokens"] == 100
+
+
+def test_replay_applies_every_distinct_observation_including_regression():
+    replay = load_module("reprocess_rollout_usage_all_observations", REPROCESS)
+    session_id = "11111111-1111-4111-8111-111111111111"
+    first = usage_envelope("2026-07-26T10:00:00Z", 100)
+    second = usage_envelope("2026-07-26T10:05:00Z", 200)
+    regression = usage_envelope("2026-07-26T10:10:00Z", 150)
+    events, objects = stored_generation(
+        session_id,
+        "e" * 16,
+        rollout_bytes(first, second, second, regression),
+    )
+    client = FakeClient(events, objects)
+
+    result = replay.reprocess_rollout_usage(
+        client,
+        apply=True,
+        cutoff="2026-07-27T00:00:00Z",
+    )
+
+    assert result["observations"] == 3
+    assert result["rpc_calls"] == 3
+    assert [parameters["p_total_tokens"] for parameters in client.upserts] == [
+        100,
+        200,
+        150,
+    ]
+    assert all(
+        parameters["p_cached_input_tokens"] > 0
+        for parameters in client.upserts
+    )
 
 
 def test_replay_quarantines_exact_legacy_session_and_continues():
@@ -419,3 +539,79 @@ def test_usage_rpc_migration_derives_owner_and_is_service_role_only():
     assert "excluded.total_tokens >= public.codex_session_usage.total_tokens" in sql
     assert "excluded.observed_at >= public.codex_session_usage.observed_at" in sql
     assert "codex_rollout_replay_snapshot" not in sql
+
+
+def test_observation_migration_is_append_only_indexed_and_keeps_old_rpc():
+    migration = next(
+        (PLUGIN / "supabase" / "migrations").glob(
+            "*codex_session_usage_observations.sql"
+        )
+    )
+    sql = migration.read_text().lower()
+    table_sql = sql.split(
+        "create table public.codex_session_usage_observations (", 1
+    )[1].split(");", 1)[0]
+
+    assert "id uuid primary key" in table_sql
+    assert "references public.codex_sessions(id) on delete cascade" in table_sql
+    assert "cached_input_tokens bigint not null" in table_sql
+    assert "reasoning_output_tokens bigint not null" in table_sql
+    assert "observed_at timestamptz not null" in table_sql
+    assert "total_tokens" not in table_sql
+    assert "model_context_window" not in table_sql
+    assert "created_at" not in table_sql
+    assert "(start, end]" in sql
+    assert "observed_at desc,\n    session_id" in sql
+    assert "session_id,\n    observed_at desc,\n    id desc" in sql
+    assert "enable row level security" in sql
+    assert "from pg_catalog.pg_roles" in sql
+    assert "create role codestat_ro nologin" in sql
+    assert "grant usage on schema public to codestat_ro" in sql
+    for source_table in (
+        "public.codex_sessions",
+        "public.codex_session_messages",
+        "public.codex_session_users",
+    ):
+        assert f"on {source_table}\n  for select\n  to codestat_ro" in sql
+    assert "to codestat_ro\n  using (true)" in sql
+    assert "to codestat_ro;" in sql
+    assert "grant select, insert" in sql
+    assert "grant update" not in sql
+    assert "grant delete" not in sql
+    assert "create or replace function public.upsert_codex_session_usage_latest(" in sql
+    assert "on conflict (id) do nothing" in sql
+    assert "at time zone 'utc'" in sql
+    assert "pg_catalog.substring(observation_digest, 1, 16)" in sql
+    assert "pg_catalog.substring(observation_digest from" not in sql
+    assert "excluded.input_tokens >= public.codex_session_usage.input_tokens" in sql
+    assert (
+        "excluded.cached_input_tokens\n      >= "
+        "public.codex_session_usage.cached_input_tokens"
+    ) in sql
+    assert "excluded.output_tokens >= public.codex_session_usage.output_tokens" in sql
+    assert (
+        "excluded.reasoning_output_tokens\n      >= "
+        "public.codex_session_usage.reasoning_output_tokens"
+    ) in sql
+    assert "excluded.total_tokens >= public.codex_session_usage.total_tokens" in sql
+    assert "excluded.observed_at >= public.codex_session_usage.observed_at" in sql
+
+
+def test_additive_repair_migration_is_source_and_pattern_gated():
+    migration = next(
+        (PLUGIN / "supabase" / "migrations").glob(
+            "*repair_additive_session_usage.sql"
+        )
+    )
+    sql = migration.read_text().lower()
+
+    assert "metadata ->> 'source' = 'historical_transcript'" in sql
+    assert "input_tokens >= cached_input_tokens" in sql
+    assert "output_tokens >= reasoning_output_tokens" in sql
+    assert "metadata ->> 'source' = 'transcript_sync'" in sql
+    assert "metadata ->> 'agent' = 'claude'" in sql
+    assert "cache_creation_input_tokens" in sql
+    assert "'^[0-9]{1,19}$'" in sql
+    assert "<= 9223372036854775807::numeric" in sql
+    assert "total_tokens::numeric" in sql
+    assert "validate constraint" not in sql

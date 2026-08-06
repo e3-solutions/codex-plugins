@@ -40,7 +40,7 @@ DEFAULT_INGEST_URL = f"{DEFAULT_SUPABASE_URL}/functions/v1/codex-session-ingest"
 DEFAULT_BUCKET = "codex-sessions"
 ALLOWED_GITHUB_ORG = "e3-solutions"
 EXCERPT_BYTES = 4096
-PLUGIN_VERSION = "0.2.9"
+PLUGIN_VERSION = "0.2.11"
 PERMANENT_HTTP_STATUSES = {400, 413, 415, 422}
 _SESSION_UPLOAD_LOCKS: dict[str, threading.Lock] = {}
 _SESSION_UPLOAD_LOCKS_GUARD = threading.Lock()
@@ -939,14 +939,24 @@ def ingest_url() -> str:
 
 
 def build_ingest_payload(record: JsonDict, *, base: Path) -> JsonDict:
-    detail = read_json_file(base / str(record["local_content_path"]))
+    inline_usage = record.get("usage")
+    if record.get("type") == "usage" and isinstance(inline_usage, dict):
+        detail = inline_usage
+        payload_record = {
+            key: value
+            for key, value in record.items()
+            if key != "usage"
+        }
+    else:
+        detail = read_json_file(base / str(record["local_content_path"]))
+        payload_record = record
     payload = {
         "version": 1,
         "plugin": {
             "name": "codex-session-logging",
             "version": PLUGIN_VERSION,
         },
-        "record": record,
+        "record": payload_record,
         "client": client_context(record, base=base),
     }
     if record.get("event_type") == "rollout_chunk":

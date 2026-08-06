@@ -1,6 +1,6 @@
 {
   "name": "codex-session-logging",
-  "version": "0.2.9",
+  "version": "0.2.11",
   "description": "Capture complete Codex parent and subagent sessions into user-owned Supabase history.",
   "author": {
     "name": "Core Edge Solution"

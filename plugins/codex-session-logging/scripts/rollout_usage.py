@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import hashlib
+import json
 from datetime import datetime, timezone
 from typing import Any, Iterable
+from uuid import UUID
 
 
 JsonDict = dict[str, Any]
 
 
-def parse_cumulative_usage(
-    envelope: JsonDict,
-    fallback_created_at: str | None = None,
-) -> JsonDict | None:
+def parse_cumulative_usage(envelope: JsonDict) -> JsonDict | None:
     """Parse one Codex cumulative token-count envelope.
 
     Codex emits cumulative session totals, not per-turn deltas. Invalid or
@@ -49,7 +49,7 @@ def parse_cumulative_usage(
     ):
         return None
 
-    created_at = non_empty_string(envelope.get("timestamp")) or fallback_created_at
+    created_at = aware_timestamp(envelope.get("timestamp"))
     if not created_at:
         return None
     usage: JsonDict = {
@@ -66,20 +66,59 @@ def parse_cumulative_usage(
     return usage
 
 
-def latest_cumulative_usage(
-    envelopes: Iterable[JsonDict],
-    fallback_created_at: str | None = None,
-) -> JsonDict | None:
+def latest_cumulative_usage(envelopes: Iterable[JsonDict]) -> JsonDict | None:
     """Return the newest cumulative snapshot, preferring larger equal-time totals."""
     latest: JsonDict | None = None
     for envelope in envelopes:
-        parsed = parse_cumulative_usage(
-            envelope,
-            fallback_created_at=fallback_created_at,
-        )
+        parsed = parse_cumulative_usage(envelope)
         if parsed is not None and usage_is_newer(parsed, latest):
             latest = parsed
     return latest
+
+
+def cumulative_usage_observations(
+    envelopes: Iterable[JsonDict],
+) -> list[JsonDict]:
+    """Return every valid cumulative observation in source order."""
+    observations: list[JsonDict] = []
+    for envelope in envelopes:
+        parsed = parse_cumulative_usage(envelope)
+        if parsed is not None:
+            observations.append(parsed)
+    return observations
+
+
+def usage_observation_id(session_id: str, usage: JsonDict) -> str:
+    """Derive a stable queue id from the stored observation fields."""
+    identity = json.dumps(
+        [
+            session_id,
+            canonical_observed_at(str(usage["created_at"])),
+            usage["input_tokens"],
+            usage["cached_input_tokens"],
+            usage["output_tokens"],
+            usage["reasoning_output_tokens"],
+        ],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    digest = bytearray(hashlib.sha256(identity.encode("utf-8")).digest()[:16])
+    digest[6] = (digest[6] & 0x0F) | 0x50
+    digest[8] = (digest[8] & 0x3F) | 0x80
+    return str(UUID(bytes=bytes(digest)))
+
+
+def canonical_observed_at(value: str) -> str:
+    """Normalize equivalent aware timestamps before deriving observation ids."""
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return value
+    if parsed.tzinfo is None:
+        return value
+    return parsed.astimezone(timezone.utc).isoformat(timespec="microseconds").replace(
+        "+00:00", "Z"
+    )
 
 
 def usage_is_newer(candidate: JsonDict, current: JsonDict | None) -> bool:
@@ -123,6 +162,21 @@ def parsed_timestamp(value: object) -> datetime | None:
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=timezone.utc)
     return parsed.astimezone(timezone.utc)
+
+
+def aware_timestamp(value: object) -> str | None:
+    text = non_empty_string(value)
+    if not text:
+        return None
+    try:
+        parsed = datetime.fromisoformat(
+            text[:-1] + "+00:00" if text.endswith("Z") else text
+        )
+    except ValueError:
+        return None
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        return None
+    return text
 
 
 def non_empty_string(value: object) -> str | None:

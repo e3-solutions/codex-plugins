@@ -3071,7 +3071,7 @@ def test_real_marketplace_activates_in_isolated_codex_home_and_passes_doctor(tmp
     assert health["healthy"] is True
     assert health["issues"] == []
     assert health["cache_versions"] == {
-        "codex-session-logging": ["0.2.9"],
+        "codex-session-logging": ["0.2.11"],
         "linear-progress-sync": ["0.3.10"],
     }
     assert subprocess.run(["sh", "-n", str(resident_root / "run.sh")], check=False).returncode == 0
