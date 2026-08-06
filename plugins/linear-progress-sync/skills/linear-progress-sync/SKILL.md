@@ -17,7 +17,7 @@ Before writing code, creating a branch, or opening implementation changes, check
 
 Read-only inspection is allowed before kickoff. Before the first write or branch creation in any repo, Codex must have a saved Linear team/project binding or an existing active state.
 
-Pre-kickoff Bash blocks write-like commands and branch creation, not every unknown command. Allow read-only and non-mutating commands before kickoff. Block file edits, commands that appear to write files or mutate repo state, and branch creation until active Linear state exists.
+Pre-kickoff Bash blocks write-like commands and branch creation, not every unknown command. Allow read-only, non-mutating, and repository synchronization commands such as `git fetch` and `git pull` before kickoff. Block actual file edits, commands that appear to author file changes, and branch creation until active Linear state exists.
 
 Linear kickoff enforcement only applies to repos whose `origin` remote is under the `e3-solutions` GitHub org. Repos with no `origin` remote or another GitHub org are out of scope and should be allowed without Linear kickoff.
 
@@ -79,7 +79,7 @@ This repository is a Codex plugin marketplace, not a single plugin source. Do no
 
 Setup installs a resident updater under `~/.codex/coreedge`. It checks at login and every 30 minutes through a macOS LaunchAgent or Linux systemd user timer, validates and stages the current `main.zip`, atomically switches the managed marketplace, selects one cache version per default plugin, and retains rollback copies outside Codex's cache scan. Linux VMs use user units under `$XDG_CONFIG_HOME/systemd/user` when that variable is set and `~/.config/systemd/user` otherwise. Headless VMs need `loginctl enable-linger <user>` if the timers must continue after logout. SessionStart and PreToolUse self-heal a missing service. Persistently disable or re-enable network checks with:
 
-Existing installations activate `0.3.9` during one ordinary resident check and self-heal without rerunning setup. The release preserves historical-backfill protections, Linux systemd support, commit-only Linear progress comments, and verified GitHub SSH aliases while replacing one-minute task presence with complete hook-triggered parent and subagent rollout capture. Exact native JSONL bytes are durably queued in deterministic chunks, and a later hook recovers after crashes without duplicates. Existing one-minute presence schedulers are removed during upgrade. Do not ask teammates to run an update command, deliberately restart Codex, or create a renewal thread for normal updates. Fresh setup installs and schedules the current plugins immediately.
+Existing installations activate `0.3.10` during one ordinary resident check and self-heal without rerunning setup. This release allows repository synchronization commands such as `git pull` before Linear kickoff while preserving the guard for actual file edits. It also preserves historical-backfill protections, Linux systemd support, commit-only Linear progress comments, verified GitHub SSH aliases, and complete hook-triggered parent and subagent rollout capture. Do not ask teammates to run an update command, deliberately restart Codex, or create a renewal thread for normal updates. Fresh setup installs and schedules the current plugins immediately.
 
 ```bash
 python3 ~/.codex/coreedge/runtime/current/update_plugin.py --disable-auto-update

@@ -1169,6 +1169,27 @@ def test_pre_tool_guard_allows_unbound_repo_read_only_commands(tmp_path, monkeyp
         assert decision.blocked is False, command
 
 
+def test_pre_tool_guard_allows_repository_sync_without_active_state(tmp_path, monkeypatch):
+    state_dir = tmp_path / "state"
+    config_dir = tmp_path / "config"
+    monkeypatch.setenv("LINEAR_SYNC_STATE_DIR", str(state_dir))
+    monkeypatch.setenv("LINEAR_SYNC_CONFIG_DIR", str(config_dir))
+    repo = init_git_repo(tmp_path / "repo", branch="arya/no-linear-binding")
+
+    commands = [
+        "git fetch --all --prune",
+        "git pull",
+        "git pull --ff-only origin main",
+    ]
+
+    for command in commands:
+        decision = linear_sync.pre_tool_guard_decision(
+            {"tool_name": "Bash", "command": command},
+            root=repo,
+        )
+        assert decision.blocked is False, command
+
+
 def test_pre_tool_guard_allows_unknown_non_write_bash_without_active_state(tmp_path, monkeypatch):
     monkeypatch.setenv("LINEAR_SYNC_STATE_DIR", str(tmp_path))
     bind_linear_repo(tmp_path, tmp_path, monkeypatch)
@@ -2156,7 +2177,7 @@ def test_legacy_upgrade_keeps_presence_scheduler_decommissioned(tmp_path, monkey
     manifest.write_text(
         json.dumps(
             {
-                    "version": "0.3.9",
+                    "version": "0.3.10",
                 "archive_url": archive.as_uri(),
                 "sha256": hashlib.sha256(archive.read_bytes()).hexdigest(),
                 "plugin_subdir": "plugins/linear-progress-sync",
@@ -2212,8 +2233,8 @@ def test_legacy_upgrade_keeps_presence_scheduler_decommissioned(tmp_path, monkey
     resident_root = codex_home / "coreedge"
 
     assert first_cycle.returncode == 0, first_cycle.stderr
-    assert json.loads(first_cycle.stdout)["resident"]["version"] == "0.3.9"
-    assert (resident_root / "runtime" / "current").resolve().name == "0.3.9"
+    assert json.loads(first_cycle.stdout)["resident"]["version"] == "0.3.10"
+    assert (resident_root / "runtime" / "current").resolve().name == "0.3.10"
     assert not (home / "Library" / "LaunchAgents" / "com.coreedge.codex-session-presence.plist").exists()
 
     second_cycle = subprocess.run(
@@ -3046,12 +3067,12 @@ def test_real_marketplace_activates_in_isolated_codex_home_and_passes_doctor(tmp
         platform="unsupported",
     )
 
-    assert activation["version"] == "0.3.9"
+    assert activation["version"] == "0.3.10"
     assert health["healthy"] is True
     assert health["issues"] == []
     assert health["cache_versions"] == {
         "codex-session-logging": ["0.2.9"],
-        "linear-progress-sync": ["0.3.9"],
+        "linear-progress-sync": ["0.3.10"],
     }
     assert subprocess.run(["sh", "-n", str(resident_root / "run.sh")], check=False).returncode == 0
 
@@ -3068,7 +3089,7 @@ def test_resident_hook_repairs_matching_cache_and_runtime_corruption_from_manage
         platform="unsupported",
     )
     managed = resident_root / "marketplace/current/plugins/linear-progress-sync"
-    cache = codex_home / "plugins/cache/coreedge-local/linear-progress-sync/0.3.9"
+    cache = codex_home / "plugins/cache/coreedge-local/linear-progress-sync/0.3.10"
     runtime = resident_root / "runtime/current"
     corrupt_content = (managed / "scripts/linear_sync.py").read_bytes()
     (cache / "scripts/update_plugin.py").write_bytes(corrupt_content)
@@ -4357,7 +4378,7 @@ def test_resident_doctor_reports_content_corruption_and_unloaded_service(tmp_pat
     broken_cache_script = (
         cache_root
         / "linear-progress-sync"
-        / "0.3.9"
+        / "0.3.10"
         / "scripts"
         / "update_plugin.py"
     )
@@ -4606,7 +4627,7 @@ def test_readmes_register_linear_mcp_before_linear_login():
         assert "saves it in `~/.codex/linear-sync/repos.json`" in text
         assert "update_plugin.py --force" in text
         assert "update_plugin.py --doctor" in text
-        assert "`0.3.9`" in text
+        assert "`0.3.10`" in text
         assert "hook-triggered parent and subagent rollout capture" in text
         assert "renewal thread" in text
         assert "every 30 minutes" in text
