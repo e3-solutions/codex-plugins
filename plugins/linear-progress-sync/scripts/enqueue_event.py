@@ -4,10 +4,12 @@ from __future__ import annotations
 import argparse
 import json
 
-from linear_sync import cli_root_arg, collect_commit_event, enqueue_event
+from linear_sync import cli_root_arg, collect_commit_event, enqueue_event, tweed_owns_workflow
 
 
 def main() -> None:
+    if tweed_owns_workflow():
+        return
     parser = argparse.ArgumentParser(description="Enqueue a Linear progress sync event.")
     parser.add_argument("event_type", nargs="?", default="manual")
     parser.add_argument("--from-git", action="store_true", help="Collect the latest commit as a post_commit event.")
@@ -30,4 +32,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

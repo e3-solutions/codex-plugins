@@ -4,7 +4,14 @@ from __future__ import annotations
 import argparse
 import json
 
-from linear_sync import cli_root_arg, collect_today_commits, drain_once, enqueue_event, read_state
+from linear_sync import (
+    cli_root_arg,
+    collect_today_commits,
+    drain_once,
+    enqueue_event,
+    read_state,
+    tweed_owns_workflow,
+)
 
 
 def main() -> None:
@@ -13,6 +20,9 @@ def main() -> None:
     cli_root_arg(parser)
     args = parser.parse_args()
 
+    if tweed_owns_workflow():
+        return
+
     state = read_state(args.root)
     queued = []
     for commit in collect_today_commits(root=args.root):
@@ -20,11 +30,11 @@ def main() -> None:
         if sha in set(state.get("synced_commit_shas") or []):
             continue
         event = enqueue_event("post_commit", {**commit, "source": "daily_sweep"}, root=args.root)
-        queued.append(event["id"])
+        if event:
+            queued.append(event["id"])
     result = drain_once(root=args.root, dry_run=args.dry_run)
     print(json.dumps({"queued": queued, "drain": result}, sort_keys=True))
 
 
 if __name__ == "__main__":
     main()
-

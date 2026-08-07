@@ -13,6 +13,10 @@ from linear_sync import (
     save_linear_user_profile,
     save_repo_linear_binding,
     save_repo_linear_opt_out,
+    save_workflow_manager,
+    tweed_inert_result,
+    tweed_owns_workflow,
+    workflow_manager_status,
 )
 
 
@@ -57,7 +61,15 @@ def main() -> None:
     configure_user = sub.add_parser("configure-user", help="Save the global Linear user profile.")
     configure_user.add_argument("--linear-name", required=True)
 
+    owner = sub.add_parser("workflow-owner", help="Inspect or change the global workflow owner.")
+    owner_group = owner.add_mutually_exclusive_group()
+    owner_group.add_argument("--set", choices=("tweed",), dest="workflow_manager")
+    owner_group.add_argument("--clear", action="store_true")
+
     args = parser.parse_args()
+    if args.command != "workflow-owner" and tweed_owns_workflow():
+        print(json.dumps(tweed_inert_result(args.command), indent=2, sort_keys=True))
+        return
     if args.command == "kickoff":
         result = run_linear_start(
             issue_key=args.issue_key,
@@ -97,6 +109,14 @@ def main() -> None:
         print(json.dumps(linear_user_profile_status(), indent=2, sort_keys=True))
     elif args.command == "configure-user":
         result = save_linear_user_profile(linear_name=args.linear_name)
+        print(json.dumps(result, indent=2, sort_keys=True))
+    elif args.command == "workflow-owner":
+        if args.clear:
+            result = save_workflow_manager(None)
+        elif args.workflow_manager:
+            result = save_workflow_manager(args.workflow_manager)
+        else:
+            result = workflow_manager_status()
         print(json.dumps(result, indent=2, sort_keys=True))
 
 
