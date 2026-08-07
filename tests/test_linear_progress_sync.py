@@ -258,6 +258,158 @@ def test_global_linear_user_profile_rejects_blank_name(tmp_path, monkeypatch):
         linear_sync.save_linear_user_profile(linear_name=" ")
 
 
+def test_global_workflow_owner_round_trips_and_preserves_repo_bindings(tmp_path, monkeypatch):
+    monkeypatch.setenv("LINEAR_SYNC_CONFIG_DIR", str(tmp_path / "config"))
+    linear_sync.save_repo_bindings({"repos": {"e3-solutions/example": {"team": "Engineering"}}})
+
+    enabled = linear_sync.save_workflow_manager("tweed")
+    stored = json.loads(linear_sync.repo_bindings_path().read_text(encoding="utf-8"))
+    cleared = linear_sync.save_workflow_manager(None)
+
+    assert enabled["workflow_manager"] == "tweed"
+    assert enabled["tweed_owns_workflow"] is True
+    assert stored["workflow_manager"] == "tweed"
+    assert stored["repos"]["e3-solutions/example"]["team"] == "Engineering"
+    assert cleared["workflow_manager"] is None
+    assert cleared["tweed_owns_workflow"] is False
+
+
+def test_unknown_workflow_owner_keeps_native_guards_enabled(tmp_path, monkeypatch):
+    monkeypatch.setenv("LINEAR_SYNC_CONFIG_DIR", str(tmp_path / "config"))
+    repo = init_git_repo(tmp_path / "repo")
+    linear_sync.write_json_atomic(
+        linear_sync.repo_bindings_path(),
+        {"workflow_manager": "unknown", "repos": {}},
+    )
+
+    decision = linear_sync.pre_tool_guard_decision({"tool_name": "apply_patch"}, root=repo)
+
+    assert linear_sync.tweed_owns_workflow() is False
+    assert decision.blocked is True
+    assert "LINEAR USER REQUIRED" in decision.message
+
+
+def test_tweed_owner_makes_all_workflow_paths_inert(tmp_path, monkeypatch):
+    state_dir = tmp_path / "state"
+    monkeypatch.setenv("LINEAR_SYNC_STATE_DIR", str(state_dir))
+    monkeypatch.setenv("LINEAR_SYNC_CONFIG_DIR", str(tmp_path / "config"))
+    repo = init_git_repo(tmp_path / "repo")
+    linear_sync.save_workflow_manager("tweed")
+    executor_calls = []
+
+    write_guard = linear_sync.pre_tool_guard_decision({"tool_name": "apply_patch"}, root=repo)
+    branch_guard = linear_sync.pre_tool_guard_decision(
+        {"tool_name": "Bash", "command": "git switch -c tweed/work"},
+        root=repo,
+    )
+    linear_guard = linear_sync.pre_tool_guard_decision(
+        {"tool_name": "mcp__linear.save_comment"},
+        root=repo,
+    )
+    queued = linear_sync.enqueue_event("post_commit", {"id": "should-not-exist"}, root=repo)
+    post_tool = linear_sync.handle_post_tool_use(
+        {"tool_name": "Bash", "command": "git commit -m work", "tool_result": {"returncode": 0}},
+        root=repo,
+    )
+    drain = linear_sync.drain_once(
+        root=repo,
+        executor=lambda *_: executor_calls.append(True) or linear_sync.WorkerResult(True, "unexpected"),
+    )
+    foreground = linear_sync.foreground_sync_plan(root=repo)
+    kickoff = linear_sync.run_linear_start(
+        issue_key="COR-1",
+        issue_title="Ignored",
+        issue_url="https://linear.app/example/issue/COR-1/ignored",
+        branch="tweed/cor-1-ignored",
+        root=repo,
+    )
+    activation = linear_sync.activate_linear_start(
+        issue_key="COR-1",
+        issue_title="Ignored",
+        issue_url="https://linear.app/example/issue/COR-1/ignored",
+        branch="tweed/cor-1-ignored",
+        pr_url="https://github.com/e3-solutions/example/pull/1",
+        pr_number=1,
+        root=repo,
+    )
+
+    assert write_guard.blocked is False
+    assert branch_guard.blocked is False
+    assert linear_guard.blocked is False
+    assert queued is None
+    assert post_tool is None
+    assert drain["inert"] is True
+    assert foreground["inert"] is True
+    assert kickoff == {"inert": True, "operation": "kickoff", "workflow_manager": "tweed"}
+    assert activation == {"inert": True, "operation": "activate", "workflow_manager": "tweed"}
+    assert executor_calls == []
+    assert state_dir.exists() is False
+
+
+def test_tweed_owner_hooks_exit_without_state_or_cached_context(tmp_path, monkeypatch):
+    state_dir = tmp_path / "state"
+    config_dir = tmp_path / "config"
+    monkeypatch.setenv("LINEAR_SYNC_STATE_DIR", str(state_dir))
+    monkeypatch.setenv("LINEAR_SYNC_CONFIG_DIR", str(config_dir))
+    repo = init_git_repo(tmp_path / "repo")
+    linear_sync.save_workflow_manager("tweed")
+    scripts = ROOT / "plugins" / "linear-progress-sync" / "scripts"
+
+    pre_tool = subprocess.run(
+        [sys.executable, str(scripts / "pre_tool_use.py")],
+        input=json.dumps({"tool_name": "apply_patch"}),
+        cwd=repo,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    session = subprocess.run(
+        [sys.executable, str(scripts / "session_start.py")],
+        cwd=repo,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert pre_tool.returncode == 0
+    assert pre_tool.stdout == ""
+    assert pre_tool.stderr == ""
+    assert session.returncode == 0
+    assert session.stdout == ""
+    assert session.stderr == ""
+    assert state_dir.exists() is False
+
+
+def test_workflow_owner_cli_sets_and_clears_global_setting(tmp_path, monkeypatch):
+    config_dir = tmp_path / "config"
+    monkeypatch.setenv("LINEAR_SYNC_CONFIG_DIR", str(config_dir))
+    script = ROOT / "plugins/linear-progress-sync/scripts/linear_start.py"
+
+    enabled = subprocess.run(
+        [sys.executable, str(script), "workflow-owner", "--set", "tweed"],
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+    configure_user = subprocess.run(
+        [sys.executable, str(script), "configure-user", "--linear-name", "Should Not Save"],
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+    cleared = subprocess.run(
+        [sys.executable, str(script), "workflow-owner", "--clear"],
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+
+    assert json.loads(enabled.stdout)["tweed_owns_workflow"] is True
+    assert json.loads(configure_user.stdout)["inert"] is True
+    assert (config_dir / "user.json").exists() is False
+    assert json.loads(cleared.stdout)["tweed_owns_workflow"] is False
+
+
 def test_terminal_statuses_are_never_changed(tmp_path, monkeypatch):
     monkeypatch.setenv("LINEAR_SYNC_STATE_DIR", str(tmp_path))
     state = linear_sync.default_state()
@@ -2177,7 +2329,7 @@ def test_legacy_upgrade_keeps_presence_scheduler_decommissioned(tmp_path, monkey
     manifest.write_text(
         json.dumps(
             {
-                    "version": "0.3.10",
+                    "version": "0.3.11",
                 "archive_url": archive.as_uri(),
                 "sha256": hashlib.sha256(archive.read_bytes()).hexdigest(),
                 "plugin_subdir": "plugins/linear-progress-sync",
@@ -2233,8 +2385,8 @@ def test_legacy_upgrade_keeps_presence_scheduler_decommissioned(tmp_path, monkey
     resident_root = codex_home / "coreedge"
 
     assert first_cycle.returncode == 0, first_cycle.stderr
-    assert json.loads(first_cycle.stdout)["resident"]["version"] == "0.3.10"
-    assert (resident_root / "runtime" / "current").resolve().name == "0.3.10"
+    assert json.loads(first_cycle.stdout)["resident"]["version"] == "0.3.11"
+    assert (resident_root / "runtime" / "current").resolve().name == "0.3.11"
     assert not (home / "Library" / "LaunchAgents" / "com.coreedge.codex-session-presence.plist").exists()
 
     second_cycle = subprocess.run(
@@ -3067,12 +3219,12 @@ def test_real_marketplace_activates_in_isolated_codex_home_and_passes_doctor(tmp
         platform="unsupported",
     )
 
-    assert activation["version"] == "0.3.10"
+    assert activation["version"] == "0.3.11"
     assert health["healthy"] is True
     assert health["issues"] == []
     assert health["cache_versions"] == {
         "codex-session-logging": ["0.2.11"],
-        "linear-progress-sync": ["0.3.10"],
+        "linear-progress-sync": ["0.3.11"],
     }
     assert subprocess.run(["sh", "-n", str(resident_root / "run.sh")], check=False).returncode == 0
 
@@ -3089,7 +3241,7 @@ def test_resident_hook_repairs_matching_cache_and_runtime_corruption_from_manage
         platform="unsupported",
     )
     managed = resident_root / "marketplace/current/plugins/linear-progress-sync"
-    cache = codex_home / "plugins/cache/coreedge-local/linear-progress-sync/0.3.10"
+    cache = codex_home / "plugins/cache/coreedge-local/linear-progress-sync/0.3.11"
     runtime = resident_root / "runtime/current"
     corrupt_content = (managed / "scripts/linear_sync.py").read_bytes()
     (cache / "scripts/update_plugin.py").write_bytes(corrupt_content)
@@ -4378,7 +4530,7 @@ def test_resident_doctor_reports_content_corruption_and_unloaded_service(tmp_pat
     broken_cache_script = (
         cache_root
         / "linear-progress-sync"
-        / "0.3.10"
+        / "0.3.11"
         / "scripts"
         / "update_plugin.py"
     )
@@ -4627,7 +4779,7 @@ def test_readmes_register_linear_mcp_before_linear_login():
         assert "saves it in `~/.codex/linear-sync/repos.json`" in text
         assert "update_plugin.py --force" in text
         assert "update_plugin.py --doctor" in text
-        assert "`0.3.10`" in text
+        assert "`0.3.11`" in text
         assert "hook-triggered parent and subagent rollout capture" in text
         assert "renewal thread" in text
         assert "every 30 minutes" in text
@@ -4752,6 +4904,8 @@ def test_plugin_exposes_linear_start_command_and_pre_tool_guard_hook():
     assert "linear_start.py activate" in command_text
     assert "linear_start.py user-profile" in command_text
     assert "linear_start.py configure-user" in command_text
+    assert "linear_start.py workflow-owner" in command_text
+    assert '"workflow_manager": "tweed"' in command_text
     assert "mcp__codex_apps__linear._list_users" in command_text
     assert "mcp__linear.list_users" in command_text
     assert "activation_command" in command_text
@@ -4790,7 +4944,7 @@ def test_plugin_exposes_linear_start_command_and_pre_tool_guard_hook():
     assert "update_plugin.py --doctor" in skill_text
     assert "renewal thread" in skill_text
     assert "self-heal without rerunning setup" in skill_text
-    assert "complete hook-triggered parent and subagent rollout capture" in skill_text
+    assert '"workflow_manager": "tweed"' in skill_text
     assert "LINEAR_SYNC_AUTO_UPDATE=0" in skill_text
     assert "configure-user" in skill_text
     assert "Do not create the Linear issue, branch, PR, or code changes until the chosen repo destination is saved" in skill_text

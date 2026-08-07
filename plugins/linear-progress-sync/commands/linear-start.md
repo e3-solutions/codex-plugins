@@ -2,6 +2,8 @@
 
 Start Linear-linked implementation work before any code edits.
 
+Before doing anything else, inspect the global workflow owner with `python3 <plugin-root>/scripts/linear_start.py workflow-owner`. If it reports `"workflow_manager": "tweed"`, return without performing setup, kickoff, activation, or any other Linear Progress Sync action. Tweed owns the workflow.
+
 ## Arguments
 
 - `issue`: existing Linear issue identifier, for example `COR-123`.

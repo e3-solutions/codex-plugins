@@ -267,6 +267,40 @@ def save_repo_bindings(config: JsonDict) -> JsonDict:
     return config
 
 
+def workflow_manager_status() -> JsonDict:
+    manager = read_repo_bindings().get("workflow_manager")
+    return {
+        "workflow_manager": manager if isinstance(manager, str) else None,
+        "tweed_owns_workflow": manager == "tweed",
+        "config_path": str(repo_bindings_path()),
+    }
+
+
+def save_workflow_manager(workflow_manager: str | None) -> JsonDict:
+    manager = str(workflow_manager or "").strip().lower() or None
+    if manager not in {None, "tweed"}:
+        raise ValueError("workflow_manager must be 'tweed' or unset")
+    config = read_repo_bindings()
+    if manager is None:
+        config.pop("workflow_manager", None)
+    else:
+        config["workflow_manager"] = manager
+    save_repo_bindings(config)
+    return workflow_manager_status()
+
+
+def tweed_owns_workflow() -> bool:
+    return read_repo_bindings().get("workflow_manager") == "tweed"
+
+
+def tweed_inert_result(operation: str) -> JsonDict:
+    return {
+        "inert": True,
+        "operation": operation,
+        "workflow_manager": "tweed",
+    }
+
+
 def repo_identity(root: str | Path | None = None) -> str:
     return repo_remote_identity(root) or str(repo_root(root))
 
@@ -812,7 +846,14 @@ def with_codex_attribution(body: str, *, now: datetime | None = None) -> str:
     return "\n".join([body.rstrip(), "", codex_attribution_footer(now=now)])
 
 
-def enqueue_event(event_type: str, payload: JsonDict | None = None, *, root: str | Path | None = None) -> JsonDict:
+def enqueue_event(
+    event_type: str,
+    payload: JsonDict | None = None,
+    *,
+    root: str | Path | None = None,
+) -> JsonDict | None:
+    if tweed_owns_workflow():
+        return None
     base = ensure_state(root)
     event = dict(payload or {})
     event.setdefault("id", f"{event_type}-{uuid.uuid4().hex}")
@@ -1178,6 +1219,8 @@ def run_linear_start(
     root: str | Path | None = None,
     dry_run: bool = False,
 ) -> JsonDict:
+    if tweed_owns_workflow():
+        return tweed_inert_result("kickoff")
     require_linear_user_profile()
     plan = linear_start_plan(
         issue_key=issue_key,
@@ -1238,6 +1281,8 @@ def activate_linear_start(
     root: str | Path | None = None,
     linked_at: str | None = None,
 ) -> JsonDict:
+    if tweed_owns_workflow():
+        return tweed_inert_result("activate")
     active_state: JsonDict = {
         "issue_key": issue_key.upper(),
         "issue_title": issue_title,
@@ -1524,6 +1569,15 @@ def drain_once(
     executor: Callable[[str, JsonDict, IssueInference], WorkerResult] | None = None,
     now: datetime | None = None,
 ) -> JsonDict:
+    if tweed_owns_workflow():
+        return {
+            "processed": 0,
+            "reviewed": 0,
+            "skipped": 0,
+            "failed": 0,
+            "inert": True,
+            "workflow_manager": "tweed",
+        }
     local_state = read_state(root)
     processed = 0
     failed = 0
@@ -1674,6 +1728,16 @@ def foreground_sync_plan(
     limit: int = 5,
     now: datetime | None = None,
 ) -> JsonDict:
+    if tweed_owns_workflow():
+        return {
+            "repo": str(repo_root(root)),
+            "eligible": [],
+            "held": [],
+            "skipped": [],
+            "inert": True,
+            "workflow_manager": "tweed",
+            "instructions": [],
+        }
     local_state = read_state(root)
     eligible: list[JsonDict] = []
     held: list[JsonDict] = []
@@ -1824,6 +1888,8 @@ def ack_foreground_event(
     root: str | Path | None = None,
     now: datetime | None = None,
 ) -> JsonDict:
+    if tweed_owns_workflow():
+        return tweed_inert_result("foreground-ack")
     local_state = read_state(root)
     matched_path: Path | None = None
     matched_event: JsonDict | None = None
@@ -1850,6 +1916,8 @@ def skip_foreground_event(
     issue_key: str | None = None,
     root: str | Path | None = None,
 ) -> JsonDict:
+    if tweed_owns_workflow():
+        return tweed_inert_result("foreground-skip")
     local_state = read_state(root)
     matched_path: Path | None = None
     matched_event: JsonDict | None = None
@@ -1953,6 +2021,8 @@ def read_stdin_json() -> JsonDict:
 
 
 def pre_tool_guard_decision(payload: JsonDict, *, root: str | Path | None = None) -> PreToolGuardDecision:
+    if tweed_owns_workflow():
+        return PreToolGuardDecision(False)
     tool = tool_name(payload)
     normalized_tool = tool.lower()
     is_linear_write = linear_tool_is_write(normalized_tool)
@@ -2036,7 +2106,7 @@ def linear_guard_enabled(*, root: str | Path | None = None) -> bool:
 
 
 def linear_guard_disabled(*, root: str | Path | None = None) -> bool:
-    return bool(repo_binding_status(root=root).get("disabled"))
+    return tweed_owns_workflow() or bool(repo_binding_status(root=root).get("disabled"))
 
 
 def linear_start_script_path() -> str:
@@ -2305,8 +2375,9 @@ def handle_post_tool_use(payload: JsonDict, *, root: str | Path | None = None) -
             event = collect_commit_event(root=root)
             event["source"] = "PostToolUse:Bash"
             queued = enqueue_event("post_commit", event, root=root)
-            spawn_drain(root=root)
-            return queued
+            if queued:
+                spawn_drain(root=root)
+                return queued
     return None
 
 
@@ -2930,7 +3001,7 @@ def linear_start_command_segments(command: str) -> list[list[str]] | None:
 
 def linear_start_segment_allowed_without_user_profile(tokens: list[str]) -> bool:
     subcommand = linear_start_subcommand_from_tokens(tokens)
-    if subcommand in {"user-profile", "configure-user"}:
+    if subcommand in {"user-profile", "configure-user", "workflow-owner"}:
         return True
     if subcommand == "configure-repo":
         return "--disable-linear-sync" in tokens
@@ -2970,6 +3041,7 @@ def linear_start_subcommand_from_tokens(tokens: list[str]) -> str | None:
         "configure-repo",
         "user-profile",
         "configure-user",
+        "workflow-owner",
     } else None
 
 
