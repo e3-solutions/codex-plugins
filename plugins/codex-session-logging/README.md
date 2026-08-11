@@ -36,11 +36,29 @@ https://pmdfllwuctzkdjiehezq.supabase.co
 
 Apply the SQL files in `supabase/migrations` when provisioning a new project. Chunk objects use the existing private bucket and their offsets, hashes, generations, and parent/root relationships are cataloged in `codex_session_events`. Version 0.2.11 adds immutable usage observations to the existing nine-argument `upsert_codex_session_usage_latest` RPC. It derives the immutable owner from `codex_sessions`, records every distinct observation, and advances the latest row only when its timestamp and all four cumulative token components do not move backwards. Deploy that migration before updating clients. The Edge Function, RPC, and database constraint require the normalized token components to sum exactly to the reported total.
 
-Deploy the ingest Edge Function from `supabase/functions/codex-session-ingest` after the migration. The function owns the Supabase admin key server-side and uses the developer's git email as the initial user key when available. If `CODEX_SESSION_LOG_USER_EMAIL_MAP` contains the email, that mapped Supabase Auth user id is used; otherwise the function derives a stable UUID from the email. When git email is not configured, the plugin sends a persistent local installation id so sessions still track without per-user setup.
+Deploy the ingest Edge Function from `supabase/functions/codex-session-ingest` after migrations when provisioning a new project. The function owns the Supabase admin key server-side and uses the developer's git email as the initial user key when available. If `CODEX_SESSION_LOG_USER_EMAIL_MAP` contains the email, that mapped Supabase Auth user id is used; otherwise the function derives a stable UUID from the email. When git email is not configured, the plugin sends a persistent local installation id so sessions still track without per-user setup.
+
+The ignore-session migration adds a private, service-role-only fenced purge. The
+ingest function durably reserves its exact bucket/prefix before uploading, so a
+failed cleanup remains discoverable. Purge completion clears those locators and
+leaves only the task-id hash. Later writes are acknowledged without being stored;
+the service role has no direct table-delete grant.
+
+For the first production rollout of the ignore-session protocol, deploy this Edge
+Function first, wait at least ten minutes for older hosted invocations to drain,
+then apply the ignore-session migration. During that interval the new function
+fails before upload because its reservation RPC is not present; this is intentional.
+Deploy Heartbeat only after both source steps succeed.
 
 ```bash
-supabase db push --project-ref pmdfllwuctzkdjiehezq
 supabase functions deploy codex-session-ingest --project-ref pmdfllwuctzkdjiehezq
+sleep 600
+supabase db push --project-ref pmdfllwuctzkdjiehezq
+```
+
+Configure secrets separately as needed:
+
+```bash
 supabase secrets set \
   --project-ref pmdfllwuctzkdjiehezq \
   CODEX_SESSION_LOG_USER_EMAIL_MAP='{"user@e3.solutions":"00000000-0000-0000-0000-000000000000"}'
