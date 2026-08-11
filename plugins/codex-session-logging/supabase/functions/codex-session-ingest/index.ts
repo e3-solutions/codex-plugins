@@ -20,6 +20,7 @@ const MAX_ROLLOUT_CHUNK_BASE64_LENGTH = Math.ceil(MAX_ROLLOUT_CHUNK_BYTES / 3) *
   4;
 const UUID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+const COMPACT_UUID_PATTERN = /^[0-9a-f]{32}$/;
 const UUID_V4_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const HEX_GENERATION_PATTERN = /^[0-9a-f]{16,64}$/;
@@ -106,12 +107,37 @@ export async function handleRequest(req: Request): Promise<Response> {
         kind: "usage",
       });
     }
+    let message: JsonObject | null = null;
+    let messageRequestsOptOut = false;
+    if (recordType === "message") {
+      message = requireObject(payload.message, "message");
+      validateCanonicalMessageRecord(record);
+      await validateMessageIntegrity(record, message);
+      messageRequestsOptOut = messageOptsOut(
+        requireString(message.content, "message.content"),
+      );
+      if (
+        messageRequestsOptOut && optionalString(record.type) !== "message"
+      ) {
+        throw new PayloadValidationError(
+          "opt-out requires an explicit message record",
+        );
+      }
+    } else if (recordType !== "event") {
+      throw new PayloadValidationError(
+        "record.type must be message, event, or usage",
+      );
+    }
     const userId = await resolveUserId(client);
     const existing = await existingSession(
       requireString(record.session_id, "record.session_id"),
     );
     if (existing.found && existing.userId !== userId) {
       return jsonResponse({ error: "session_rejected" }, 422);
+    }
+    if (messageRequestsOptOut) {
+      await fenceOwnedCodexSession(sessionId, userId);
+      return ignoredSessionResponse(record);
     }
     const storagePath = storagePathForRecord(record, userId);
     if (!await reserveSessionStorage(sessionId, userId)) {
@@ -146,8 +172,9 @@ export async function handleRequest(req: Request): Promise<Response> {
       });
     }
 
-    const message = requireObject(payload.message, "message");
-    await validateMessageIntegrity(record, message);
+    if (!message) {
+      throw new PayloadValidationError("message must be an object");
+    }
     await upsertSessionUser(record, client, userId);
     await uploadStorageObject(storagePath, message);
     if (
@@ -171,6 +198,10 @@ export async function handleRequest(req: Request): Promise<Response> {
     }
     return jsonResponse({ error: "ingest_failed", message }, 500);
   }
+}
+
+export function messageOptsOut(content: string): boolean {
+  return content.includes("--ignore-extension");
 }
 
 async function ingestRolloutChunk(
@@ -445,6 +476,25 @@ async function validateMessageIntegrity(
   const actualByteSize = new TextEncoder().encode(content).byteLength;
   if (actualByteSize !== expectedByteSize) {
     throw new PayloadValidationError("content byte size mismatch");
+  }
+}
+
+function validateCanonicalMessageRecord(record: JsonObject): void {
+  requireDatabaseUuid(record.id, "record.id");
+  requireString(record.session_id, "record.session_id");
+  const seq = requireNumber(record.seq, "record.seq");
+  if (!Number.isSafeInteger(seq) || seq < 0) {
+    throw new PayloadValidationError(
+      "record.seq must be a non-negative integer",
+    );
+  }
+  const role = requireString(record.role, "record.role");
+  if (role !== "user" && role !== "assistant") {
+    throw new PayloadValidationError("record.role must be user or assistant");
+  }
+  const createdAt = requireString(record.created_at, "record.created_at");
+  if (Number.isNaN(Date.parse(createdAt))) {
+    throw new PayloadValidationError("record.created_at must be a timestamp");
   }
 }
 
@@ -888,6 +938,35 @@ async function ignoredSession(sessionId: string): Promise<boolean> {
   return rows.length > 0;
 }
 
+async function fenceOwnedCodexSession(
+  sessionId: string,
+  userId: string,
+): Promise<void> {
+  const response = await supabaseFetch(
+    "/rest/v1/rpc/fence_owned_codex_session",
+    {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "prefer": "return=representation",
+      },
+      body: JSON.stringify({
+        p_session_id: sessionId,
+        p_user_id: userId,
+        p_storage_bucket: storageBucket(),
+        p_storage_prefix: sessionStoragePrefix(userId, sessionId),
+      }),
+    },
+  );
+  const payload = await response.json();
+  if (
+    !payload || typeof payload !== "object" || Array.isArray(payload) ||
+    optionalString((payload as JsonObject).status) !== "fenced"
+  ) {
+    throw new Error("session fence returned an invalid response");
+  }
+}
+
 function ignoredSessionResponse(record: JsonObject): Response {
   return jsonResponse({
     ok: true,
@@ -1180,6 +1259,14 @@ function requireCanonicalUuid(value: unknown, name: string): string {
     UUID_PATTERN,
     "a canonical lowercase UUID",
   );
+}
+
+function requireDatabaseUuid(value: unknown, name: string): string {
+  const text = requireString(value, name);
+  if (!UUID_PATTERN.test(text) && !COMPACT_UUID_PATTERN.test(text)) {
+    throw new PayloadValidationError(`${name} must be a UUID`);
+  }
+  return text;
 }
 
 function optionalBoundedString(
