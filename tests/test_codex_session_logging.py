@@ -966,6 +966,9 @@ def test_plugin_packaging_and_supabase_migration_are_present():
     owned_fence_migration_path = ignore_migration_path.with_name(
         "20260811215200_refresh_fenced_session_discovery.sql"
     )
+    indexed_purge_migration_path = ignore_migration_path.with_name(
+        "20260811222845_index_ignored_session_object_lookup.sql"
+    )
     function_path = (
         ROOT
         / "plugins"
@@ -985,6 +988,7 @@ def test_plugin_packaging_and_supabase_migration_are_present():
     thread_migration = thread_migration_path.read_text(encoding="utf-8")
     ignore_migration = ignore_migration_path.read_text(encoding="utf-8")
     owned_fence_migration = owned_fence_migration_path.read_text(encoding="utf-8")
+    indexed_purge_migration = indexed_purge_migration_path.read_text(encoding="utf-8")
     all_migrations = "\n".join(
         path.read_text(encoding="utf-8")
         for path in sorted((ROOT / "plugins/codex-session-logging/supabase/migrations").glob("*.sql"))
@@ -1060,6 +1064,14 @@ def test_plugin_packaging_and_supabase_migration_are_present():
     assert "insert into public.codex_sessions" in owned_fence_migration
     assert "ignore_extension_fenced" in owned_fence_migration
     assert "grant execute on function public.fence_owned_codex_session" in owned_fence_migration
+    assert "create or replace function public.list_ignored_codex_session_objects" in indexed_purge_migration
+    assert 'stored.name collate "C" >=' in indexed_purge_migration
+    assert 'stored.name collate "C" <' in indexed_purge_migration
+    assert "pg_catalog.starts_with" not in indexed_purge_migration
+    assert (
+        ROOT
+        / "plugins/codex-session-logging/supabase/scripts/test_ignore_session_purge_db.py"
+    ).exists()
     assert function_path.exists()
     function_source = function_path.read_text(encoding="utf-8")
     identity_source = client_identity_path.read_text(encoding="utf-8")
