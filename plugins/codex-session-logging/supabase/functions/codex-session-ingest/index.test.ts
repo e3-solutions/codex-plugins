@@ -1,5 +1,5 @@
 import { sanitizeEventPayload } from "./event_sanitizer.ts";
-import { handleRequest } from "./index.ts";
+import { handleRequest, messageOptsOut } from "./index.ts";
 
 type JsonObject = Record<string, unknown>;
 
@@ -107,6 +107,276 @@ Deno.test("handleRequest ignores historical backfill status without writes", asy
     assertEquals(fetchCalls, 0);
   } finally {
     globalThis.fetch = originalFetch;
+  }
+});
+
+Deno.test("messageOptsOut matches only the exact case-sensitive marker", () => {
+  assertEquals(messageOptsOut("please --ignore-extension now"), true);
+  assertEquals(messageOptsOut("please --IGNORE-EXTENSION now"), false);
+  assertEquals(messageOptsOut("please --ignore now"), false);
+});
+
+Deno.test("handleRequest fences an opt-out message before any storage write", async () => {
+  const originalFetch = globalThis.fetch;
+  const previousUrl = Deno.env.get("SUPABASE_URL");
+  const previousServiceRole = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
+  const requests: Array<{ url: string; method: string }> = [];
+  const content = "private context\n--ignore-extension";
+
+  Deno.env.set("SUPABASE_URL", "https://project.supabase.co");
+  Deno.env.set("SUPABASE_SERVICE_ROLE_KEY", "service-role-key");
+  globalThis.fetch = (input, init = {}) => {
+    const url = input instanceof Request
+      ? input.url
+      : input instanceof URL
+      ? input.toString()
+      : input;
+    const requestInit = init as { method?: string };
+    requests.push({ url, method: requestInit.method ?? "GET" });
+    if (url.includes("/rest/v1/codex_ignored_sessions?")) {
+      return Promise.resolve(
+        new Response(JSON.stringify([]), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+      );
+    }
+    if (url.includes("/rest/v1/codex_sessions?select=")) {
+      return Promise.resolve(
+        new Response(JSON.stringify([]), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+      );
+    }
+    if (url.endsWith("/rest/v1/rpc/fence_owned_codex_session")) {
+      return Promise.resolve(
+        new Response(JSON.stringify({ status: "fenced" }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+      );
+    }
+    throw new Error(`unexpected request: ${url}`);
+  };
+
+  try {
+    const response = await handleRequest(
+      new Request("https://example.test/codex-session-ingest", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          version: 1,
+          record: {
+            id: "804fd832777946659bec2f10462c721b",
+            session_id: "opt-out-session",
+            type: "message",
+            seq: 2,
+            role: "user",
+            content_sha256: await testSha256Hex(content),
+            content_byte_size: new TextEncoder().encode(content).byteLength,
+            created_at: "2026-08-11T21:00:00.000Z",
+          },
+          message: { content },
+          client: {
+            repo_remote: "https://github.com/e3-solutions/codex-plugins.git",
+            identity_key: "opt-out-test",
+          },
+        }),
+      }),
+    );
+
+    assertEquals(response.status, 200);
+    assertEquals(await response.json(), {
+      ok: true,
+      id: "804fd832777946659bec2f10462c721b",
+      ignored: true,
+      reason: "session_opted_out",
+    });
+    assertEquals(requests, [
+      {
+        url: requests[0].url,
+        method: "GET",
+      },
+      {
+        url: requests[1].url,
+        method: "GET",
+      },
+      {
+        url:
+          "https://project.supabase.co/rest/v1/rpc/fence_owned_codex_session",
+        method: "POST",
+      },
+    ]);
+    assertEquals(requests[0].url.includes("/codex_ignored_sessions?"), true);
+    assertEquals(requests[1].url.includes("/codex_sessions?select="), true);
+  } finally {
+    globalThis.fetch = originalFetch;
+    restoreEnv("SUPABASE_URL", previousUrl);
+    restoreEnv("SUPABASE_SERVICE_ROLE_KEY", previousServiceRole);
+  }
+});
+
+Deno.test("handleRequest rejects non-canonical opt-out records before fencing", async () => {
+  const originalFetch = globalThis.fetch;
+  const previousUrl = Deno.env.get("SUPABASE_URL");
+  const previousServiceRole = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
+  const requests: string[] = [];
+  const content = "--ignore-extension";
+
+  Deno.env.set("SUPABASE_URL", "https://project.supabase.co");
+  Deno.env.set("SUPABASE_SERVICE_ROLE_KEY", "service-role-key");
+  globalThis.fetch = (input) => {
+    const url = input instanceof Request
+      ? input.url
+      : input instanceof URL
+      ? input.toString()
+      : input;
+    requests.push(url);
+    if (url.includes("/rest/v1/codex_ignored_sessions?")) {
+      return Promise.resolve(
+        new Response(JSON.stringify([]), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+      );
+    }
+    throw new Error(`unexpected request: ${url}`);
+  };
+
+  const requestFor = async (
+    type: string | undefined,
+    role: string,
+    omitted?: "id" | "seq" | "created_at",
+  ) => {
+    const record: JsonObject = {
+      id: "804fd832-7779-4665-9bec-2f10462c721b",
+      session_id: `invalid-${type ?? "missing"}-${role}`,
+      type,
+      seq: 1,
+      role,
+      content_sha256: await testSha256Hex(content),
+      content_byte_size: content.length,
+      created_at: "2026-08-11T21:00:00.000Z",
+    };
+    if (type === undefined) {
+      delete record.type;
+    }
+    if (omitted) {
+      delete record[omitted];
+    }
+    return await handleRequest(
+      new Request("https://example.test/codex-session-ingest", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          version: 1,
+          record,
+          message: { content },
+          client: {
+            repo_remote: "https://github.com/e3-solutions/codex-plugins.git",
+            identity_key: "other-user-test",
+          },
+        }),
+      }),
+    );
+  };
+
+  try {
+    assertEquals((await requestFor("unknown", "user")).status, 400);
+    assertEquals((await requestFor("message", "tool")).status, 400);
+    assertEquals((await requestFor(undefined, "user")).status, 400);
+    assertEquals((await requestFor("message", "user", "id")).status, 400);
+    assertEquals((await requestFor("message", "user", "seq")).status, 400);
+    assertEquals(
+      (await requestFor("message", "user", "created_at")).status,
+      400,
+    );
+    assertEquals(requests.length, 6);
+    assertEquals(requests.some((url) => url.includes("/rpc/fence")), false);
+  } finally {
+    globalThis.fetch = originalFetch;
+    restoreEnv("SUPABASE_URL", previousUrl);
+    restoreEnv("SUPABASE_SERVICE_ROLE_KEY", previousServiceRole);
+  }
+});
+
+Deno.test("handleRequest cannot fence a session owned by another user", async () => {
+  const originalFetch = globalThis.fetch;
+  const previousUrl = Deno.env.get("SUPABASE_URL");
+  const previousServiceRole = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
+  const requests: string[] = [];
+  const content = "--ignore-extension";
+
+  Deno.env.set("SUPABASE_URL", "https://project.supabase.co");
+  Deno.env.set("SUPABASE_SERVICE_ROLE_KEY", "service-role-key");
+  globalThis.fetch = (input) => {
+    const url = input instanceof Request
+      ? input.url
+      : input instanceof URL
+      ? input.toString()
+      : input;
+    requests.push(url);
+    if (url.includes("/rest/v1/codex_ignored_sessions?")) {
+      return Promise.resolve(
+        new Response(JSON.stringify([]), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+      );
+    }
+    if (url.includes("/rest/v1/codex_sessions?select=")) {
+      return Promise.resolve(
+        new Response(
+          JSON.stringify([{
+            user_id: "different-owner",
+            metadata: {},
+          }]),
+          {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          },
+        ),
+      );
+    }
+    throw new Error(`unexpected request: ${url}`);
+  };
+
+  try {
+    const response = await handleRequest(
+      new Request("https://example.test/codex-session-ingest", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          version: 1,
+          record: {
+            id: "804fd832-7779-4665-9bec-2f10462c721b",
+            session_id: "other-user-session",
+            type: "message",
+            seq: 2,
+            role: "user",
+            content_sha256: await testSha256Hex(content),
+            content_byte_size: content.length,
+            created_at: "2026-08-11T21:00:00.000Z",
+          },
+          message: { content },
+          client: {
+            repo_remote: "https://github.com/e3-solutions/codex-plugins.git",
+            identity_key: "owner-mismatch-test",
+          },
+        }),
+      }),
+    );
+
+    assertEquals([response.status, await response.json()], [
+      422,
+      { error: "session_rejected" },
+    ]);
+    assertEquals(requests.some((url) => url.includes("/rpc/fence")), false);
+  } finally {
+    globalThis.fetch = originalFetch;
+    restoreEnv("SUPABASE_URL", previousUrl);
+    restoreEnv("SUPABASE_SERVICE_ROLE_KEY", previousServiceRole);
   }
 });
 

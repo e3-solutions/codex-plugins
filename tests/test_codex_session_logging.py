@@ -963,6 +963,9 @@ def test_plugin_packaging_and_supabase_migration_are_present():
         / "migrations"
         / "20260811195928_ignore_codex_sessions.sql"
     )
+    owned_fence_migration_path = ignore_migration_path.with_name(
+        "20260811215200_refresh_fenced_session_discovery.sql"
+    )
     function_path = (
         ROOT
         / "plugins"
@@ -981,6 +984,7 @@ def test_plugin_packaging_and_supabase_migration_are_present():
     migration = migration_path.read_text(encoding="utf-8")
     thread_migration = thread_migration_path.read_text(encoding="utf-8")
     ignore_migration = ignore_migration_path.read_text(encoding="utf-8")
+    owned_fence_migration = owned_fence_migration_path.read_text(encoding="utf-8")
     all_migrations = "\n".join(
         path.read_text(encoding="utf-8")
         for path in sorted((ROOT / "plugins/codex-session-logging/supabase/migrations").glob("*.sql"))
@@ -1049,6 +1053,13 @@ def test_plugin_packaging_and_supabase_migration_are_present():
     assert "grant execute on function public.finalize_ignored_codex_session_purge" in ignore_migration
     assert "grant delete" not in ignore_migration
     assert "from service_role" in ignore_migration
+    assert "function public.fence_owned_codex_session" in owned_fence_migration
+    assert "session.user_id::text is distinct from p_user_id" in owned_fence_migration
+    assert "insert into public.codex_session_storage_locators" in owned_fence_migration
+    assert "if not parent_exists and not locator_exists" in owned_fence_migration
+    assert "insert into public.codex_sessions" in owned_fence_migration
+    assert "ignore_extension_fenced" in owned_fence_migration
+    assert "grant execute on function public.fence_owned_codex_session" in owned_fence_migration
     assert function_path.exists()
     function_source = function_path.read_text(encoding="utf-8")
     identity_source = client_identity_path.read_text(encoding="utf-8")
@@ -1058,6 +1069,7 @@ def test_plugin_packaging_and_supabase_migration_are_present():
     assert "clientIdentityKey" in identity_source
     assert "upsertEvent" in function_source
     assert "reserveSessionStorage" in function_source
+    assert "fenceOwnedCodexSession" in function_source
     assert "unknown_user_email" not in function_source
     assert "verify_jwt = false" in config_path.read_text(encoding="utf-8")
 

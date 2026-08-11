@@ -46,6 +46,14 @@ the service role has no direct table-delete grant. The migration does not scan o
 populate locators for historical tasks; each newly received task record reserves
 its locator before its object can be uploaded.
 
+A new canonical user or assistant message containing the exact, case-sensitive
+substring `--ignore-extension` is ownership-checked and fenced before its content
+is uploaded or cataloged. The fence updates only the existing session timestamp
+and a transient boolean discovery flag; it never stores the trigger message.
+Heartbeat consumes that flag, deletes its local projection, and drives the
+bounded source purge. Spelling and case variants, non-message records, and
+historical rows do not trigger this behavior.
+
 For the first production rollout of the ignore-session protocol, deploy this Edge
 Function first, wait at least ten minutes for older hosted invocations to drain,
 then apply the ignore-session migration. During that interval the new function
