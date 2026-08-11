@@ -84,7 +84,15 @@ export async function handleRequest(req: Request): Promise<Response> {
     }
 
     const record = requireObject(payload.record, "record");
+    const sessionId = requireString(record.session_id, "record.session_id");
     const recordType = optionalString(record.type) ?? "message";
+    if (await ignoredSession(sessionId)) {
+      if (recordType !== "usage") {
+        const ignoredUserId = await resolveUserId(client);
+        await deleteStorageObject(storagePathForRecord(record, ignoredUserId));
+      }
+      return ignoredSessionResponse(record);
+    }
     if (recordType === "usage") {
       const usage = requireObject(payload.usage, "usage");
       const usageParameters = sessionUsageParameters(record, usage);
@@ -106,21 +114,31 @@ export async function handleRequest(req: Request): Promise<Response> {
       return jsonResponse({ error: "session_rejected" }, 422);
     }
     const storagePath = storagePathForRecord(record, userId);
+    if (!await reserveSessionStorage(sessionId, userId)) {
+      await deleteStorageObject(storagePath);
+      return ignoredSessionResponse(record);
+    }
 
     if (recordType === "event") {
       const event = requireObject(payload.event, "event");
       const sanitizedEvent = sanitizeEventPayload(record, event);
       await upsertSessionUser(record, client, userId);
       await uploadStorageObject(storagePath, sanitizedEvent);
-      await upsertSession(
-        record,
-        client,
-        userId,
-        remote,
-        existing,
-        optionalObject(sanitizedEvent.metadata),
-      );
-      await upsertEvent(record, userId, storagePath, sanitizedEvent);
+      if (
+        await finishSessionObjectWrite(record, storagePath, async () => {
+          await upsertSession(
+            record,
+            client,
+            userId,
+            remote,
+            existing,
+            optionalObject(sanitizedEvent.metadata),
+          );
+          await upsertEvent(record, userId, storagePath, sanitizedEvent);
+        })
+      ) {
+        return ignoredSessionResponse(record);
+      }
       return jsonResponse({
         ok: true,
         id: record.id,
@@ -132,8 +150,14 @@ export async function handleRequest(req: Request): Promise<Response> {
     await validateMessageIntegrity(record, message);
     await upsertSessionUser(record, client, userId);
     await uploadStorageObject(storagePath, message);
-    await upsertSession(record, client, userId, remote, existing);
-    await upsertMessage(record, userId, storagePath);
+    if (
+      await finishSessionObjectWrite(record, storagePath, async () => {
+        await upsertSession(record, client, userId, remote, existing);
+        await upsertMessage(record, userId, storagePath);
+      })
+    ) {
+      return ignoredSessionResponse(record);
+    }
 
     return jsonResponse({
       ok: true,
@@ -228,11 +252,26 @@ async function ingestRolloutChunk(
   if (await sha256HexBytes(content) !== contentSha256) {
     throw new PayloadValidationError("rollout chunk content hash mismatch");
   }
-
   const userId = await resolveUserId(client);
+  const storagePath = rolloutStoragePath(
+    userId,
+    sessionId,
+    fileGeneration,
+    startOffset,
+    endOffset,
+    contentSha256,
+  );
+  if (await ignoredSession(sessionId)) {
+    await deleteStorageObject(storagePath);
+    return ignoredSessionResponse(record);
+  }
   const existing = await existingSession(sessionId);
   if (existing.found && existing.userId !== userId) {
     return jsonResponse({ error: "session_rejected" }, 422);
+  }
+  if (!await reserveSessionStorage(sessionId, userId)) {
+    await deleteStorageObject(storagePath);
+    return ignoredSessionResponse(record);
   }
 
   const metadata = sanitizeRolloutChunkMetadata(
@@ -257,14 +296,6 @@ async function ingestRolloutChunk(
     seq: deterministicEventSequence(eventId),
     metadata,
   };
-  const storagePath = rolloutStoragePath(
-    userId,
-    sessionId,
-    fileGeneration,
-    startOffset,
-    endOffset,
-    contentSha256,
-  );
   const event = { metadata };
 
   await upsertSessionUser(catalogRecord, client, userId);
@@ -273,15 +304,25 @@ async function ingestRolloutChunk(
     exactArrayBuffer(content),
     "application/x-ndjson",
   );
-  await upsertSession(
-    catalogRecord,
-    client,
-    userId,
-    remote,
-    existing,
-    metadata,
-  );
-  await upsertEvent(catalogRecord, userId, storagePath, event);
+  if (
+    await finishSessionObjectWrite(
+      catalogRecord,
+      storagePath,
+      async () => {
+        await upsertSession(
+          catalogRecord,
+          client,
+          userId,
+          remote,
+          existing,
+          metadata,
+        );
+        await upsertEvent(catalogRecord, userId, storagePath, event);
+      },
+    )
+  ) {
+    return ignoredSessionResponse(catalogRecord);
+  }
   return jsonResponse({
     ok: true,
     id: eventId,
@@ -553,7 +594,7 @@ async function uploadStorageBytes(
   payload: BodyInit,
   contentType: string,
 ): Promise<void> {
-  const bucket = Deno.env.get("CODEX_SESSION_LOG_BUCKET") ?? DEFAULT_BUCKET;
+  const bucket = storageBucket();
   const quotedPath = storagePath.split("/").map(encodeURIComponent).join("/");
   await supabaseFetch(
     `/storage/v1/object/${encodeURIComponent(bucket)}/${quotedPath}`,
@@ -566,6 +607,40 @@ async function uploadStorageBytes(
       body: payload,
     },
   );
+}
+
+async function deleteStorageObject(storagePath: string): Promise<void> {
+  const bucket = storageBucket();
+  await supabaseFetch(
+    `/storage/v1/object/${encodeURIComponent(bucket)}`,
+    {
+      method: "DELETE",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ prefixes: [storagePath] }),
+    },
+  );
+}
+
+async function finishSessionObjectWrite(
+  record: JsonObject,
+  storagePath: string,
+  writeCatalog: () => Promise<void>,
+): Promise<boolean> {
+  const sessionId = requireString(record.session_id, "record.session_id");
+  try {
+    await writeCatalog();
+  } catch (error) {
+    if (!await ignoredSession(sessionId)) {
+      throw error;
+    }
+    await deleteStorageObject(storagePath);
+    return true;
+  }
+  if (!await ignoredSession(sessionId)) {
+    return false;
+  }
+  await deleteStorageObject(storagePath);
+  return true;
 }
 
 async function upsertSession(
@@ -594,9 +669,7 @@ async function upsertSession(
     user_id: userId,
     repo: remote,
     branch: optionalString(client.git_branch),
-    storage_prefix: `users/${safeSegment(userId)}/sessions/${
-      safeSegment(sessionId)
-    }`,
+    storage_prefix: sessionStoragePrefix(userId, sessionId),
     metadata: sessionMetadata,
     started_at: earliestTimestamp(
       existing.startedAt,
@@ -758,6 +831,72 @@ async function existingSession(
   };
 }
 
+function storageBucket(): string {
+  return Deno.env.get("CODEX_SESSION_LOG_BUCKET") ?? DEFAULT_BUCKET;
+}
+
+function sessionStoragePrefix(userId: string, sessionId: string): string {
+  return `users/${safeSegment(userId)}/sessions/${safeSegment(sessionId)}`;
+}
+
+async function reserveSessionStorage(
+  sessionId: string,
+  userId: string,
+): Promise<boolean> {
+  const response = await supabaseFetch(
+    "/rest/v1/rpc/reserve_codex_session_storage",
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        p_session_id: sessionId,
+        p_user_id: userId,
+        p_storage_bucket: storageBucket(),
+        p_storage_prefix: sessionStoragePrefix(userId, sessionId),
+      }),
+    },
+  );
+  const payload = await response.json();
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+    throw new Error("session storage reservation returned an invalid response");
+  }
+  const status = optionalString((payload as JsonObject).status);
+  if (status === "reserved") {
+    return true;
+  }
+  if (status === "ignored") {
+    return false;
+  }
+  throw new Error("session storage reservation returned an invalid status");
+}
+
+async function ignoredSession(sessionId: string): Promise<boolean> {
+  const sessionHash = await sha256Hex(
+    `codex_rollout_session:${sessionId}`,
+  );
+  const response = await supabaseFetch(
+    `/rest/v1/codex_ignored_sessions?select=session_id_hash&session_id_hash=eq.${sessionHash}&limit=1`,
+    {
+      method: "GET",
+      headers: { accept: "application/json" },
+    },
+  );
+  const rows = await response.json();
+  if (!Array.isArray(rows)) {
+    throw new Error("ignored session lookup returned an invalid response");
+  }
+  return rows.length > 0;
+}
+
+function ignoredSessionResponse(record: JsonObject): Response {
+  return jsonResponse({
+    ok: true,
+    id: record.id,
+    ignored: true,
+    reason: "session_opted_out",
+  });
+}
+
 async function installationCapabilityDigest(
   value: unknown,
 ): Promise<string | null> {
@@ -820,7 +959,7 @@ async function upsertMessage(
     turn_id: optionalString(record.turn_id),
     seq: requireNumber(record.seq, "record.seq"),
     role: requireString(record.role, "record.role"),
-    storage_bucket: Deno.env.get("CODEX_SESSION_LOG_BUCKET") ?? DEFAULT_BUCKET,
+    storage_bucket: storageBucket(),
     storage_path: storagePath,
     content_sha256: requireString(
       record.content_sha256,
@@ -910,7 +1049,7 @@ async function upsertEvent(
     user_id: userId,
     seq: requireNumber(record.seq, "record.seq"),
     event_type: requireString(record.event_type, "record.event_type"),
-    storage_bucket: Deno.env.get("CODEX_SESSION_LOG_BUCKET") ?? DEFAULT_BUCKET,
+    storage_bucket: storageBucket(),
     storage_path: storagePath,
     metadata: optionalObject(event.metadata),
     created_at: requireString(record.created_at, "record.created_at"),

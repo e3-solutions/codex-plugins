@@ -955,6 +955,14 @@ def test_plugin_packaging_and_supabase_migration_are_present():
         / "migrations"
         / "20260710005921_add_thread_identity.sql"
     )
+    ignore_migration_path = (
+        ROOT
+        / "plugins"
+        / "codex-session-logging"
+        / "supabase"
+        / "migrations"
+        / "20260811195928_ignore_codex_sessions.sql"
+    )
     function_path = (
         ROOT
         / "plugins"
@@ -972,6 +980,7 @@ def test_plugin_packaging_and_supabase_migration_are_present():
     marketplace = json.loads(marketplace_path.read_text(encoding="utf-8"))
     migration = migration_path.read_text(encoding="utf-8")
     thread_migration = thread_migration_path.read_text(encoding="utf-8")
+    ignore_migration = ignore_migration_path.read_text(encoding="utf-8")
     all_migrations = "\n".join(
         path.read_text(encoding="utf-8")
         for path in sorted((ROOT / "plugins/codex-session-logging/supabase/migrations").glob("*.sql"))
@@ -1019,6 +1028,30 @@ def test_plugin_packaging_and_supabase_migration_are_present():
     assert "digest(new.id, 'sha256')" in thread_migration
     assert "alter column thread_id set not null" in thread_migration
     assert "codex_sessions_user_thread_created_idx" in thread_migration
+    assert "create table if not exists public.codex_ignored_sessions" in ignore_migration
+    assert "alter table public.codex_ignored_sessions enable row level security" in ignore_migration
+    assert "security definer" in ignore_migration
+    assert "session is not fenced for deletion" in ignore_migration
+    assert "pg_advisory_xact_lock" in ignore_migration
+    assert "interval '10 minutes'" in ignore_migration
+    assert "'pending_quiescence'" in ignore_migration
+    assert "pg_catalog.clock_timestamp()" in ignore_migration
+    assert "create table if not exists public.codex_session_storage_locators" in ignore_migration
+    assert "create or replace function public.reserve_codex_session_storage" in ignore_migration
+    assert "stored.path_tokens[4]" in ignore_migration
+    assert "where not exists (\n  select 1\n  from public.codex_session_storage_locators locator" in ignore_migration
+    assert "delete from public.codex_session_storage_locators" in ignore_migration
+    assert "pg_catalog.starts_with" in ignore_migration
+    assert "p_limit is null" in ignore_migration
+    assert "create trigger codex_sessions_reject_ignored" in ignore_migration
+    assert "create trigger codex_session_usage_observations_reject_ignored" in ignore_migration
+    assert "storage.objects" in ignore_migration
+    assert "grant execute on function public.fence_codex_session" in ignore_migration
+    assert "grant execute on function public.reserve_codex_session_storage" in ignore_migration
+    assert "grant execute on function public.list_ignored_codex_session_objects" in ignore_migration
+    assert "grant execute on function public.finalize_ignored_codex_session_purge" in ignore_migration
+    assert "grant delete" not in ignore_migration
+    assert "from service_role" in ignore_migration
     assert function_path.exists()
     function_source = function_path.read_text(encoding="utf-8")
     identity_source = client_identity_path.read_text(encoding="utf-8")
@@ -1027,6 +1060,7 @@ def test_plugin_packaging_and_supabase_migration_are_present():
     assert "deterministicUserIdForEmail" in identity_source
     assert "clientIdentityKey" in identity_source
     assert "upsertEvent" in function_source
+    assert "reserveSessionStorage" in function_source
     assert "unknown_user_email" not in function_source
     assert "verify_jwt = false" in config_path.read_text(encoding="utf-8")
 

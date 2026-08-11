@@ -110,6 +110,327 @@ Deno.test("handleRequest ignores historical backfill status without writes", asy
   }
 });
 
+Deno.test("handleRequest discards a fenced rollout and removes its object", async () => {
+  const originalFetch = globalThis.fetch;
+  const previousUrl = Deno.env.get("SUPABASE_URL");
+  const previousServiceRole = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
+  const requests: Array<{ url: string; method: string; body: string | null }> =
+    [];
+  Deno.env.set("SUPABASE_URL", "https://project.supabase.co");
+  Deno.env.set("SUPABASE_SERVICE_ROLE_KEY", "service-role-key");
+  globalThis.fetch = (input, init = {}) => {
+    const url = input instanceof Request
+      ? input.url
+      : input instanceof URL
+      ? input.toString()
+      : input;
+    const requestInit = init as { method?: string; body?: BodyInit | null };
+    requests.push({
+      url,
+      method: requestInit.method ?? "GET",
+      body: typeof requestInit.body === "string" ? requestInit.body : null,
+    });
+    return Promise.resolve(
+      new Response(
+        JSON.stringify([{
+          session_id_hash: "a".repeat(64),
+        }]),
+        {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        },
+      ),
+    );
+  };
+
+  try {
+    const payload = await rolloutChunkPayload("sensitive rollout\n");
+    const response = await handleRequest(
+      new Request("https://example.test/codex-session-ingest", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(payload),
+      }),
+    );
+
+    assertEquals(response.status, 200);
+    assertEquals(await response.json(), {
+      ok: true,
+      id: optionalTestObject(payload.record).id,
+      ignored: true,
+      reason: "session_opted_out",
+    });
+    assertEquals(requests.length, 3);
+    assertIncludes(requests[0].url, "/rest/v1/codex_session_users?");
+    assertEquals(requests[0].method, "GET");
+    assertIncludes(requests[1].url, "/rest/v1/codex_ignored_sessions?");
+    const expectedSessionHash =
+      "e964072a95ff700a5dfb7ea1d1632a5fa672eee28b2a5ea2680eb72adb927928";
+    assertEquals(
+      await testSha256Hex(
+        "codex_rollout_session:11111111-1111-4111-8111-111111111111",
+      ),
+      expectedSessionHash,
+    );
+    assertIncludes(requests[1].url, expectedSessionHash);
+    assertEquals(requests[1].method, "GET");
+    assertEquals(
+      requests[2].url,
+      "https://project.supabase.co/storage/v1/object/codex-sessions",
+    );
+    assertEquals(requests[2].method, "DELETE");
+    const deleteBody = JSON.parse(requests[2].body ?? "{}") as JsonObject;
+    const prefixes = deleteBody.prefixes as unknown[];
+    assertEquals(prefixes.length, 1);
+    assertIncludes(
+      String(prefixes[0]),
+      "/sessions/11111111-1111-4111-8111-111111111111/",
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+    restoreEnv("SUPABASE_URL", previousUrl);
+    restoreEnv("SUPABASE_SERVICE_ROLE_KEY", previousServiceRole);
+  }
+});
+
+Deno.test("handleRequest removes a rollout fenced during its catalog writes", async () => {
+  const originalFetch = globalThis.fetch;
+  const previousUrl = Deno.env.get("SUPABASE_URL");
+  const previousServiceRole = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
+  const requests: Array<{ url: string; method: string }> = [];
+  let fenceChecks = 0;
+  Deno.env.set("SUPABASE_URL", "https://project.supabase.co");
+  Deno.env.set("SUPABASE_SERVICE_ROLE_KEY", "service-role-key");
+  globalThis.fetch = (input, init = {}) => {
+    const url = input instanceof Request
+      ? input.url
+      : input instanceof URL
+      ? input.toString()
+      : input;
+    const requestInit = init as { method?: string };
+    const method = requestInit.method ?? "GET";
+    requests.push({ url, method });
+    if (url.includes("/rest/v1/rpc/reserve_codex_session_storage")) {
+      return Promise.resolve(reservedStorageResponse());
+    }
+    if (url.includes("/rest/v1/codex_ignored_sessions?")) {
+      fenceChecks += 1;
+      return Promise.resolve(
+        new Response(
+          JSON.stringify(
+            fenceChecks === 1 ? [] : [{ session_id_hash: "a".repeat(64) }],
+          ),
+          {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          },
+        ),
+      );
+    }
+    if (url.includes("/rest/v1/codex_session_users?")) {
+      return Promise.resolve(
+        new Response(
+          JSON.stringify([{
+            user_id: "99999999-9999-4999-8999-999999999999",
+            git_email: "owner@example.com",
+            first_seen_at: "2026-07-01T00:00:00.000Z",
+          }]),
+          {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          },
+        ),
+      );
+    }
+    if (url.includes("/rest/v1/codex_sessions?select=")) {
+      return Promise.resolve(
+        new Response(JSON.stringify([]), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+      );
+    }
+    return Promise.resolve(new Response("", { status: 201 }));
+  };
+
+  try {
+    const payload = await rolloutChunkPayload("sensitive rollout\n");
+    const response = await handleRequest(
+      new Request("https://example.test/codex-session-ingest", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(payload),
+      }),
+    );
+    const body = await response.json();
+
+    assertEquals(response.status, 200);
+    assertEquals(body.ignored, true);
+    assertEquals(fenceChecks, 2);
+    assertEquals(
+      requests.filter((request) =>
+        request.method === "POST" &&
+        request.url.includes("/storage/v1/object/")
+      ).length,
+      1,
+    );
+    assertEquals(
+      requests.filter((request) =>
+        request.method === "DELETE" &&
+        request.url.includes("/storage/v1/object/")
+      ).length,
+      1,
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+    restoreEnv("SUPABASE_URL", previousUrl);
+    restoreEnv("SUPABASE_SERVICE_ROLE_KEY", previousServiceRole);
+  }
+});
+
+Deno.test("handleRequest preserves a reserved object when cataloging fails", async () => {
+  const originalFetch = globalThis.fetch;
+  const previousUrl = Deno.env.get("SUPABASE_URL");
+  const previousServiceRole = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
+  const requests: Array<{ url: string; method: string }> = [];
+  Deno.env.set("SUPABASE_URL", "https://project.supabase.co");
+  Deno.env.set("SUPABASE_SERVICE_ROLE_KEY", "service-role-key");
+  globalThis.fetch = (input, init = {}) => {
+    const url = input instanceof Request
+      ? input.url
+      : input instanceof URL
+      ? input.toString()
+      : input;
+    const method = (init as { method?: string }).method ?? "GET";
+    requests.push({ url, method });
+    if (url.includes("/rest/v1/rpc/reserve_codex_session_storage")) {
+      return Promise.resolve(reservedStorageResponse());
+    }
+    if (url.includes("/rest/v1/codex_ignored_sessions?")) {
+      return Promise.resolve(
+        new Response(JSON.stringify([]), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+      );
+    }
+    if (url.includes("/rest/v1/codex_session_users?")) {
+      return Promise.resolve(
+        new Response(
+          JSON.stringify([{
+            user_id: "99999999-9999-4999-8999-999999999999",
+          }]),
+          {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          },
+        ),
+      );
+    }
+    if (url.includes("/rest/v1/codex_sessions?select=")) {
+      return Promise.resolve(
+        new Response(JSON.stringify([]), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+      );
+    }
+    if (
+      method === "POST" &&
+      url.includes("/rest/v1/codex_sessions?on_conflict=")
+    ) {
+      return Promise.resolve(new Response("catalog conflict", { status: 409 }));
+    }
+    return Promise.resolve(new Response("", { status: 201 }));
+  };
+
+  try {
+    const payload = await rolloutChunkPayload("catalog race\n");
+    const response = await handleRequest(
+      new Request("https://example.test/codex-session-ingest", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(payload),
+      }),
+    );
+
+    assertEquals(response.status, 500);
+    assertEquals(
+      requests.filter((request) =>
+        request.method === "DELETE" &&
+        request.url.endsWith("/storage/v1/object/codex-sessions")
+      ).length,
+      0,
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+    restoreEnv("SUPABASE_URL", previousUrl);
+    restoreEnv("SUPABASE_SERVICE_ROLE_KEY", previousServiceRole);
+  }
+});
+
+Deno.test("handleRequest reserves storage before the first upload", async () => {
+  const originalFetch = globalThis.fetch;
+  const previousUrl = Deno.env.get("SUPABASE_URL");
+  const previousServiceRole = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
+  let storageUploads = 0;
+  Deno.env.set("SUPABASE_URL", "https://project.supabase.co");
+  Deno.env.set("SUPABASE_SERVICE_ROLE_KEY", "service-role-key");
+  globalThis.fetch = (input, init = {}) => {
+    const url = input instanceof Request
+      ? input.url
+      : input instanceof URL
+      ? input.toString()
+      : input;
+    if (url.includes("/rest/v1/codex_ignored_sessions?")) {
+      return Promise.resolve(new Response(JSON.stringify([]), { status: 200 }));
+    }
+    if (url.includes("/rest/v1/codex_session_users?")) {
+      return Promise.resolve(
+        new Response(
+          JSON.stringify([{
+            user_id: "99999999-9999-4999-8999-999999999999",
+          }]),
+          { status: 200 },
+        ),
+      );
+    }
+    if (url.includes("/rest/v1/codex_sessions?select=")) {
+      return Promise.resolve(new Response(JSON.stringify([]), { status: 200 }));
+    }
+    if (url.includes("/rest/v1/rpc/reserve_codex_session_storage")) {
+      return Promise.resolve(
+        new Response("storage identity conflict", {
+          status: 409,
+        }),
+      );
+    }
+    if (
+      (init as { method?: string }).method === "POST" &&
+      url.includes("/storage/v1/object/")
+    ) {
+      storageUploads += 1;
+    }
+    return Promise.resolve(new Response("", { status: 201 }));
+  };
+
+  try {
+    const response = await handleRequest(
+      new Request("https://example.test/codex-session-ingest", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(await rolloutChunkPayload("reservation race\n")),
+      }),
+    );
+    assertEquals(response.status, 500);
+    assertEquals(storageUploads, 0);
+  } finally {
+    globalThis.fetch = originalFetch;
+    restoreEnv("SUPABASE_URL", previousUrl);
+    restoreEnv("SUPABASE_SERVICE_ROLE_KEY", previousServiceRole);
+  }
+});
+
 Deno.test("handleRequest preserves existing session codex setup on later event upserts", async () => {
   const requests: Array<{ url: string; body: JsonObject | null }> = [];
   const originalFetch = globalThis.fetch;
@@ -135,6 +456,15 @@ Deno.test("handleRequest preserves existing session codex setup on later event u
       ? JSON.parse(requestInit.body) as JsonObject
       : null;
     requests.push({ url, body });
+    if (url.includes("/rest/v1/rpc/reserve_codex_session_storage")) {
+      return reservedStorageResponse();
+    }
+    if (url.includes("/rest/v1/codex_ignored_sessions?")) {
+      return new Response(JSON.stringify([]), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    }
     if (url.includes("/rest/v1/codex_session_users?select=")) {
       return new Response(JSON.stringify([{ user_id: existingUserId }]), {
         status: 200,
@@ -233,7 +563,11 @@ Deno.test("handleRequest upserts session user identity rollup", async () => {
       ? JSON.parse(requestInit.body) as JsonObject
       : null;
     requests.push({ url, body });
+    if (url.includes("/rest/v1/rpc/reserve_codex_session_storage")) {
+      return reservedStorageResponse();
+    }
     if (
+      url.includes("/rest/v1/codex_ignored_sessions?") ||
       url.includes("/rest/v1/codex_sessions?select=") ||
       url.includes("/rest/v1/codex_session_users?select=")
     ) {
@@ -331,6 +665,15 @@ Deno.test("handleRequest reuses the email-backed user for an existing installati
       ? JSON.parse(requestInit.body) as JsonObject
       : null;
     requests.push({ url, body });
+    if (url.includes("/rest/v1/rpc/reserve_codex_session_storage")) {
+      return reservedStorageResponse();
+    }
+    if (url.includes("/rest/v1/codex_ignored_sessions?")) {
+      return new Response(JSON.stringify([]), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    }
     if (url.includes("/rest/v1/codex_session_users?select=")) {
       return new Response(
         JSON.stringify([
@@ -426,6 +769,12 @@ Deno.test("handleRequest accepts usage with matching capability and configured t
       ? JSON.parse(requestInit.body) as JsonObject
       : null;
     requests.push({ url, body });
+    if (url.includes("/rest/v1/codex_ignored_sessions?")) {
+      return new Response(JSON.stringify([]), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    }
     if (url.includes("/rest/v1/codex_sessions?select=")) {
       return new Response(
         JSON.stringify([{
@@ -598,10 +947,21 @@ Deno.test("handleRequest returns one retryable failure for usage capability erro
   try {
     for (const scenario of scenarios) {
       let writes = 0;
-      globalThis.fetch = async (_input, init = {}) => {
+      globalThis.fetch = async (input, init = {}) => {
+        const url = input instanceof Request
+          ? input.url
+          : input instanceof URL
+          ? input.toString()
+          : input;
         const requestInit = init as { method?: string };
         if (requestInit.method !== "GET") {
           writes += 1;
+        }
+        if (url.includes("/rest/v1/codex_ignored_sessions?")) {
+          return new Response(JSON.stringify([]), {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          });
         }
         return new Response(JSON.stringify(scenario.rows), {
           status: 200,
@@ -717,6 +1077,15 @@ Deno.test("handleRequest stores rollout bytes and catalogs retries idempotently"
       body = JSON.parse(new TextDecoder().decode(rawBody)) as JsonObject;
     }
     requests.push({ url, body, rawBody, contentType });
+    if (url.includes("/rest/v1/rpc/reserve_codex_session_storage")) {
+      return reservedStorageResponse();
+    }
+    if (url.includes("/rest/v1/codex_ignored_sessions?")) {
+      return new Response(JSON.stringify([]), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    }
     if (url.includes("/rest/v1/codex_session_users?select=user_id")) {
       return new Response(
         JSON.stringify([{
@@ -858,6 +1227,7 @@ Deno.test("handleRequest rejects existing event and rollout owner mismatches bef
   };
   const rolloutPayload = await rolloutChunkPayload("complete rollout line\n");
   let writes = 0;
+  const existingUserId = "22222222-2222-4222-8222-222222222222";
 
   Deno.env.set("SUPABASE_URL", "https://project.supabase.co");
   Deno.env.set("SUPABASE_SERVICE_ROLE_KEY", "service-role-key");
@@ -869,15 +1239,20 @@ Deno.test("handleRequest rejects existing event and rollout owner mismatches bef
       ? input.toString()
       : input;
     const requestInit = init as { method?: string };
+    if (url.includes("/rest/v1/rpc/reserve_codex_session_storage")) {
+      return reservedStorageResponse();
+    }
     if (requestInit.method !== "GET") {
       writes += 1;
     }
-    const rows = url.includes("/rest/v1/codex_session_users?select=")
+    const rows = url.includes("/rest/v1/codex_ignored_sessions?")
+      ? []
+      : url.includes("/rest/v1/codex_session_users?select=")
       ? [{
         user_id: "11111111-1111-4111-8111-111111111111",
         first_seen_at: "2026-07-01T00:00:00.000Z",
       }]
-      : [{ user_id: "22222222-2222-4222-8222-222222222222" }];
+      : [{ user_id: existingUserId, storage_bucket: "codex-sessions" }];
     return new Response(JSON.stringify(rows), {
       status: 200,
       headers: { "content-type": "application/json" },
@@ -1240,7 +1615,11 @@ Deno.test("handleRequest stamps the claude agent and end time onto the session",
       ? JSON.parse(requestInit.body) as JsonObject
       : null;
     requests.push({ url, body });
+    if (url.includes("/rest/v1/rpc/reserve_codex_session_storage")) {
+      return reservedStorageResponse();
+    }
     if (
+      url.includes("/rest/v1/codex_ignored_sessions?") ||
       url.includes("/rest/v1/codex_sessions?select=") ||
       url.includes("/rest/v1/codex_session_users?select=")
     ) {
@@ -1326,7 +1705,11 @@ Deno.test("handleRequest defaults agent to codex and clears ended_at on live eve
       ? JSON.parse(requestInit.body) as JsonObject
       : null;
     requests.push({ url, body });
+    if (url.includes("/rest/v1/rpc/reserve_codex_session_storage")) {
+      return reservedStorageResponse();
+    }
     if (
+      url.includes("/rest/v1/codex_ignored_sessions?") ||
       url.includes("/rest/v1/codex_sessions?select=") ||
       url.includes("/rest/v1/codex_session_users?select=")
     ) {
@@ -1436,6 +1819,13 @@ async function testSha256Hex(value: string): Promise<string> {
   return Array.from(new Uint8Array(digest)).map((byte) =>
     byte.toString(16).padStart(2, "0")
   ).join("");
+}
+
+function reservedStorageResponse(): Response {
+  return new Response(JSON.stringify({ status: "reserved" }), {
+    status: 200,
+    headers: { "content-type": "application/json" },
+  });
 }
 
 function optionalTestObject(value: unknown): JsonObject {
