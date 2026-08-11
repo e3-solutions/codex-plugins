@@ -42,7 +42,9 @@ The ignore-session migration adds a private, service-role-only fenced purge. The
 ingest function durably reserves its exact bucket/prefix before uploading, so a
 failed cleanup remains discoverable. Purge completion clears those locators and
 leaves only the task-id hash. Later writes are acknowledged without being stored;
-the service role has no direct table-delete grant.
+the service role has no direct table-delete grant. The migration does not scan or
+populate locators for historical tasks; each newly received task record reserves
+its locator before its object can be uploaded.
 
 For the first production rollout of the ignore-session protocol, deploy this Edge
 Function first, wait at least ten minutes for older hosted invocations to drain,
