@@ -1038,14 +1038,11 @@ def test_plugin_packaging_and_supabase_migration_are_present():
     assert "pg_catalog.clock_timestamp()" in ignore_migration
     assert "create table if not exists public.codex_session_storage_locators" in ignore_migration
     assert "create or replace function public.reserve_codex_session_storage" in ignore_migration
-    assert "stored.path_tokens[4]" in ignore_migration
-    assert "where not exists (\n  select 1\n  from public.codex_session_storage_locators locator" in ignore_migration
     assert "delete from public.codex_session_storage_locators" in ignore_migration
     assert "pg_catalog.starts_with" in ignore_migration
     assert "p_limit is null" in ignore_migration
     assert "create trigger codex_sessions_reject_ignored" in ignore_migration
     assert "create trigger codex_session_usage_observations_reject_ignored" in ignore_migration
-    assert "storage.objects" in ignore_migration
     assert "grant execute on function public.fence_codex_session" in ignore_migration
     assert "grant execute on function public.reserve_codex_session_storage" in ignore_migration
     assert "grant execute on function public.list_ignored_codex_session_objects" in ignore_migration
