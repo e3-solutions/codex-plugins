@@ -29,7 +29,7 @@ def isolated_state(tmp_path, monkeypatch):
 def load_rollout_sync():
     sys.path.insert(0, str(SCRIPTS))
     try:
-        for name in ("session_logging", "publish_presence", "rollout_sync"):
+        for name in ("session_logging", "native_threads", "rollout_sync"):
             sys.modules.pop(name, None)
         spec = importlib.util.spec_from_file_location("rollout_sync", SCRIPTS / "rollout_sync.py")
         module = importlib.util.module_from_spec(spec)

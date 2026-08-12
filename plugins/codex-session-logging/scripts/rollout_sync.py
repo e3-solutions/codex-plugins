@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any
 from uuid import UUID
 
-import publish_presence
+import native_threads
 import rollout_usage
 import session_logging
 
@@ -181,7 +181,7 @@ def discover_rollout_threads(
     merged: dict[str, JsonDict] = {}
     errors: list[str] = []
     next_database_state = dict(database_state)
-    for database in publish_presence.native_database_candidates(codex_home):
+    for database in native_threads.native_database_candidates(codex_home):
         try:
             database_stat = database.stat()
             database_key = str(database)
@@ -207,7 +207,7 @@ def discover_rollout_threads(
             offset = 0
             observed: list[JsonDict] = []
             while True:
-                page = publish_presence.read_recent_threads(
+                page = native_threads.read_recent_threads(
                     database,
                     cutoff_ms=watermark,
                     limit=DISCOVERY_PAGE_SIZE,
@@ -222,9 +222,9 @@ def discover_rollout_threads(
                     if row_updated == watermark and thread_id in seen_at_watermark:
                         continue
                     previous = merged.get(thread_id)
-                    if previous is None or publish_presence.native_row_precedence(
+                    if previous is None or native_threads.native_row_precedence(
                         row
-                    ) > publish_presence.native_row_precedence(previous):
+                    ) > native_threads.native_row_precedence(previous):
                         merged[thread_id] = row
                 offset += len(page)
                 if len(page) < DISCOVERY_PAGE_SIZE:
@@ -311,7 +311,7 @@ def descriptor_for_row(row: JsonDict) -> JsonDict | None:
     if not session_id:
         return None
     parent_id = canonical_uuid(payload.get("parent_thread_id")) or canonical_uuid(
-        publish_presence.parent_thread_id(row)
+        native_threads.parent_thread_id(row)
     )
     metadata: JsonDict = {
         "cwd": str(row["cwd"]),
@@ -333,7 +333,7 @@ def descriptor_for_row(row: JsonDict) -> JsonDict | None:
         "session_id": session_id,
         "path": path,
         "parent_thread_id": parent_id,
-        "created_at": publish_presence.milliseconds_to_iso(
+        "created_at": native_threads.milliseconds_to_iso(
             row.get("created_at_ms") or row.get("updated_at_ms")
         ),
         "metadata": metadata,

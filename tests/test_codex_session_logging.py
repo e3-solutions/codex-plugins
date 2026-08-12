@@ -1006,7 +1006,11 @@ def test_plugin_packaging_and_supabase_migration_are_present():
     assert (ROOT / "plugins" / "codex-session-logging" / "scripts" / "session_start.py").exists()
     assert (ROOT / "plugins" / "codex-session-logging" / "scripts" / "pre_tool_use.py").exists()
     assert (ROOT / "plugins" / "codex-session-logging" / "scripts" / "post_tool_use.py").exists()
-    assert (ROOT / "plugins" / "codex-session-logging" / "scripts" / "publish_presence.py").exists()
+    scripts_path = ROOT / "plugins" / "codex-session-logging" / "scripts"
+    assert (scripts_path / "native_threads.py").exists()
+    assert not (scripts_path / "publish_presence.py").exists()
+    assert not (scripts_path / "backfill_sessions.py").exists()
+    assert not (scripts_path / "test_session_logging.py").exists()
     session_logging_plugin = next(
         plugin for plugin in marketplace["plugins"] if plugin["name"] == "codex-session-logging"
     )
@@ -1028,6 +1032,9 @@ def test_plugin_packaging_and_supabase_migration_are_present():
     assert "codex-sessions" in migration
     assert "storage.objects" in migration
     assert "add column if not exists thread_id text" in thread_migration
+    assert "codex_session_backfill_runs" in all_migrations
+    session_start_source = (scripts_path / "session_start.py").read_text(encoding="utf-8")
+    assert "backfill_sessions.py" not in session_start_source
     assert "from public.codex_session_events" in thread_migration
     assert "from public.codex_session_messages" in thread_migration
     assert "digest(session_transcripts.transcript_path, 'sha256')" in thread_migration
@@ -1074,6 +1081,7 @@ def test_plugin_packaging_and_supabase_migration_are_present():
     ).exists()
     assert function_path.exists()
     function_source = function_path.read_text(encoding="utf-8")
+    assert "historical_backfill_disabled" in function_source
     identity_source = client_identity_path.read_text(encoding="utf-8")
     assert "SUPABASE_SECRET_KEYS" in function_source
     assert "CODEX_SESSION_LOG_USER_EMAIL_MAP" in identity_source
@@ -1103,3 +1111,90 @@ def test_git_identity_falls_back_to_global_config_for_deleted_checkout(monkeypat
         ["git", "-C", "/deleted/repo", "config", "--get", "user.email"],
         ["git", "config", "--global", "--get", "user.email"],
     ]
+
+
+def test_canonical_github_remote_supports_verified_ssh_aliases(monkeypatch):
+    session_logging = load_session_logging()
+    checked = []
+    monkeypatch.setattr(
+        session_logging,
+        "ssh_host_resolves_to_github",
+        lambda host: checked.append(host) or True,
+    )
+
+    canonical = session_logging.canonical_github_remote(
+        "git@github-coreedge:e3-solutions/negotiation.git",
+        "e3-solutions",
+    )
+
+    assert canonical == "https://github.com/e3-solutions/negotiation.git"
+    assert checked == ["github-coreedge"]
+
+
+def test_canonical_github_remote_rejects_unverified_alias_and_other_org(monkeypatch):
+    session_logging = load_session_logging()
+    monkeypatch.setattr(session_logging, "ssh_host_resolves_to_github", lambda _host: False)
+
+    assert session_logging.canonical_github_remote(
+        "git@internal-git:e3-solutions/negotiation.git",
+        "e3-solutions",
+    ) is None
+    assert session_logging.canonical_github_remote(
+        "git@github.com:other-org/negotiation.git",
+        "e3-solutions",
+    ) is None
+
+
+def test_client_context_submits_canonical_remote(monkeypatch):
+    session_logging = load_session_logging()
+    monkeypatch.setattr(session_logging, "ssh_host_resolves_to_github", lambda _host: True)
+    monkeypatch.setattr(session_logging, "git_config_value", lambda *_args: None)
+    monkeypatch.setattr(session_logging, "local_hostname", lambda: "test-host")
+    monkeypatch.setattr(session_logging, "local_username", lambda: "jai")
+    monkeypatch.setattr(session_logging, "local_installation_id", lambda _base: "installation-id")
+    monkeypatch.setattr(session_logging, "saved_linear_user_name", lambda: "Jai")
+
+    context = session_logging.client_context(
+        {"metadata": {
+            "cwd": "/tmp/negotiation",
+            "repo_remote": "git@github-coreedge:e3-solutions/negotiation.git",
+        }},
+        base=Path("/tmp/logging"),
+    )
+
+    assert context["repo_remote"] == "https://github.com/e3-solutions/negotiation.git"
+
+
+def test_existing_installation_id_permissions_are_tightened(tmp_path):
+    session_logging = load_session_logging()
+    path = tmp_path / "installation_id"
+    path.write_text("existing-id\n", encoding="utf-8")
+    path.chmod(0o644)
+
+    assert session_logging.local_installation_id(tmp_path) == "existing-id"
+    assert path.stat().st_mode & 0o777 == 0o600
+
+
+def test_installation_id_permission_failure_is_not_silenced(tmp_path, monkeypatch):
+    session_logging = load_session_logging()
+    path = tmp_path / "installation_id"
+    path.write_text("existing-id\n", encoding="utf-8")
+    def deny_chmod(*_args, **_kwargs):
+        raise OSError("denied")
+
+    monkeypatch.setattr(Path, "chmod", deny_chmod)
+
+    with pytest.raises(OSError, match="denied"):
+        session_logging.local_installation_id(tmp_path)
+
+    assert path.read_text(encoding="utf-8").strip() == "existing-id"
+
+
+def test_new_installation_id_is_owner_only(tmp_path):
+    session_logging = load_session_logging()
+    base = tmp_path / "state"
+
+    value = session_logging.local_installation_id(base)
+
+    assert (base / "installation_id").read_text(encoding="utf-8").strip() == value
+    assert (base / "installation_id").stat().st_mode & 0o777 == 0o600

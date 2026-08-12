@@ -72,18 +72,6 @@ export async function handleRequest(req: Request): Promise<Response> {
       return await ingestRolloutChunk(payload, client, remote);
     }
 
-    if (payloadKind === "backfill_status") {
-      const userId = await resolveUserId(client);
-      const backfill = requireObject(payload.backfill, "backfill");
-      const observedAt = requireString(
-        backfill.updated_at,
-        "backfill.updated_at",
-      );
-      await upsertSessionUser({ created_at: observedAt }, client, userId);
-      await upsertBackfillRun(backfill, client, userId);
-      return jsonResponse({ ok: true, kind: "backfill_status" });
-    }
-
     const record = requireObject(payload.record, "record");
     const sessionId = requireString(record.session_id, "record.session_id");
     const recordType = optionalString(record.type) ?? "message";
@@ -370,48 +358,6 @@ function isHistoricalBackfill(payload: JsonObject): boolean {
   const metadata = optionalObject(record.metadata);
   return optionalString(metadata.source) === "historical_transcript" ||
     optionalString(record.hook_event_name) === "HistoricalBackfill";
-}
-
-async function upsertBackfillRun(
-  backfill: JsonObject,
-  client: JsonObject,
-  userId: string,
-): Promise<void> {
-  const totals = optionalObject(backfill.totals);
-  const installationId = requireString(
-    client.installation_id,
-    "client.installation_id",
-  );
-  const updatedAt = requireString(backfill.updated_at, "backfill.updated_at");
-  const row = {
-    user_id: userId,
-    installation_id: installationId,
-    backfill_version: requireNumber(backfill.version, "backfill.version"),
-    status: requireBackfillStatus(backfill.status),
-    files_discovered: optionalNonNegativeNumber(totals.discovered),
-    files_processed: optionalNonNegativeNumber(totals.processed),
-    records_queued: optionalNonNegativeNumber(totals.queued),
-    files_skipped_non_e3: optionalNonNegativeNumber(totals.skipped_non_e3),
-    files_failed: optionalNonNegativeNumber(totals.failed),
-    remaining_files: optionalNonNegativeNumber(backfill.remaining_files),
-    started_at: optionalString(backfill.started_at),
-    completed_at: optionalString(backfill.completed_at),
-    last_heartbeat_at: updatedAt,
-    updated_at: updatedAt,
-    metadata: {
-      plugin_version: optionalString(
-        optionalObject(backfill.metadata).plugin_version,
-      ),
-      last_drain: sanitizeDrainResult(
-        optionalObject(optionalObject(backfill.metadata).last_drain),
-      ),
-    },
-  };
-  await restUpsert(
-    "codex_session_backfill_runs",
-    row,
-    "user_id,installation_id,backfill_version",
-  );
 }
 
 if (import.meta.main) {
@@ -1307,32 +1253,6 @@ function optionalNonNegativeInteger(value: unknown): number | null {
   return typeof value === "number" && Number.isSafeInteger(value) && value >= 0
     ? value
     : null;
-}
-
-function optionalNonNegativeNumber(value: unknown): number {
-  return typeof value === "number" && Number.isFinite(value) && value >= 0
-    ? value
-    : 0;
-}
-
-function sanitizeDrainResult(value: JsonObject): JsonObject {
-  return {
-    uploaded: optionalNonNegativeNumber(value.uploaded),
-    failed: optionalNonNegativeNumber(value.failed),
-    dead_lettered: optionalNonNegativeNumber(value.dead_lettered),
-    historical_dead_lettered: optionalNonNegativeNumber(
-      value.historical_dead_lettered,
-    ),
-    remaining: optionalNonNegativeNumber(value.remaining),
-  };
-}
-
-function requireBackfillStatus(value: unknown): string {
-  const status = requireString(value, "backfill.status");
-  if (!["running", "partial", "complete", "failed"].includes(status)) {
-    throw new PayloadValidationError("backfill.status is invalid");
-  }
-  return status;
 }
 
 function safeSegment(value: string): string {
