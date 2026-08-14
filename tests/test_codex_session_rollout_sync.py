@@ -450,6 +450,40 @@ def test_sync_captures_exact_parent_and_subagent_rollout_bytes_once(tmp_path):
     assert "full output" not in json.dumps(by_session[CHILD_ID])
 
 
+def test_sync_captures_rollout_without_a_repository_remote(tmp_path):
+    codex_home = tmp_path / "codex"
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    rollout = tmp_path / "unscoped-rollout.jsonl"
+    raw = write_rollout(
+        rollout,
+        session_id=PARENT_ID,
+        records=[{"type": "response_item", "payload": {"role": "user", "content": "all"}}],
+    )
+    create_database(
+        codex_home / "state.sqlite",
+        [{
+            "id": PARENT_ID,
+            "rollout_path": rollout,
+            "cwd": str(workspace),
+            "git_origin_url": None,
+        }],
+    )
+    module = load_rollout_sync()
+
+    result = module.sync_rollouts(codex_home=codex_home)
+    records = queue_records(tmp_path / "logging")
+    ingest_payload = module.session_logging.build_ingest_payload(
+        records[0],
+        base=tmp_path / "logging",
+    )
+
+    assert result == {"queued": 1, "eligible": 1, "errors": []}
+    assert decoded_chunks(module, tmp_path / "logging", records) == raw
+    assert records[0]["metadata"]["repo_remote"] == "codex://unscoped"
+    assert ingest_payload["client"]["repo_remote"] == "codex://unscoped"
+
+
 def test_sync_captures_unterminated_tail_and_continues_from_exact_offset(tmp_path):
     codex_home = tmp_path / "codex"
     rollout = tmp_path / "rollout.jsonl"

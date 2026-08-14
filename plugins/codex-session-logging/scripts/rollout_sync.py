@@ -274,7 +274,7 @@ def rotate_items(items: list[Any], cursor: int, limit: int) -> tuple[list[Any], 
 
 
 def eligible_rollout_thread(row: JsonDict) -> bool:
-    if not all(row.get(key) for key in ("id", "rollout_path", "cwd")):
+    if not all(row.get(key) for key in ("id", "rollout_path")):
         return False
     try:
         UUID(str(row["id"]))
@@ -283,10 +283,12 @@ def eligible_rollout_thread(row: JsonDict) -> bool:
     path = Path(str(row["rollout_path"])).expanduser()
     if not path.is_file():
         return False
-    remote = row.get("git_origin_url") or session_logging.git_origin_remote(str(row["cwd"]))
-    if remote:
-        row["git_origin_url"] = str(remote)
-    return remote is not None
+    remote = row.get("git_origin_url")
+    if not isinstance(remote, str) or not remote.strip():
+        cwd = str(row["cwd"]) if row.get("cwd") else None
+        remote = session_logging.repo_remote_for_cwd(cwd)
+    row["git_origin_url"] = remote
+    return True
 
 
 def descriptor_for_row(row: JsonDict) -> JsonDict | None:
@@ -300,11 +302,12 @@ def descriptor_for_row(row: JsonDict) -> JsonDict | None:
         native_threads.parent_thread_id(row)
     )
     metadata: JsonDict = {
-        "cwd": str(row["cwd"]),
         "transcript_path": str(path),
         "repo_remote": str(row["git_origin_url"]),
         "source": "rollout_sync",
     }
+    if row.get("cwd"):
+        metadata["cwd"] = str(row["cwd"])
     for key in ("git_branch", "thread_source"):
         if row.get(key):
             value = str(row[key])

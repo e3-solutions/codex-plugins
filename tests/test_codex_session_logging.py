@@ -179,7 +179,7 @@ def test_capture_accepts_any_remote_origin(tmp_path, monkeypatch):
     assert (tmp_path / "state" / "events.jsonl").exists()
 
 
-def test_capture_skips_checkouts_without_an_origin_remote(tmp_path, monkeypatch):
+def test_capture_accepts_checkouts_without_an_origin_remote(tmp_path, monkeypatch):
     monkeypatch.setenv("CODEX_SESSION_LOG_STATE_DIR", str(tmp_path / "state"))
     session_logging = load_session_logging()
     repo = tmp_path / "repo"
@@ -190,14 +190,41 @@ def test_capture_skips_checkouts_without_an_origin_remote(tmp_path, monkeypatch)
         "hook_event_name": "UserPromptSubmit",
         "session_id": "session-no-origin",
         "cwd": str(repo),
-        "prompt": "There is no repository identity for remote delivery.",
+        "prompt": "Capture this task without a Git remote.",
     })
 
-    assert result is None
-    assert not (tmp_path / "state" / "events.jsonl").exists()
+    ingest_payload = session_logging.build_ingest_payload(result, base=tmp_path / "state")
+    assert result["role"] == "user"
+    assert result["metadata"]["repo_remote"] == "codex://unscoped"
+    assert ingest_payload["client"]["repo_remote"] == "codex://unscoped"
+    assert (tmp_path / "state" / "events.jsonl").exists()
 
 
-def test_session_logging_has_no_repository_owner_allowlist():
+def test_capture_accepts_non_repository_workspaces(tmp_path, monkeypatch):
+    monkeypatch.setenv("CODEX_SESSION_LOG_STATE_DIR", str(tmp_path / "state"))
+    session_logging = load_session_logging()
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    def git_unavailable(*_args, **_kwargs):
+        raise OSError("git is unavailable")
+
+    monkeypatch.setattr(session_logging.subprocess, "run", git_unavailable)
+
+    result = session_logging.capture_hook_event({
+        "hook_event_name": "UserPromptSubmit",
+        "session_id": "session-non-repository",
+        "cwd": str(workspace),
+        "prompt": "Capture every Codex task.",
+    })
+
+    ingest_payload = session_logging.build_ingest_payload(result, base=tmp_path / "state")
+    assert result["role"] == "user"
+    assert result["metadata"]["repo_remote"] == "codex://unscoped"
+    assert ingest_payload["client"]["repo_remote"] == "codex://unscoped"
+
+
+def test_session_logging_has_no_repository_admission_filter():
     plugin_root = ROOT / "plugins" / "codex-session-logging"
     sources = {
         "capture": (plugin_root / "scripts" / "session_logging.py").read_text(encoding="utf-8"),
@@ -214,6 +241,7 @@ def test_session_logging_has_no_repository_owner_allowlist():
 
     assert "remote_belongs_to_org" not in sources["capture"]
     assert "remoteBelongsToOrg" not in sources["ingest"]
+    assert "should_capture_payload" not in sources["capture"]
 
 
 def test_session_start_spools_sanitized_environment_snapshot(tmp_path, monkeypatch):
@@ -351,6 +379,7 @@ def test_pre_tool_use_records_only_tool_name_without_arguments(tmp_path, monkeyp
     assert result["event_type"] == "tool_call_started"
     assert detail["metadata"] == {
         "cwd": str(repo),
+        "repo_remote": "https://github.com/e3-solutions/codex-plugins.git",
         "tool_name": "functions.exec_command",
         "tool_phase": "started",
     }
@@ -382,6 +411,7 @@ def test_post_tool_use_records_tool_completion_without_output(tmp_path, monkeypa
     assert result["event_type"] == "tool_call_finished"
     assert detail["metadata"] == {
         "cwd": str(repo),
+        "repo_remote": "https://github.com/e3-solutions/codex-plugins.git",
         "success": True,
         "tool_name": "web.run",
         "tool_phase": "finished",
@@ -832,7 +862,7 @@ def test_successful_retry_removes_matching_stale_dead_letter(tmp_path, monkeypat
     assert not dead_letter_path.exists()
 
 
-def test_drain_dead_letters_record_missing_repo_context_without_network(tmp_path, monkeypatch):
+def test_drain_uses_unscoped_identity_when_queued_record_lacks_repo_context(tmp_path, monkeypatch):
     monkeypatch.setenv("CODEX_SESSION_LOG_STATE_DIR", str(tmp_path / "state"))
     monkeypatch.setenv("CODEX_SESSION_LOG_INGEST_URL", "https://logs.example.test/ingest")
     session_logging = load_session_logging()
@@ -851,20 +881,28 @@ def test_drain_dead_letters_record_missing_repo_context_without_network(tmp_path
     pending["metadata"] = {}
     pending_path.write_text(json.dumps(pending, sort_keys=True) + "\n", encoding="utf-8")
 
-    def fail_urlopen(request, timeout):
-        raise AssertionError("invalid local records should not be posted")
+    requests = []
 
-    monkeypatch.setattr(session_logging.urllib.request, "urlopen", fail_urlopen)
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    def fake_urlopen(request, timeout):
+        requests.append(request)
+        return Response()
+
+    monkeypatch.setattr(session_logging.urllib.request, "urlopen", fake_urlopen)
 
     result = session_logging.drain_queue()
     queued = read_queue_records(tmp_path / "state")
-    dead_letter_path = tmp_path / "state" / "queue" / "dead-letter" / f"{captured['id']}.json"
-    dead_lettered = json.loads(dead_letter_path.read_text(encoding="utf-8"))
+    body = json.loads(requests[0].data.decode("utf-8"))
 
-    assert result == {"uploaded": 0, "failed": 0, "dead_lettered": 1, "remaining": 0}
+    assert result == {"uploaded": 1, "failed": 0, "dead_lettered": 0, "remaining": 0}
     assert queued == []
-    assert dead_lettered["dead_letter_reason"] == "permanent_upload_failure"
-    assert dead_lettered["last_upload_error"] == "client.repo_remote must be a non-empty string"
+    assert body["client"]["repo_remote"] == "codex://unscoped"
 
 
 def test_drain_keeps_transient_ingest_failure_pending(tmp_path, monkeypatch):

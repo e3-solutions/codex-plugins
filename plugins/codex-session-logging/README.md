@@ -8,7 +8,7 @@ At `SessionStart`, `UserPromptSubmit`, and `Stop`, the plugin reads Codex's nati
 
 There is no per-minute transcript poller and no external session process. A crash tail is recovered by the next lifecycle hook. The resident process remains responsible only for checking plugin updates every 30 minutes. Existing one-minute presence schedulers are removed automatically during upgrade.
 
-Capture applies to every Git checkout with an `origin` remote, regardless of hosting provider or organization. Checkouts without an `origin` return without writing local or remote session data because the ingest catalog requires repository identity.
+Capture applies to every Codex task, including non-Git directories and Git checkouts without an `origin`. A real `origin` is retained when available; otherwise the client uses the fixed `codex://unscoped` catalog identity. Local workspace paths are not substituted for missing remotes.
 
 Queryable hook event rows record only the tool name, phase, optional tool call id, and success flag when exposed by Codex. The private rollout objects retain the exact native JSONL, including tool arguments and outputs, so no available session data is discarded. Setup snapshots include sanitized Codex config names such as enabled plugins, installed skill names/sources, MCP server names/transport, marketplaces, app connection ids/tool names, and non-secret model/runtime settings.
 
@@ -18,7 +18,7 @@ Each runtime `session_id` is retained for event correlation. When Codex provides
 
 The first live hook considers native Codex tasks active during the previous 24 hours, prioritizes the current task family, and captures at most 8 MiB across 32 rollout files. Durable pending rows and byte offsets continue that bounded baseline on later hooks, including when SQLite exposes a row before its rollout file exists. After installation, a per-database watermark discovers every new or changed parent and subagent task without rescanning lifetime history.
 
-Version 0.2.12 removes the disabled historical importer, retired resident-presence publisher, and E3-only repository admission guard from the client package and ingest function. Any Git checkout with an `origin` remote can now deliver session records. This does not remove live messages, events, tool data, reasoning records, usage, environment snapshots, or unknown future rollout records. The ingest Edge Function continues to acknowledge and discard historical-backfill payloads from older queues, and the resident updater continues to remove old presence schedulers during upgrade.
+Version 0.2.12 removes the disabled historical importer, retired resident-presence publisher, and repository-based admission filters from the client package and ingest function. Every Codex task can now deliver session records. This does not remove live messages, events, tool data, reasoning records, usage, environment snapshots, or unknown future rollout records. The ingest Edge Function continues to acknowledge and discard historical-backfill payloads from older queues, and the resident updater continues to remove old presence schedulers during upgrade.
 
 ## Supabase
 
@@ -95,7 +95,7 @@ The email map is optional for the first rollout and can be added later to merge 
 
 ## Environment
 
-Usage requests authenticate with the session's installation capability. Repository remotes are catalog identity, not authentication. `CODEX_SESSION_LOG_INGEST_TOKEN` is an optional additive gate for all requests; a shared or commercial deployment should configure it on the function and provision the same token to every client before relying on authenticated admission.
+Usage requests authenticate with the session's installation capability. Repository remotes and the `codex://unscoped` fallback are catalog identity, not authentication. `CODEX_SESSION_LOG_INGEST_TOKEN` is an optional additive gate for all requests; a shared or commercial deployment should configure it on the function and provision the same token to every client before relying on authenticated admission.
 
 Optional:
 

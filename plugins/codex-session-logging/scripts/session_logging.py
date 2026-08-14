@@ -38,6 +38,7 @@ UPLOAD_WORKERS_ENV = "CODEX_SESSION_LOG_UPLOAD_WORKERS"
 DEFAULT_SUPABASE_URL = "https://pmdfllwuctzkdjiehezq.supabase.co"
 DEFAULT_INGEST_URL = f"{DEFAULT_SUPABASE_URL}/functions/v1/codex-session-ingest"
 DEFAULT_BUCKET = "codex-sessions"
+UNSCOPED_REPO_REMOTE = "codex://unscoped"
 EXCERPT_BYTES = 4096
 PLUGIN_VERSION = "0.2.12"
 PERMANENT_HTTP_STATUSES = {400, 413, 415, 422}
@@ -85,8 +86,6 @@ def read_stdin_json() -> JsonDict:
 def capture_hook_event(payload: JsonDict, *, event_name: str | None = None) -> JsonDict | None:
     hook_event = event_name or str(payload.get("hook_event_name") or payload.get("event") or "")
     role, content = message_from_payload(hook_event, payload)
-    if not should_capture_payload(payload):
-        return None
     if role and content is not None:
         return capture_message_event(payload, hook_event=hook_event, role=role, content=content)
     event_type, event_metadata = event_from_payload(hook_event, payload)
@@ -234,6 +233,7 @@ def metadata_from_payload(payload: JsonDict) -> JsonDict:
     cwd = first_string(payload, "cwd") or os.getcwd()
     if cwd:
         metadata["cwd"] = cwd
+    metadata["repo_remote"] = repo_remote_for_cwd(cwd)
     for key in ("transcript_path", "model", "source"):
         value = payload.get(key)
         if isinstance(value, str) and value:
@@ -505,23 +505,28 @@ def codex_connections(config: JsonDict) -> list[JsonDict]:
     return sorted(result, key=lambda item: str(item["id"]))
 
 
-def should_capture_payload(payload: JsonDict) -> bool:
-    cwd = first_string(payload, "cwd") or os.getcwd()
-    return git_origin_remote(cwd) is not None
-
-
-def git_origin_remote(cwd: str) -> str | None:
-    result = subprocess.run(
-        ["git", "-C", cwd, "remote", "get-url", "origin"],
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
-        check=False,
-    )
+def git_origin_remote(cwd: str | None) -> str | None:
+    if not cwd:
+        return None
+    try:
+        result = subprocess.run(
+            ["git", "-C", cwd, "remote", "get-url", "origin"],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            check=False,
+            timeout=2,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
     if result.returncode != 0:
         return None
     remote = result.stdout.strip()
     return remote or None
+
+
+def repo_remote_for_cwd(cwd: str | None) -> str:
+    return git_origin_remote(cwd) or UNSCOPED_REPO_REMOTE
 
 
 def canonical_github_remote(remote: str | None) -> str | None:
@@ -975,7 +980,9 @@ def client_context(record: JsonDict, *, base: Path) -> JsonDict:
     hostname = local_hostname()
     username = local_username()
     installation_id = local_installation_id(base)
-    remote = metadata.get("repo_remote") or (git_origin_remote(cwd) if cwd else None)
+    remote = metadata.get("repo_remote")
+    if not isinstance(remote, str) or not remote.strip():
+        remote = repo_remote_for_cwd(cwd)
     canonical_remote = canonical_github_remote(
         str(remote) if isinstance(remote, str) else None,
     )
@@ -1081,26 +1088,34 @@ def git_config_value(cwd: str | None, key: str) -> str | None:
         commands.append(["git", "-C", cwd, "config", "--get", key])
     commands.append(["git", "config", "--global", "--get", key])
     for command in commands:
-        result = subprocess.run(
-            command,
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            check=False,
-        )
+        try:
+            result = subprocess.run(
+                command,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                check=False,
+                timeout=2,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            continue
         if result.returncode == 0 and result.stdout.strip():
             return result.stdout.strip()
     return None
 
 
 def current_git_branch(cwd: str) -> str | None:
-    result = subprocess.run(
-        ["git", "-C", cwd, "branch", "--show-current"],
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
-        check=False,
-    )
+    try:
+        result = subprocess.run(
+            ["git", "-C", cwd, "branch", "--show-current"],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            check=False,
+            timeout=2,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
     if result.returncode != 0:
         return None
     value = result.stdout.strip()
