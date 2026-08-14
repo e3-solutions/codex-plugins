@@ -1,0 +1,13 @@
+project_id = "backend-v2"
+
+[api]
+schemas = ["public", "graphql_public"]
+extra_search_path = ["public", "extensions"]
+
+[db]
+major_version = 17
+
+[functions.agent-ingest-v1]
+enabled = true
+verify_jwt = false
+entrypoint = "./functions/agent-ingest-v1/index.ts"

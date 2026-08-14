@@ -8,19 +8,17 @@ At `SessionStart`, `UserPromptSubmit`, and `Stop`, the plugin reads Codex's nati
 
 There is no per-minute transcript poller and no external session process. A crash tail is recovered by the next lifecycle hook. The resident process remains responsible only for checking plugin updates every 30 minutes. Existing one-minute presence schedulers are removed automatically during upgrade.
 
-Capture is scoped to repositories whose `origin` remote belongs to the `e3-solutions` GitHub organization. In other repositories, the hooks return without writing local or remote session data.
+Capture applies to every Codex task, including non-Git directories and Git checkouts without an `origin`. A real `origin` is retained when available; otherwise the client uses the fixed `codex://unscoped` catalog identity. Local workspace paths are not substituted for missing remotes.
 
 Queryable hook event rows record only the tool name, phase, optional tool call id, and success flag when exposed by Codex. The private rollout objects retain the exact native JSONL, including tool arguments and outputs, so no available session data is discarded. Setup snapshots include sanitized Codex config names such as enabled plugins, installed skill names/sources, MCP server names/transport, marketplaces, app connection ids/tool names, and non-secret model/runtime settings.
 
 Each runtime `session_id` is retained for event correlation. When Codex provides a `transcript_path`, the plugin also records a SHA-256 `thread_id` derived from that path so resumed runtime sessions can be grouped as one conversation without storing another copy of the path. Legacy records without a transcript reference remain separate runtime sessions and cannot be grouped reliably after the fact.
 
-## Legacy historical backfill
+## Capture boundary and legacy compatibility
 
-Historical transcript backfills are disabled as of version 0.2.2. `SessionStart` captures only the live environment snapshot and no longer launches `backfill_sessions.py`. The ingest Edge Function acknowledges and discards historical-backfill data and status payloads so queues created by older plugin versions can drain without modifying Storage or Postgres.
+The first live hook considers native Codex tasks active during the previous 24 hours, prioritizes the current task family, and captures at most 8 MiB across 32 rollout files. Durable pending rows and byte offsets continue that bounded baseline on later hooks, including when SQLite exposes a row before its rollout file exists. After installation, a per-database watermark discovers every new or changed parent and subagent task without rescanning lifetime history.
 
-The legacy importer and its checkpoint files remain in the repository only for auditability. Do not run it; historical analysis uses the separately imported `ai_session_*` archive tables.
-
-The 0.2.8 rollout synchronizer does not parse or reconstruct legacy transcript messages. It only extracts cumulative usage while capturing native rollouts already admitted by the live 24-hour discovery policy. Its first hook considers only native E3 tasks active during the previous 24 hours, prioritizes the current task family, and captures at most 8 MiB across 32 rollout files before returning. Durable pending rows and byte offsets continue that bounded baseline on later hooks, including when SQLite exposes a row before its rollout file exists. Older history remains under the legacy archive policy instead of being auto-uploaded during upgrade. After installation, the SQLite watermark discovers new or changed parent and subagent tasks without rescanning lifetime history.
+Version 0.2.12 removes the disabled historical importer, retired resident-presence publisher, and repository-based admission filters from the client package and ingest function. Every Codex task can now deliver session records. This does not remove live messages, events, tool data, reasoning records, usage, environment snapshots, or unknown future rollout records. The ingest Edge Function continues to acknowledge and discard historical-backfill payloads from older queues, and the resident updater continues to remove old presence schedulers during upgrade.
 
 ## Supabase
 
@@ -34,7 +32,7 @@ Default URL:
 https://pmdfllwuctzkdjiehezq.supabase.co
 ```
 
-Apply the SQL files in `supabase/migrations` when provisioning a new project. Chunk objects use the existing private bucket and their offsets, hashes, generations, and parent/root relationships are cataloged in `codex_session_events`. Version 0.2.11 adds immutable usage observations to the existing nine-argument `upsert_codex_session_usage_latest` RPC. It derives the immutable owner from `codex_sessions`, records every distinct observation, and advances the latest row only when its timestamp and all four cumulative token components do not move backwards. Deploy that migration before updating clients. The Edge Function, RPC, and database constraint require the normalized token components to sum exactly to the reported total.
+Apply the SQL files in `supabase/migrations` when provisioning a new project. Chunk objects use the existing private bucket and their offsets, hashes, generations, and parent/root relationships are cataloged in `codex_session_events`. Immutable usage observations use the existing nine-argument `upsert_codex_session_usage_latest` RPC. It derives the immutable owner from `codex_sessions`, records every distinct observation, and advances the latest row only when its timestamp and all four cumulative token components do not move backwards. The Edge Function, RPC, and database constraint require the normalized token components to sum exactly to the reported total.
 
 Deploy the ingest Edge Function from `supabase/functions/codex-session-ingest` after migrations when provisioning a new project. The function owns the Supabase admin key server-side and uses the developer's git email as the initial user key when available. If `CODEX_SESSION_LOG_USER_EMAIL_MAP` contains the email, that mapped Supabase Auth user id is used; otherwise the function derives a stable UUID from the email. When git email is not configured, the plugin sends a persistent local installation id so sessions still track without per-user setup.
 
@@ -74,7 +72,7 @@ supabase secrets set \
   CODEX_SESSION_LOG_USER_EMAIL_MAP='{"user@e3.solutions":"00000000-0000-0000-0000-000000000000"}'
 ```
 
-To recover usage from rollout chunks stored before 0.2.11, run the bounded admin replay in dry-run mode first. It reads the existing event catalog with a fixed cutoff and keyset cursor, defaults to the previous 72 hours, 500 sessions, and one session reader, verifies chunk offsets, sizes, and hashes, and makes no database writes unless `--apply` is passed. Use `--workers 4` for bounded session-level parallel reads. A resume must reuse the reported `cutoff` with `--cutoff` and the reported `resume_after_session` with `--after-session`. A later fresh run safely picks up concurrent catalog inserts; the monotonic RPC makes reruns idempotent.
+To recover usage from older rollout chunks, run the bounded admin replay in dry-run mode first. It reads the existing event catalog with a fixed cutoff and keyset cursor, defaults to the previous 72 hours, 500 sessions, and one session reader, verifies chunk offsets, sizes, and hashes, and makes no database writes unless `--apply` is passed. Use `--workers 4` for bounded session-level parallel reads. A resume must reuse the reported `cutoff` with `--cutoff` and the reported `resume_after_session` with `--after-session`. A later fresh run safely picks up concurrent catalog inserts; the monotonic RPC makes reruns idempotent.
 
 ```bash
 SUPABASE_URL=https://pmdfllwuctzkdjiehezq.supabase.co \
@@ -97,7 +95,7 @@ The email map is optional for the first rollout and can be added later to merge 
 
 ## Environment
 
-Usage requests authenticate with the session's installation capability. `CODEX_SESSION_LOG_INGEST_TOKEN` is an optional additive gate for all requests; configure it only when every client has also been provisioned with that token.
+Usage requests authenticate with the session's installation capability. Repository remotes and the `codex://unscoped` fallback are catalog identity, not authentication. `CODEX_SESSION_LOG_INGEST_TOKEN` is an optional additive gate for all requests; a shared or commercial deployment should configure it on the function and provision the same token to every client before relying on authenticated admission.
 
 Optional:
 

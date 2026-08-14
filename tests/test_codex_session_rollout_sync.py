@@ -29,7 +29,7 @@ def isolated_state(tmp_path, monkeypatch):
 def load_rollout_sync():
     sys.path.insert(0, str(SCRIPTS))
     try:
-        for name in ("session_logging", "publish_presence", "rollout_sync"):
+        for name in ("session_logging", "native_threads", "rollout_sync"):
             sys.modules.pop(name, None)
         spec = importlib.util.spec_from_file_location("rollout_sync", SCRIPTS / "rollout_sync.py")
         module = importlib.util.module_from_spec(spec)
@@ -95,7 +95,7 @@ def create_database(path: Path, rows: list[dict]) -> None:
             "archived": row.get("archived", 0),
             "git_branch": "arya/test",
             "git_origin_url": row.get(
-                "git_origin_url", "https://github.com/e3-solutions/codex-plugins.git"
+                "git_origin_url", "https://github.com/example-org/codex-plugins.git"
             ),
             "created_at_ms": 1000,
             "updated_at_ms": 1000 + index,
@@ -448,6 +448,40 @@ def test_sync_captures_exact_parent_and_subagent_rollout_bytes_once(tmp_path):
     assert base64.b64decode(ingest_payload["rollout_chunk"]["content_base64"]) == child_raw
     assert "secret" not in json.dumps(by_session[PARENT_ID])
     assert "full output" not in json.dumps(by_session[CHILD_ID])
+
+
+def test_sync_captures_rollout_without_a_repository_remote(tmp_path):
+    codex_home = tmp_path / "codex"
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    rollout = tmp_path / "unscoped-rollout.jsonl"
+    raw = write_rollout(
+        rollout,
+        session_id=PARENT_ID,
+        records=[{"type": "response_item", "payload": {"role": "user", "content": "all"}}],
+    )
+    create_database(
+        codex_home / "state.sqlite",
+        [{
+            "id": PARENT_ID,
+            "rollout_path": rollout,
+            "cwd": str(workspace),
+            "git_origin_url": None,
+        }],
+    )
+    module = load_rollout_sync()
+
+    result = module.sync_rollouts(codex_home=codex_home)
+    records = queue_records(tmp_path / "logging")
+    ingest_payload = module.session_logging.build_ingest_payload(
+        records[0],
+        base=tmp_path / "logging",
+    )
+
+    assert result == {"queued": 1, "eligible": 1, "errors": []}
+    assert decoded_chunks(module, tmp_path / "logging", records) == raw
+    assert records[0]["metadata"]["repo_remote"] == "codex://unscoped"
+    assert ingest_payload["client"]["repo_remote"] == "codex://unscoped"
 
 
 def test_sync_captures_unterminated_tail_and_continues_from_exact_offset(tmp_path):

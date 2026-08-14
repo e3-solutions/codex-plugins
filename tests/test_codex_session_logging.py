@@ -158,10 +158,10 @@ def test_transcript_path_groups_runtime_sessions_into_one_thread(tmp_path, monke
     assert first["thread_id"] == session_logging.sha256_hex(transcript_path)
 
 
-def test_capture_skips_repos_outside_e3_solutions(tmp_path, monkeypatch):
+def test_capture_accepts_any_remote_origin(tmp_path, monkeypatch):
     monkeypatch.setenv("CODEX_SESSION_LOG_STATE_DIR", str(tmp_path / "state"))
     session_logging = load_session_logging()
-    repo = init_git_repo(tmp_path / "repo", "https://github.com/example/codex-plugins.git")
+    repo = init_git_repo(tmp_path / "repo", "https://gitlab.com/example/codex-plugins.git")
 
     result = session_logging.capture_hook_event(
         {
@@ -169,12 +169,79 @@ def test_capture_skips_repos_outside_e3_solutions(tmp_path, monkeypatch):
             "session_id": "session-123",
             "turn_id": "turn-1",
             "cwd": str(repo),
-            "prompt": "Do not capture this.",
+            "prompt": "Capture this repository too.",
         }
     )
 
-    assert result is None
-    assert not (tmp_path / "state" / "events.jsonl").exists()
+    assert result["role"] == "user"
+    ingest_payload = session_logging.build_ingest_payload(result, base=tmp_path / "state")
+    assert ingest_payload["client"]["repo_remote"] == "https://gitlab.com/example/codex-plugins.git"
+    assert (tmp_path / "state" / "events.jsonl").exists()
+
+
+def test_capture_accepts_checkouts_without_an_origin_remote(tmp_path, monkeypatch):
+    monkeypatch.setenv("CODEX_SESSION_LOG_STATE_DIR", str(tmp_path / "state"))
+    session_logging = load_session_logging()
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+
+    result = session_logging.capture_hook_event({
+        "hook_event_name": "UserPromptSubmit",
+        "session_id": "session-no-origin",
+        "cwd": str(repo),
+        "prompt": "Capture this task without a Git remote.",
+    })
+
+    ingest_payload = session_logging.build_ingest_payload(result, base=tmp_path / "state")
+    assert result["role"] == "user"
+    assert result["metadata"]["repo_remote"] == "codex://unscoped"
+    assert ingest_payload["client"]["repo_remote"] == "codex://unscoped"
+    assert (tmp_path / "state" / "events.jsonl").exists()
+
+
+def test_capture_accepts_non_repository_workspaces(tmp_path, monkeypatch):
+    monkeypatch.setenv("CODEX_SESSION_LOG_STATE_DIR", str(tmp_path / "state"))
+    session_logging = load_session_logging()
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    def git_unavailable(*_args, **_kwargs):
+        raise OSError("git is unavailable")
+
+    monkeypatch.setattr(session_logging.subprocess, "run", git_unavailable)
+
+    result = session_logging.capture_hook_event({
+        "hook_event_name": "UserPromptSubmit",
+        "session_id": "session-non-repository",
+        "cwd": str(workspace),
+        "prompt": "Capture every Codex task.",
+    })
+
+    ingest_payload = session_logging.build_ingest_payload(result, base=tmp_path / "state")
+    assert result["role"] == "user"
+    assert result["metadata"]["repo_remote"] == "codex://unscoped"
+    assert ingest_payload["client"]["repo_remote"] == "codex://unscoped"
+
+
+def test_session_logging_has_no_repository_admission_filter():
+    plugin_root = ROOT / "plugins" / "codex-session-logging"
+    sources = {
+        "capture": (plugin_root / "scripts" / "session_logging.py").read_text(encoding="utf-8"),
+        "rollout": (plugin_root / "scripts" / "rollout_sync.py").read_text(encoding="utf-8"),
+        "ingest": (
+            plugin_root / "supabase" / "functions" / "codex-session-ingest" / "index.ts"
+        ).read_text(encoding="utf-8"),
+    }
+
+    for source in sources.values():
+        assert "ALLOWED_GITHUB_ORG" not in source
+        assert "CODEX_SESSION_LOG_ALLOWED_GITHUB_ORG" not in source
+        assert "repo_not_allowed" not in source
+
+    assert "remote_belongs_to_org" not in sources["capture"]
+    assert "remoteBelongsToOrg" not in sources["ingest"]
+    assert "should_capture_payload" not in sources["capture"]
 
 
 def test_session_start_spools_sanitized_environment_snapshot(tmp_path, monkeypatch):
@@ -312,6 +379,7 @@ def test_pre_tool_use_records_only_tool_name_without_arguments(tmp_path, monkeyp
     assert result["event_type"] == "tool_call_started"
     assert detail["metadata"] == {
         "cwd": str(repo),
+        "repo_remote": "https://github.com/e3-solutions/codex-plugins.git",
         "tool_name": "functions.exec_command",
         "tool_phase": "started",
     }
@@ -343,6 +411,7 @@ def test_post_tool_use_records_tool_completion_without_output(tmp_path, monkeypa
     assert result["event_type"] == "tool_call_finished"
     assert detail["metadata"] == {
         "cwd": str(repo),
+        "repo_remote": "https://github.com/e3-solutions/codex-plugins.git",
         "success": True,
         "tool_name": "web.run",
         "tool_phase": "finished",
@@ -793,7 +862,7 @@ def test_successful_retry_removes_matching_stale_dead_letter(tmp_path, monkeypat
     assert not dead_letter_path.exists()
 
 
-def test_drain_dead_letters_record_missing_repo_context_without_network(tmp_path, monkeypatch):
+def test_drain_uses_unscoped_identity_when_queued_record_lacks_repo_context(tmp_path, monkeypatch):
     monkeypatch.setenv("CODEX_SESSION_LOG_STATE_DIR", str(tmp_path / "state"))
     monkeypatch.setenv("CODEX_SESSION_LOG_INGEST_URL", "https://logs.example.test/ingest")
     session_logging = load_session_logging()
@@ -812,20 +881,28 @@ def test_drain_dead_letters_record_missing_repo_context_without_network(tmp_path
     pending["metadata"] = {}
     pending_path.write_text(json.dumps(pending, sort_keys=True) + "\n", encoding="utf-8")
 
-    def fail_urlopen(request, timeout):
-        raise AssertionError("invalid local records should not be posted")
+    requests = []
 
-    monkeypatch.setattr(session_logging.urllib.request, "urlopen", fail_urlopen)
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    def fake_urlopen(request, timeout):
+        requests.append(request)
+        return Response()
+
+    monkeypatch.setattr(session_logging.urllib.request, "urlopen", fake_urlopen)
 
     result = session_logging.drain_queue()
     queued = read_queue_records(tmp_path / "state")
-    dead_letter_path = tmp_path / "state" / "queue" / "dead-letter" / f"{captured['id']}.json"
-    dead_lettered = json.loads(dead_letter_path.read_text(encoding="utf-8"))
+    body = json.loads(requests[0].data.decode("utf-8"))
 
-    assert result == {"uploaded": 0, "failed": 0, "dead_lettered": 1, "remaining": 0}
+    assert result == {"uploaded": 1, "failed": 0, "dead_lettered": 0, "remaining": 0}
     assert queued == []
-    assert dead_lettered["dead_letter_reason"] == "permanent_upload_failure"
-    assert dead_lettered["last_upload_error"] == "client.repo_remote must be a non-empty string"
+    assert body["client"]["repo_remote"] == "codex://unscoped"
 
 
 def test_drain_keeps_transient_ingest_failure_pending(tmp_path, monkeypatch):
@@ -1006,7 +1083,11 @@ def test_plugin_packaging_and_supabase_migration_are_present():
     assert (ROOT / "plugins" / "codex-session-logging" / "scripts" / "session_start.py").exists()
     assert (ROOT / "plugins" / "codex-session-logging" / "scripts" / "pre_tool_use.py").exists()
     assert (ROOT / "plugins" / "codex-session-logging" / "scripts" / "post_tool_use.py").exists()
-    assert (ROOT / "plugins" / "codex-session-logging" / "scripts" / "publish_presence.py").exists()
+    scripts_path = ROOT / "plugins" / "codex-session-logging" / "scripts"
+    assert (scripts_path / "native_threads.py").exists()
+    assert not (scripts_path / "publish_presence.py").exists()
+    assert not (scripts_path / "backfill_sessions.py").exists()
+    assert not (scripts_path / "test_session_logging.py").exists()
     session_logging_plugin = next(
         plugin for plugin in marketplace["plugins"] if plugin["name"] == "codex-session-logging"
     )
@@ -1028,6 +1109,9 @@ def test_plugin_packaging_and_supabase_migration_are_present():
     assert "codex-sessions" in migration
     assert "storage.objects" in migration
     assert "add column if not exists thread_id text" in thread_migration
+    assert "codex_session_backfill_runs" in all_migrations
+    session_start_source = (scripts_path / "session_start.py").read_text(encoding="utf-8")
+    assert "backfill_sessions.py" not in session_start_source
     assert "from public.codex_session_events" in thread_migration
     assert "from public.codex_session_messages" in thread_migration
     assert "digest(session_transcripts.transcript_path, 'sha256')" in thread_migration
@@ -1074,6 +1158,7 @@ def test_plugin_packaging_and_supabase_migration_are_present():
     ).exists()
     assert function_path.exists()
     function_source = function_path.read_text(encoding="utf-8")
+    assert "historical_backfill_disabled" in function_source
     identity_source = client_identity_path.read_text(encoding="utf-8")
     assert "SUPABASE_SECRET_KEYS" in function_source
     assert "CODEX_SESSION_LOG_USER_EMAIL_MAP" in identity_source
@@ -1103,3 +1188,91 @@ def test_git_identity_falls_back_to_global_config_for_deleted_checkout(monkeypat
         ["git", "-C", "/deleted/repo", "config", "--get", "user.email"],
         ["git", "config", "--global", "--get", "user.email"],
     ]
+
+
+def test_canonical_github_remote_supports_verified_ssh_aliases(monkeypatch):
+    session_logging = load_session_logging()
+    checked = []
+    monkeypatch.setattr(
+        session_logging,
+        "ssh_host_resolves_to_github",
+        lambda host: checked.append(host) or True,
+    )
+
+    canonical = session_logging.canonical_github_remote(
+        "git@github-coreedge:e3-solutions/negotiation.git",
+    )
+
+    assert canonical == "https://github.com/e3-solutions/negotiation.git"
+    assert checked == ["github-coreedge"]
+
+
+def test_canonical_github_remote_rejects_unverified_alias_and_accepts_any_org(monkeypatch):
+    session_logging = load_session_logging()
+    monkeypatch.setattr(
+        session_logging,
+        "ssh_host_resolves_to_github",
+        lambda host: host == "github.com",
+    )
+
+    assert session_logging.canonical_github_remote(
+        "git@internal-git:e3-solutions/negotiation.git",
+    ) is None
+    assert session_logging.canonical_github_remote(
+        "git@github.com:other-org/negotiation.git",
+    ) == "https://github.com/other-org/negotiation.git"
+
+
+def test_client_context_submits_canonical_remote(monkeypatch):
+    session_logging = load_session_logging()
+    monkeypatch.setattr(session_logging, "ssh_host_resolves_to_github", lambda _host: True)
+    monkeypatch.setattr(session_logging, "git_config_value", lambda *_args: None)
+    monkeypatch.setattr(session_logging, "local_hostname", lambda: "test-host")
+    monkeypatch.setattr(session_logging, "local_username", lambda: "jai")
+    monkeypatch.setattr(session_logging, "local_installation_id", lambda _base: "installation-id")
+    monkeypatch.setattr(session_logging, "saved_linear_user_name", lambda: "Jai")
+
+    context = session_logging.client_context(
+        {"metadata": {
+            "cwd": "/tmp/negotiation",
+            "repo_remote": "git@github-coreedge:e3-solutions/negotiation.git",
+        }},
+        base=Path("/tmp/logging"),
+    )
+
+    assert context["repo_remote"] == "https://github.com/e3-solutions/negotiation.git"
+
+
+def test_existing_installation_id_permissions_are_tightened(tmp_path):
+    session_logging = load_session_logging()
+    path = tmp_path / "installation_id"
+    path.write_text("existing-id\n", encoding="utf-8")
+    path.chmod(0o644)
+
+    assert session_logging.local_installation_id(tmp_path) == "existing-id"
+    assert path.stat().st_mode & 0o777 == 0o600
+
+
+def test_installation_id_permission_failure_is_not_silenced(tmp_path, monkeypatch):
+    session_logging = load_session_logging()
+    path = tmp_path / "installation_id"
+    path.write_text("existing-id\n", encoding="utf-8")
+    def deny_chmod(*_args, **_kwargs):
+        raise OSError("denied")
+
+    monkeypatch.setattr(Path, "chmod", deny_chmod)
+
+    with pytest.raises(OSError, match="denied"):
+        session_logging.local_installation_id(tmp_path)
+
+    assert path.read_text(encoding="utf-8").strip() == "existing-id"
+
+
+def test_new_installation_id_is_owner_only(tmp_path):
+    session_logging = load_session_logging()
+    base = tmp_path / "state"
+
+    value = session_logging.local_installation_id(base)
+
+    assert (base / "installation_id").read_text(encoding="utf-8").strip() == value
+    assert (base / "installation_id").stat().st_mode & 0o777 == 0o600

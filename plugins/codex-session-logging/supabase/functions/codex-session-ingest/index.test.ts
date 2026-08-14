@@ -1311,7 +1311,7 @@ Deno.test("handleRequest retains the configured token check for all requests", a
   }
 });
 
-Deno.test("handleRequest stores rollout bytes and catalogs retries idempotently", async () => {
+Deno.test("handleRequest stores unscoped rollout bytes and catalogs retries idempotently", async () => {
   const requests: Array<{
     url: string;
     body: JsonObject | null;
@@ -1324,6 +1324,7 @@ Deno.test("handleRequest stores rollout bytes and catalogs retries idempotently"
   const rollout =
     '{"type":"event_msg","payload":{"message":"secret tool output"}}\n';
   const payload = await rolloutChunkPayload(rollout);
+  (payload.client as JsonObject).repo_remote = "codex://unscoped";
 
   Deno.env.set("SUPABASE_URL", "https://project.supabase.co");
   Deno.env.set("SUPABASE_SERVICE_ROLE_KEY", "service-role-key");
@@ -1461,6 +1462,7 @@ Deno.test("handleRequest stores rollout bytes and catalogs retries idempotently"
     );
     assertEquals(sessionMetadata?.durable_existing_field, "keep-me");
     assertEquals(sessionUpsert?.body?.thread_id, "existing-thread");
+    assertEquals(sessionUpsert?.body?.repo, "codex://unscoped");
     assertEquals(
       sessionUpsert?.body?.started_at,
       "2026-07-23T00:00:00.000Z",
@@ -1491,7 +1493,7 @@ Deno.test("handleRequest rejects existing event and rollout owner mismatches bef
     },
     event: { metadata: { tool_name: "shell", tool_phase: "started" } },
     client: {
-      repo_remote: "https://github.com/e3-solutions/codex-plugins.git",
+      repo_remote: "https://github.com/example-org/codex-plugins.git",
       installation_id: "install-1",
     },
   };
@@ -2075,7 +2077,7 @@ async function rolloutChunkPayload(content: string): Promise<JsonObject> {
       content_base64: btoa(binary),
     },
     client: {
-      repo_remote: "https://github.com/e3-solutions/codex-plugins.git",
+      repo_remote: "https://github.com/example-org/codex-plugins.git",
       installation_id: "install-1",
     },
   };

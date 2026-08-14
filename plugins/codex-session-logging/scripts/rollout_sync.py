@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any
 from uuid import UUID
 
-import publish_presence
+import native_threads
 import rollout_usage
 import session_logging
 
@@ -91,9 +91,6 @@ def sync_rollouts(
         )
         descriptors: list[JsonDict | None] = []
         for row in pending_candidates:
-            if permanently_out_of_scope(row):
-                pending_rows.pop(canonical_uuid(str(row.get("id") or "")) or "", None)
-                continue
             if eligible_rollout_thread(row):
                 descriptors.append(descriptor_for_row(row))
         pending_descriptors = [item for item in descriptors if item is not None]
@@ -181,7 +178,7 @@ def discover_rollout_threads(
     merged: dict[str, JsonDict] = {}
     errors: list[str] = []
     next_database_state = dict(database_state)
-    for database in publish_presence.native_database_candidates(codex_home):
+    for database in native_threads.native_database_candidates(codex_home):
         try:
             database_stat = database.stat()
             database_key = str(database)
@@ -207,7 +204,7 @@ def discover_rollout_threads(
             offset = 0
             observed: list[JsonDict] = []
             while True:
-                page = publish_presence.read_recent_threads(
+                page = native_threads.read_recent_threads(
                     database,
                     cutoff_ms=watermark,
                     limit=DISCOVERY_PAGE_SIZE,
@@ -222,9 +219,9 @@ def discover_rollout_threads(
                     if row_updated == watermark and thread_id in seen_at_watermark:
                         continue
                     previous = merged.get(thread_id)
-                    if previous is None or publish_presence.native_row_precedence(
+                    if previous is None or native_threads.native_row_precedence(
                         row
-                    ) > publish_presence.native_row_precedence(previous):
+                    ) > native_threads.native_row_precedence(previous):
                         merged[thread_id] = row
                 offset += len(page)
                 if len(page) < DISCOVERY_PAGE_SIZE:
@@ -277,7 +274,7 @@ def rotate_items(items: list[Any], cursor: int, limit: int) -> tuple[list[Any], 
 
 
 def eligible_rollout_thread(row: JsonDict) -> bool:
-    if not all(row.get(key) for key in ("id", "rollout_path", "cwd")):
+    if not all(row.get(key) for key in ("id", "rollout_path")):
         return False
     try:
         UUID(str(row["id"]))
@@ -286,21 +283,12 @@ def eligible_rollout_thread(row: JsonDict) -> bool:
     path = Path(str(row["rollout_path"])).expanduser()
     if not path.is_file():
         return False
-    remote = row.get("git_origin_url") or session_logging.git_origin_remote(str(row["cwd"]))
-    if remote:
-        row["git_origin_url"] = str(remote)
-    return session_logging.remote_belongs_to_org(
-        str(remote) if remote else None,
-        session_logging.ALLOWED_GITHUB_ORG,
-    )
-
-
-def permanently_out_of_scope(row: JsonDict) -> bool:
     remote = row.get("git_origin_url")
-    return bool(remote) and not session_logging.remote_belongs_to_org(
-        str(remote),
-        session_logging.ALLOWED_GITHUB_ORG,
-    )
+    if not isinstance(remote, str) or not remote.strip():
+        cwd = str(row["cwd"]) if row.get("cwd") else None
+        remote = session_logging.repo_remote_for_cwd(cwd)
+    row["git_origin_url"] = remote
+    return True
 
 
 def descriptor_for_row(row: JsonDict) -> JsonDict | None:
@@ -311,14 +299,15 @@ def descriptor_for_row(row: JsonDict) -> JsonDict | None:
     if not session_id:
         return None
     parent_id = canonical_uuid(payload.get("parent_thread_id")) or canonical_uuid(
-        publish_presence.parent_thread_id(row)
+        native_threads.parent_thread_id(row)
     )
     metadata: JsonDict = {
-        "cwd": str(row["cwd"]),
         "transcript_path": str(path),
         "repo_remote": str(row["git_origin_url"]),
         "source": "rollout_sync",
     }
+    if row.get("cwd"):
+        metadata["cwd"] = str(row["cwd"])
     for key in ("git_branch", "thread_source"):
         if row.get(key):
             value = str(row[key])
@@ -333,7 +322,7 @@ def descriptor_for_row(row: JsonDict) -> JsonDict | None:
         "session_id": session_id,
         "path": path,
         "parent_thread_id": parent_id,
-        "created_at": publish_presence.milliseconds_to_iso(
+        "created_at": native_threads.milliseconds_to_iso(
             row.get("created_at_ms") or row.get("updated_at_ms")
         ),
         "metadata": metadata,
