@@ -38,7 +38,6 @@ UPLOAD_WORKERS_ENV = "CODEX_SESSION_LOG_UPLOAD_WORKERS"
 DEFAULT_SUPABASE_URL = "https://pmdfllwuctzkdjiehezq.supabase.co"
 DEFAULT_INGEST_URL = f"{DEFAULT_SUPABASE_URL}/functions/v1/codex-session-ingest"
 DEFAULT_BUCKET = "codex-sessions"
-ALLOWED_GITHUB_ORG = "e3-solutions"
 EXCERPT_BYTES = 4096
 PLUGIN_VERSION = "0.2.12"
 PERMANENT_HTTP_STATUSES = {400, 413, 415, 422}
@@ -508,8 +507,7 @@ def codex_connections(config: JsonDict) -> list[JsonDict]:
 
 def should_capture_payload(payload: JsonDict) -> bool:
     cwd = first_string(payload, "cwd") or os.getcwd()
-    remote = git_origin_remote(cwd)
-    return remote_belongs_to_org(remote, ALLOWED_GITHUB_ORG)
+    return git_origin_remote(cwd) is not None
 
 
 def git_origin_remote(cwd: str) -> str | None:
@@ -526,41 +524,40 @@ def git_origin_remote(cwd: str) -> str | None:
     return remote or None
 
 
-def remote_belongs_to_org(remote: str | None, org: str) -> bool:
-    return canonical_github_remote(remote, org) is not None
-
-
-def canonical_github_remote(remote: str | None, org: str) -> str | None:
-    """Return a GitHub canonical remote after verifying an allowed local alias."""
+def canonical_github_remote(remote: str | None) -> str | None:
+    """Return a canonical GitHub remote after verifying any local SSH alias."""
     if not remote:
         return None
     value = remote.strip()
     github_https = re.match(
-        rf"^https://github\.com/{re.escape(org)}/(?P<repository>[^/]+?)(?:\.git)?/?$",
+        r"^https://github\.com/(?P<owner>[^/\s]+)/(?P<repository>[^/\s]+?)(?:\.git)?/?$",
         value,
         flags=re.IGNORECASE,
     )
     if github_https:
-        return canonical_github_url(org, github_https.group("repository"))
+        return canonical_github_url(
+            github_https.group("owner"),
+            github_https.group("repository"),
+        )
 
     scp_style = re.match(
-        rf"^git@(?P<host>[^:/\s]+):{re.escape(org)}/(?P<repository>[^/]+?)(?:\.git)?/?$",
+        r"^git@(?P<host>[^:/\s]+):(?P<owner>[^/\s]+)/(?P<repository>[^/\s]+?)(?:\.git)?/?$",
         value,
         flags=re.IGNORECASE,
     )
     ssh_url = re.match(
-        rf"^ssh://git@(?P<host>[^/\s:]+)(?::\d+)?/{re.escape(org)}/(?P<repository>[^/]+?)(?:\.git)?/?$",
+        r"^ssh://git@(?P<host>[^/\s:]+)(?::\d+)?/(?P<owner>[^/\s]+)/(?P<repository>[^/\s]+?)(?:\.git)?/?$",
         value,
         flags=re.IGNORECASE,
     )
     match = scp_style or ssh_url
     if not match or not ssh_host_resolves_to_github(match.group("host")):
         return None
-    return canonical_github_url(org, match.group("repository"))
+    return canonical_github_url(match.group("owner"), match.group("repository"))
 
 
-def canonical_github_url(org: str, repository: str) -> str:
-    return f"https://github.com/{org}/{repository}.git"
+def canonical_github_url(owner: str, repository: str) -> str:
+    return f"https://github.com/{owner}/{repository}.git"
 
 
 @lru_cache(maxsize=32)
@@ -981,7 +978,6 @@ def client_context(record: JsonDict, *, base: Path) -> JsonDict:
     remote = metadata.get("repo_remote") or (git_origin_remote(cwd) if cwd else None)
     canonical_remote = canonical_github_remote(
         str(remote) if isinstance(remote, str) else None,
-        ALLOWED_GITHUB_ORG,
     )
     context: JsonDict = {
         "cwd": cwd,

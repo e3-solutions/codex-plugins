@@ -91,9 +91,6 @@ def sync_rollouts(
         )
         descriptors: list[JsonDict | None] = []
         for row in pending_candidates:
-            if permanently_out_of_scope(row):
-                pending_rows.pop(canonical_uuid(str(row.get("id") or "")) or "", None)
-                continue
             if eligible_rollout_thread(row):
                 descriptors.append(descriptor_for_row(row))
         pending_descriptors = [item for item in descriptors if item is not None]
@@ -289,18 +286,7 @@ def eligible_rollout_thread(row: JsonDict) -> bool:
     remote = row.get("git_origin_url") or session_logging.git_origin_remote(str(row["cwd"]))
     if remote:
         row["git_origin_url"] = str(remote)
-    return session_logging.remote_belongs_to_org(
-        str(remote) if remote else None,
-        session_logging.ALLOWED_GITHUB_ORG,
-    )
-
-
-def permanently_out_of_scope(row: JsonDict) -> bool:
-    remote = row.get("git_origin_url")
-    return bool(remote) and not session_logging.remote_belongs_to_org(
-        str(remote),
-        session_logging.ALLOWED_GITHUB_ORG,
-    )
+    return remote is not None
 
 
 def descriptor_for_row(row: JsonDict) -> JsonDict | None:

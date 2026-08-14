@@ -158,10 +158,10 @@ def test_transcript_path_groups_runtime_sessions_into_one_thread(tmp_path, monke
     assert first["thread_id"] == session_logging.sha256_hex(transcript_path)
 
 
-def test_capture_skips_repos_outside_e3_solutions(tmp_path, monkeypatch):
+def test_capture_accepts_any_remote_origin(tmp_path, monkeypatch):
     monkeypatch.setenv("CODEX_SESSION_LOG_STATE_DIR", str(tmp_path / "state"))
     session_logging = load_session_logging()
-    repo = init_git_repo(tmp_path / "repo", "https://github.com/example/codex-plugins.git")
+    repo = init_git_repo(tmp_path / "repo", "https://gitlab.com/example/codex-plugins.git")
 
     result = session_logging.capture_hook_event(
         {
@@ -169,12 +169,51 @@ def test_capture_skips_repos_outside_e3_solutions(tmp_path, monkeypatch):
             "session_id": "session-123",
             "turn_id": "turn-1",
             "cwd": str(repo),
-            "prompt": "Do not capture this.",
+            "prompt": "Capture this repository too.",
         }
     )
 
+    assert result["role"] == "user"
+    ingest_payload = session_logging.build_ingest_payload(result, base=tmp_path / "state")
+    assert ingest_payload["client"]["repo_remote"] == "https://gitlab.com/example/codex-plugins.git"
+    assert (tmp_path / "state" / "events.jsonl").exists()
+
+
+def test_capture_skips_checkouts_without_an_origin_remote(tmp_path, monkeypatch):
+    monkeypatch.setenv("CODEX_SESSION_LOG_STATE_DIR", str(tmp_path / "state"))
+    session_logging = load_session_logging()
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+
+    result = session_logging.capture_hook_event({
+        "hook_event_name": "UserPromptSubmit",
+        "session_id": "session-no-origin",
+        "cwd": str(repo),
+        "prompt": "There is no repository identity for remote delivery.",
+    })
+
     assert result is None
     assert not (tmp_path / "state" / "events.jsonl").exists()
+
+
+def test_session_logging_has_no_repository_owner_allowlist():
+    plugin_root = ROOT / "plugins" / "codex-session-logging"
+    sources = {
+        "capture": (plugin_root / "scripts" / "session_logging.py").read_text(encoding="utf-8"),
+        "rollout": (plugin_root / "scripts" / "rollout_sync.py").read_text(encoding="utf-8"),
+        "ingest": (
+            plugin_root / "supabase" / "functions" / "codex-session-ingest" / "index.ts"
+        ).read_text(encoding="utf-8"),
+    }
+
+    for source in sources.values():
+        assert "ALLOWED_GITHUB_ORG" not in source
+        assert "CODEX_SESSION_LOG_ALLOWED_GITHUB_ORG" not in source
+        assert "repo_not_allowed" not in source
+
+    assert "remote_belongs_to_org" not in sources["capture"]
+    assert "remoteBelongsToOrg" not in sources["ingest"]
 
 
 def test_session_start_spools_sanitized_environment_snapshot(tmp_path, monkeypatch):
@@ -1124,25 +1163,26 @@ def test_canonical_github_remote_supports_verified_ssh_aliases(monkeypatch):
 
     canonical = session_logging.canonical_github_remote(
         "git@github-coreedge:e3-solutions/negotiation.git",
-        "e3-solutions",
     )
 
     assert canonical == "https://github.com/e3-solutions/negotiation.git"
     assert checked == ["github-coreedge"]
 
 
-def test_canonical_github_remote_rejects_unverified_alias_and_other_org(monkeypatch):
+def test_canonical_github_remote_rejects_unverified_alias_and_accepts_any_org(monkeypatch):
     session_logging = load_session_logging()
-    monkeypatch.setattr(session_logging, "ssh_host_resolves_to_github", lambda _host: False)
+    monkeypatch.setattr(
+        session_logging,
+        "ssh_host_resolves_to_github",
+        lambda host: host == "github.com",
+    )
 
     assert session_logging.canonical_github_remote(
         "git@internal-git:e3-solutions/negotiation.git",
-        "e3-solutions",
     ) is None
     assert session_logging.canonical_github_remote(
         "git@github.com:other-org/negotiation.git",
-        "e3-solutions",
-    ) is None
+    ) == "https://github.com/other-org/negotiation.git"
 
 
 def test_client_context_submits_canonical_remote(monkeypatch):

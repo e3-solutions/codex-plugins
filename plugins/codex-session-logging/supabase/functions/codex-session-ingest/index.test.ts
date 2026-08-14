@@ -1491,7 +1491,7 @@ Deno.test("handleRequest rejects existing event and rollout owner mismatches bef
     },
     event: { metadata: { tool_name: "shell", tool_phase: "started" } },
     client: {
-      repo_remote: "https://github.com/e3-solutions/codex-plugins.git",
+      repo_remote: "https://github.com/example-org/codex-plugins.git",
       installation_id: "install-1",
     },
   };
@@ -2075,7 +2075,7 @@ async function rolloutChunkPayload(content: string): Promise<JsonObject> {
       content_base64: btoa(binary),
     },
     client: {
-      repo_remote: "https://github.com/e3-solutions/codex-plugins.git",
+      repo_remote: "https://github.com/example-org/codex-plugins.git",
       installation_id: "install-1",
     },
   };

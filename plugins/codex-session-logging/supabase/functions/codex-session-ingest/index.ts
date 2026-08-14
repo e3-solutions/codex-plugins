@@ -14,7 +14,6 @@ type ExistingSession = {
 class PayloadValidationError extends Error {}
 
 const DEFAULT_BUCKET = "codex-sessions";
-const DEFAULT_ALLOWED_ORG = "e3-solutions";
 const MAX_ROLLOUT_CHUNK_BYTES = 1024 * 1024;
 const MAX_ROLLOUT_CHUNK_BASE64_LENGTH = Math.ceil(MAX_ROLLOUT_CHUNK_BYTES / 3) *
   4;
@@ -55,9 +54,6 @@ export async function handleRequest(req: Request): Promise<Response> {
     const client = requireObject(payload.client, "client");
 
     const remote = requireString(client.repo_remote, "client.repo_remote");
-    if (!remoteBelongsToOrg(remote, allowedGithubOrg())) {
-      return jsonResponse({ error: "repo_not_allowed" }, 403);
-    }
 
     const payloadKind = optionalString(payload.kind);
     if (payloadKind !== "rollout_chunk" && isHistoricalBackfill(payload)) {
@@ -381,24 +377,6 @@ function ingestTokenError(req: Request): Response | null {
     return jsonResponse({ error: "invalid_ingest_token" }, 401);
   }
   return null;
-}
-
-function allowedGithubOrg(): string {
-  return Deno.env.get("CODEX_SESSION_LOG_ALLOWED_GITHUB_ORG") ??
-    DEFAULT_ALLOWED_ORG;
-}
-
-function remoteBelongsToOrg(remote: string, org: string): boolean {
-  const escapedOrg = escapeRegExp(org);
-  return [
-    new RegExp(`^https://github\\.com/${escapedOrg}/[^/]+(?:\\.git)?/?$`, "i"),
-    new RegExp(`^git@github\\.com:${escapedOrg}/[^/]+(?:\\.git)?$`, "i"),
-    new RegExp(`^ssh://git@github\\.com/${escapedOrg}/[^/]+(?:\\.git)?$`, "i"),
-  ].some((pattern) => pattern.test(remote.trim()));
-}
-
-function escapeRegExp(value: string): string {
-  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 async function validateMessageIntegrity(

@@ -95,7 +95,7 @@ def create_database(path: Path, rows: list[dict]) -> None:
             "archived": row.get("archived", 0),
             "git_branch": "arya/test",
             "git_origin_url": row.get(
-                "git_origin_url", "https://github.com/e3-solutions/codex-plugins.git"
+                "git_origin_url", "https://github.com/example-org/codex-plugins.git"
             ),
             "created_at_ms": 1000,
             "updated_at_ms": 1000 + index,
