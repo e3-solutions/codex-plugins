@@ -7,6 +7,17 @@ description: Inspect, test, and safely operate the local Linear progress sync pl
 
 Use this skill when working with the local `linear-progress-sync` plugin.
 
+## Global Workflow Owner
+
+Before applying any workflow rule below, inspect `~/.codex/linear-sync/repos.json`. If its top-level setting is exactly `"workflow_manager": "tweed"`, stop: Linear Progress Sync is inert. Do not require a Linear user, repo binding, kickoff, activation, `active.json`, branch guard, write guard, progress sync, or cached Linear context. Tweed owns the workflow.
+
+Set or clear the owner with:
+
+```bash
+python3 plugins/linear-progress-sync/scripts/linear_start.py workflow-owner --set tweed
+python3 plugins/linear-progress-sync/scripts/linear_start.py workflow-owner --clear
+```
+
 ## Automatic Kickoff Rule
 
 Before writing code, creating a branch, or opening implementation changes, check for:
@@ -79,7 +90,7 @@ This repository is a Codex plugin marketplace, not a single plugin source. Do no
 
 Setup installs a resident updater under `~/.codex/coreedge`. It checks at login and every 30 minutes through a macOS LaunchAgent or Linux systemd user timer, validates and stages the current `main.zip`, atomically switches the managed marketplace, selects one cache version per default plugin, and retains rollback copies outside Codex's cache scan. Linux VMs use user units under `$XDG_CONFIG_HOME/systemd/user` when that variable is set and `~/.config/systemd/user` otherwise. Headless VMs need `loginctl enable-linger <user>` if the timers must continue after logout. SessionStart and PreToolUse self-heal a missing service. Persistently disable or re-enable network checks with:
 
-Existing installations activate `0.3.10` during one ordinary resident check and self-heal without rerunning setup. This release allows repository synchronization commands such as `git pull` before Linear kickoff while preserving the guard for actual file edits. It also preserves historical-backfill protections, Linux systemd support, commit-only Linear progress comments, and verified GitHub SSH aliases alongside complete hook-triggered parent and subagent rollout capture. Exact native JSONL bytes are durably queued in deterministic chunks, and a later hook recovers after crashes without duplicates. Existing one-minute presence schedulers are removed during upgrade. Do not ask teammates to run an update command, deliberately restart Codex, or create a renewal thread for normal updates. Fresh setup installs and schedules the current plugins immediately.
+Existing installations activate `0.3.11` during one ordinary resident check and self-heal without rerunning setup. This release adds the global Tweed workflow-owner switch. Do not ask teammates to run an update command, deliberately restart Codex, or create a renewal thread for normal updates. Fresh setup installs and schedules the current plugins immediately.
 
 ```bash
 python3 ~/.codex/coreedge/runtime/current/update_plugin.py --disable-auto-update

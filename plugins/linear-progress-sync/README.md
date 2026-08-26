@@ -10,6 +10,7 @@ Agents installing this for a teammate must clone the repo and run `setup.py`, be
 
 Current behavior:
 
+- A global `"workflow_manager": "tweed"` setting makes this plugin inert so Tweed can own the complete workflow.
 - Enforcement is scoped to git repos whose `origin` remote is under `e3-solutions/*`.
 - Repos with no `origin` remote, no git repo, or a non-E3 origin are out of scope and file edits are allowed without Linear kickoff.
 - Before kickoff in scoped repos, only file edits, write-like Bash commands, and branch creation are blocked. Read-only inspection and non-mutating commands are allowed.
@@ -46,6 +47,22 @@ python3 plugins/linear-progress-sync/scripts/setup.py --dry-run
 
 ## Normal Use
 
+### Let Tweed own the workflow
+
+Set the global owner once:
+
+```bash
+python3 plugins/linear-progress-sync/scripts/linear_start.py workflow-owner --set tweed
+```
+
+This stores `"workflow_manager": "tweed"` at the top level of `~/.codex/linear-sync/repos.json`. While that exact value is present, Linear Progress Sync is inert: it does not guard writes or branches, require setup or active state, run kickoff/activation, queue or publish progress, launch nested Codex agents, or inject cached Linear context. Tweed owns those responsibilities. Unknown or malformed values retain the normal Linear Progress Sync behavior.
+
+To restore the native Linear Progress Sync workflow:
+
+```bash
+python3 plugins/linear-progress-sync/scripts/linear_start.py workflow-owner --clear
+```
+
 Start a coding task normally. Before the first edit or branch creation, Codex must create or confirm the Linear issue, create the Linear-named branch, push an empty kickoff commit, open a draft PR, link Linear and GitHub, and write local active state.
 
 Linear kickoff enforcement only applies to repos whose `origin` remote is under the `e3-solutions` GitHub org. Repos with no `origin` remote or another GitHub org are treated as out of scope and are allowed without Linear kickoff.
@@ -69,7 +86,7 @@ After kickoff, successful Git commits are synced back to the active Linear issue
 
 Setup installs a resident updater under `~/.codex/coreedge`. It runs independently of Codex tasks through a macOS LaunchAgent or Linux systemd user timer shortly after login and every 30 minutes. It downloads the current `main.zip`, validates and stages the default marketplace plugins, switches `~/.codex/coreedge/marketplace/current` atomically, points the registered marketplace at that stable path, and leaves only the selected version visible in each Codex plugin cache. Previous versions move to `~/.codex/coreedge/rollback/cache` so a failed activation can restore the prior state. `SessionStart` and `PreToolUse` repair a missing resident service without delaying or blocking Codex.
 
-Existing installations download and activate `0.3.10` during one ordinary resident check. This release allows repository synchronization commands such as `git pull` before Linear kickoff while preserving the guard for actual file edits. It preserves historical-backfill protections, Linux systemd support, commit-only Linear progress comments, and verified GitHub SSH aliases alongside complete hook-triggered parent and subagent rollout capture. SQLite discovers native rollout paths; exact JSONL bytes are durably queued in deterministic chunks before the local checkpoint advances. `SessionStart`, `UserPromptSubmit`, and `Stop` recover all changes, while agent-coordination tool completions provide lower-latency subagent sync. A crash is recovered by the next hook without duplicate Storage objects or Postgres events, and existing one-minute presence schedulers are removed during upgrade. Codex Session Logging `0.2.11` preserves every distinct cumulative usage observation from those live rollout bytes while advancing latest usage only when all four token components are monotonic; its append-only observation and monotonic usage RPC migration must be deployed before clients update. Installations from before `0.3.10` self-heal without rerunning setup; fresh setup installs and schedules the current plugins immediately.
+Existing installations download and activate `0.3.11` during one ordinary resident check. This release adds the global Tweed workflow-owner switch. When enabled, Linear Progress Sync becomes inert and leaves workflow management entirely to Tweed. Existing historical-backfill protections, hook-triggered parent and subagent rollout capture, and the monotonic usage RPC migration remain unchanged. Installations from before `0.3.11` self-heal without rerunning setup; fresh setup installs and schedules the current plugins immediately.
 
 Persistently disable or re-enable automatic network update checks with:
 

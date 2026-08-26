@@ -4,10 +4,12 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-from linear_sync import pre_tool_guard_decision, read_stdin_json
+from linear_sync import pre_tool_guard_decision, read_stdin_json, tweed_owns_workflow
 
 
 def main() -> None:
+    if tweed_owns_workflow():
+        return
     try:
         from resident_updater import ensure_resident_updater
 

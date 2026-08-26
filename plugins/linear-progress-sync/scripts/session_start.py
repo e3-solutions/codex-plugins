@@ -3,10 +3,12 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from linear_sync import ensure_state, read_state
+from linear_sync import ensure_state, read_state, tweed_owns_workflow
 
 
 def main() -> None:
+    if tweed_owns_workflow():
+        return
     try:
         from resident_updater import ensure_resident_updater
 
