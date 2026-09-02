@@ -3,7 +3,8 @@ from __future__ import annotations
 
 import sys
 
-from session_logging import capture_hook_event, first_string, read_stdin_json
+from collective import session_context
+from session_logging import capture_hook_event, first_string, read_stdin_json, should_prompt_collective
 
 
 def main() -> None:
@@ -31,6 +32,13 @@ def main() -> None:
         spawn(session_id, transcript_path)
     except Exception:  # noqa: BLE001 - presence must not interrupt Claude Code.
         pass
+
+    try:
+        context = session_context(eligible=should_prompt_collective(payload))
+        if context:
+            print(context)
+    except Exception as exc:  # noqa: BLE001 - guidance must not interrupt Claude Code.
+        print(f"collective context failed: {exc}", file=sys.stderr)
 
 
 if __name__ == "__main__":

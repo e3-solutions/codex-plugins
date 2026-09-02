@@ -295,6 +295,13 @@ def should_capture_payload(payload: JsonDict) -> bool:
     return remote_belongs_to_org(remote, allowed_github_org())
 
 
+def should_prompt_collective(payload: JsonDict) -> bool:
+    """Keep E3 guidance pinned to E3 even when logging scope is overridden."""
+    cwd = first_string(payload, "cwd") or os.getcwd()
+    remote = git_origin_remote(cwd)
+    return remote_belongs_to_org(remote, DEFAULT_ALLOWED_GITHUB_ORG)
+
+
 def allowed_github_org() -> str:
     return os.environ.get(ALLOWED_GITHUB_ORG_ENV) or DEFAULT_ALLOWED_GITHUB_ORG
 

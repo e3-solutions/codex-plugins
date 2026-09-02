@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import json
 import sys
 
-from session_logging import capture_hook_event, read_stdin_json
+from collective import stop_feedback
+from session_logging import capture_hook_event, read_stdin_json, should_prompt_collective
 
 
 def main() -> None:
@@ -21,6 +23,22 @@ def main() -> None:
         transcript_sync.sync_from_hook(payload)
     except Exception as exc:  # noqa: BLE001 - transcript sync must not interrupt Claude Code.
         print(f"claude-session-logging transcript sync failed: {exc}", file=sys.stderr)
+
+    try:
+        feedback = stop_feedback(payload, eligible=should_prompt_collective(payload))
+        if feedback:
+            print(
+                json.dumps(
+                    {
+                        "hookSpecificOutput": {
+                            "hookEventName": "Stop",
+                            "additionalContext": feedback,
+                        }
+                    }
+                )
+            )
+    except Exception as exc:  # noqa: BLE001 - guidance must not interrupt Claude Code.
+        print(f"collective assessment failed: {exc}", file=sys.stderr)
 
 
 if __name__ == "__main__":
