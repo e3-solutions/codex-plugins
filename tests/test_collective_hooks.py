@@ -116,42 +116,16 @@ def test_session_context_is_eligible_and_opt_out_bounded(collective, monkeypatch
     assert collective.session_context(eligible=True) is None
 
 
-def test_stop_feedback_catches_substantive_and_long_form_results(collective, monkeypatch):
-    monkeypatch.delenv("E3_COLLECTIVE_HOOK_ENABLED", raising=False)
-    feedback = collective.stop_feedback(
-        {"last_assistant_message": substantive_message()},
-        eligible=True,
-    )
-    assert "submit one concise candidate" in feedback
-    assert "pending approval, not publication" in feedback
-    assert "repository, branch, pull request, commit, file, or URL" in feedback
-
-    long_form = "A compact technical explanation without a keyword. " * 12
-    assert collective.stop_feedback({"last_assistant_message": long_form}, eligible=True)
-
-
-@pytest.mark.parametrize(
-    "payload,eligible",
-    [
-        ({}, True),
-        ({"last_assistant_message": "Done."}, True),
-        ({"last_assistant_message": substantive_message()}, False),
-        ({"last_assistant_message": substantive_message(), "stop_hook_active": True}, True),
-        ({"lastAssistantMessage": substantive_message(), "stop_hook_active": "true"}, True),
-    ],
-)
-def test_stop_feedback_skips_noise_out_of_scope_and_repeat_turns(collective, payload, eligible):
-    assert collective.stop_feedback(payload, eligible=eligible) is None
-
-
 @pytest.mark.parametrize(
     "agent,scripts",
     [("codex", CODEX_SCRIPTS), ("claude", CLAUDE_SCRIPTS)],
 )
+@pytest.mark.parametrize("source", ["startup", "resume", "compact"])
 def test_session_start_process_injects_context_for_e3_even_if_logging_fails(
     tmp_path,
     agent,
     scripts,
+    source,
 ):
     repo = init_git_repo(tmp_path / f"{agent}-repo", "https://github.com/e3-solutions/example.git")
     env = base_env(tmp_path, agent=agent)
@@ -163,7 +137,12 @@ def test_session_start_process_injects_context_for_e3_even_if_logging_fails(
     result = run_hook(
         scripts,
         "session_start",
-        {"hook_event_name": "SessionStart", "session_id": "test-session", "cwd": str(repo)},
+        {
+            "hook_event_name": "SessionStart",
+            "session_id": "test-session",
+            "cwd": str(repo),
+            "source": source,
+        },
         env=env,
     )
 
@@ -176,7 +155,7 @@ def test_session_start_process_injects_context_for_e3_even_if_logging_fails(
     "agent,scripts",
     [("codex", CODEX_SCRIPTS), ("claude", CLAUDE_SCRIPTS)],
 )
-def test_stop_process_emits_host_specific_single_continuation_and_then_stops(
+def test_stop_process_is_silent_for_substantive_completion(
     tmp_path,
     agent,
     scripts,
@@ -190,19 +169,15 @@ def test_stop_process_emits_host_specific_single_continuation_and_then_stops(
         "last_assistant_message": substantive_message(),
     }
 
-    first = run_hook(scripts, "stop", payload, env=env)
-    assert first.returncode == 0
-    output = json.loads(first.stdout)
-    if agent == "codex":
-        assert output == {"decision": "block", "reason": output["reason"]}
-        assert "private Cosmos Forum review queue" in output["reason"]
-    else:
-        assert output["hookSpecificOutput"]["hookEventName"] == "Stop"
-        assert "private Cosmos Forum review queue" in output["hookSpecificOutput"]["additionalContext"]
-
-    second = run_hook(scripts, "stop", {**payload, "stop_hook_active": True}, env=env)
-    assert second.returncode == 0
-    assert second.stdout == ""
+    result = run_hook(scripts, "stop", payload, env=env)
+    assert result.returncode == 0
+    assert result.stdout == ""
+    state_dir = tmp_path / ("codex-state" if agent == "codex" else "claude-state")
+    events = [
+        json.loads(line)
+        for line in (state_dir / "events.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    assert any(event["hook_event_name"] == "Stop" for event in events)
 
 
 @pytest.mark.parametrize(

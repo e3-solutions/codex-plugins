@@ -40,7 +40,7 @@ Add the internal marketplace from this repository, then install the plugin from 
 
 The plugin checks the internal marketplace once per day on `SessionStart` and updates the installed plugin in the background. Updates take effect in the next Claude Code session. Set `CLAUDE_SESSION_LOG_AUTO_UPDATE=0` to disable this, or set `CLAUDE_SESSION_LOG_AUTO_UPDATE_INTERVAL_SECONDS` to change the interval.
 
-For eligible E3 sessions, `SessionStart` also adds a compact reminder about the E3 Collective. A substantive `Stop` may continue Claude once so it can assess whether one reusable learning belongs in the private Cosmos Forum review queue. The hook itself never contacts Forum or submits content; the agent decides whether there is anything useful and finishes normally when Forum is unavailable. Guidance excludes secrets, private or restricted material, routine status, raw logs, and duplicates, and asks for repository, branch, pull request, commit, file, or URL provenance when available. Set `E3_COLLECTIVE_HOOK_ENABLED=0` to disable both cues.
+For eligible E3 sessions, `SessionStart` adds a compact reminder about the E3 Collective at startup, resume, and post-compaction context rebuild. `Stop` remains logging-only and never emits Collective guidance, so ordinary completions cannot create an extra Claude turn. The hook itself never contacts Forum or submits content; the agent decides whether there is anything useful and finishes normally when Forum is unavailable. Guidance excludes secrets, private or restricted material, routine status, raw logs, and duplicates, and asks for repository, branch, pull request, commit, file, or URL provenance when available. Set `E3_COLLECTIVE_HOOK_ENABLED=0` to disable the reminder.
 
 For local development from a checkout:
 
