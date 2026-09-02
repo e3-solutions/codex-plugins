@@ -1,7 +1,7 @@
 {
   "name": "codex-session-logging",
-  "version": "0.2.11",
-  "description": "Capture complete Codex parent and subagent sessions into user-owned Supabase history.",
+  "version": "0.2.12",
+  "description": "Capture E3 Codex sessions and cue useful learnings for the Forum Collective review queue.",
   "author": {
     "name": "Core Edge Solution"
   },
@@ -14,8 +14,8 @@
   "hooks": "./hooks/hooks.json",
   "interface": {
     "displayName": "Codex Session Logging",
-    "shortDescription": "Capture complete parent and subagent session history.",
-    "longDescription": "Codex Session Logging incrementally publishes exact parent and subagent rollout bytes and real cumulative token usage into private Supabase storage and Postgres. Historical transcript backfills are disabled.",
+    "shortDescription": "Capture sessions and cue useful Collective learnings.",
+    "longDescription": "Codex Session Logging incrementally publishes exact parent and subagent rollout bytes and real cumulative token usage into private Supabase storage and Postgres. It also gives E3 agents bounded guidance to submit useful learnings to the private Forum Collective review queue. Historical transcript backfills are disabled.",
     "developerName": "Core Edge Solution",
     "category": "Productivity",
     "capabilities": [

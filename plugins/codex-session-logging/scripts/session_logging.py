@@ -40,7 +40,7 @@ DEFAULT_INGEST_URL = f"{DEFAULT_SUPABASE_URL}/functions/v1/codex-session-ingest"
 DEFAULT_BUCKET = "codex-sessions"
 ALLOWED_GITHUB_ORG = "e3-solutions"
 EXCERPT_BYTES = 4096
-PLUGIN_VERSION = "0.2.11"
+PLUGIN_VERSION = "0.2.12"
 PERMANENT_HTTP_STATUSES = {400, 413, 415, 422}
 _SESSION_UPLOAD_LOCKS: dict[str, threading.Lock] = {}
 _SESSION_UPLOAD_LOCKS_GUARD = threading.Lock()
@@ -507,6 +507,12 @@ def codex_connections(config: JsonDict) -> list[JsonDict]:
 
 
 def should_capture_payload(payload: JsonDict) -> bool:
+    cwd = first_string(payload, "cwd") or os.getcwd()
+    remote = git_origin_remote(cwd)
+    return remote_belongs_to_org(remote, ALLOWED_GITHUB_ORG)
+
+
+def should_prompt_collective(payload: JsonDict) -> bool:
     cwd = first_string(payload, "cwd") or os.getcwd()
     remote = git_origin_remote(cwd)
     return remote_belongs_to_org(remote, ALLOWED_GITHUB_ORG)
