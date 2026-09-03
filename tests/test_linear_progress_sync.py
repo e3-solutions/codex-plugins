@@ -182,6 +182,18 @@ def make_marketplace_archive(tmp_path: Path, *, bootstrap_version: str) -> tuple
     return archive, digest
 
 
+def make_current_marketplace_archive(tmp_path: Path) -> tuple[Path, str]:
+    repo_root = tmp_path / "current-payload" / "codex-plugins-main"
+    shutil.copytree(ROOT / ".agents", repo_root / ".agents")
+    for name in ("linear-progress-sync", "codex-session-logging"):
+        shutil.copytree(ROOT / "plugins" / name, repo_root / "plugins" / name)
+    archive = tmp_path / "current-marketplace.zip"
+    with zipfile.ZipFile(archive, "w") as zip_file:
+        for path in repo_root.rglob("*"):
+            zip_file.write(path, path.relative_to(tmp_path / "current-payload"))
+    return archive, hashlib.sha256(archive.read_bytes()).hexdigest()
+
+
 def init_git_repo(
     path: Path,
     branch: str = "arya/cor-1-work",
@@ -2074,6 +2086,115 @@ def test_update_plugin_installs_newer_manifest_archive(tmp_path, monkeypatch):
     assert installed_manifest["version"] == "0.2.1"
 
 
+def test_current_marketplace_upgrades_previous_release_and_activates_prompt(tmp_path, monkeypatch):
+    update_plugin = load_update_plugin()
+    resident = load_resident_updater()
+    codex_home = tmp_path / "codex-home"
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    monkeypatch.setenv("LINEAR_SYNC_CONFIG_DIR", str(tmp_path / "config"))
+    cache_root = codex_home / "plugins/cache/coreedge-local"
+    cache_parent = cache_root / "linear-progress-sync"
+    old_linear = write_minimal_plugin(
+        cache_parent,
+        directory_name="0.3.12",
+        version="0.3.12",
+        hook_events=("SessionStart", "PreToolUse"),
+    )
+    write_minimal_plugin(
+        cache_root / "codex-session-logging",
+        name="codex-session-logging",
+        directory_name="0.2.13",
+        version="0.2.13",
+        hook_events=("SessionStart", "UserPromptSubmit", "Stop"),
+    )
+    archive, digest = make_current_marketplace_archive(tmp_path)
+    manifest = tmp_path / "current-manifest.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "version": "0.3.13",
+                "archive_url": archive.as_uri(),
+                "sha256": digest,
+                "plugin_subdir": "plugins/linear-progress-sync",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    first = update_plugin.run_update(
+        current_plugin_root=old_linear,
+        cache_parent=cache_parent,
+        manifest_url=manifest.as_uri(),
+        state_path=tmp_path / "update-state.json",
+        force=True,
+        install_hooks=False,
+    )
+    new_linear = cache_parent / "0.3.13"
+    second = update_plugin.run_update(
+        current_plugin_root=new_linear,
+        cache_parent=cache_parent,
+        manifest_url=manifest.as_uri(),
+        state_path=tmp_path / "update-state.json",
+        force=True,
+        install_hooks=False,
+    )
+    resident.activate_release(
+        ROOT,
+        codex_home=codex_home,
+        resident_root=codex_home / "coreedge",
+        install_service=True,
+        platform="unsupported",
+    )
+    health = resident.doctor(
+        codex_home=codex_home,
+        resident_root=codex_home / "coreedge",
+        platform="unsupported",
+    )
+
+    installed_prompt = (
+        cache_root / "codex-session-logging/0.2.14/scripts/collective.py"
+    )
+    assert first["updated"] is True
+    assert second["updated"] is False
+    assert second["skipped"] == "current"
+    assert sorted(path.name for path in cache_parent.iterdir() if not path.name.startswith(".")) == ["0.3.13"]
+    codex_versions = cache_root / "codex-session-logging"
+    assert sorted(path.name for path in codex_versions.iterdir() if not path.name.startswith(".")) == ["0.2.14"]
+    assert installed_prompt.read_bytes() == (
+        ROOT / "plugins/codex-session-logging/scripts/collective.py"
+    ).read_bytes()
+    repo = init_git_repo(tmp_path / "e3-repo")
+    hook_env = {
+        **os.environ,
+        "CODEX_HOME": str(codex_home),
+        "CODEX_SESSION_LOG_AUTO_UPLOAD": "0",
+        "CODEX_SESSION_LOG_STATE_DIR": str(tmp_path / "session-state"),
+        "E3_COLLECTIVE_HOOK_ENABLED": "1",
+    }
+    hook_script = installed_prompt.parent / "session_start.py"
+    startup = subprocess.run(
+        [sys.executable, str(hook_script)],
+        input=json.dumps({"cwd": str(repo), "session_id": "startup", "source": "startup"}),
+        text=True,
+        capture_output=True,
+        check=False,
+        env=hook_env,
+    )
+    clear = subprocess.run(
+        [sys.executable, str(hook_script)],
+        input=json.dumps({"cwd": str(repo), "session_id": "clear", "source": "clear"}),
+        text=True,
+        capture_output=True,
+        check=False,
+        env=hook_env,
+    )
+    assert startup.returncode == clear.returncode == 0
+    assert "E3 Collective:" in startup.stdout
+    assert clear.stdout == ""
+    assert health["healthy"] is True
+    assert health["issues"] == []
+
+
 def test_update_plugin_syncs_default_marketplace_plugins_and_hooks_when_bootstrap_current(tmp_path, monkeypatch):
     update_plugin = load_update_plugin()
     monkeypatch.setenv("LINEAR_SYNC_CONFIG_DIR", str(tmp_path / "config"))
@@ -2177,7 +2298,7 @@ def test_legacy_upgrade_keeps_presence_scheduler_decommissioned(tmp_path, monkey
     manifest.write_text(
         json.dumps(
             {
-                    "version": "0.3.12",
+                    "version": "0.3.13",
                 "archive_url": archive.as_uri(),
                 "sha256": hashlib.sha256(archive.read_bytes()).hexdigest(),
                 "plugin_subdir": "plugins/linear-progress-sync",
@@ -2233,8 +2354,8 @@ def test_legacy_upgrade_keeps_presence_scheduler_decommissioned(tmp_path, monkey
     resident_root = codex_home / "coreedge"
 
     assert first_cycle.returncode == 0, first_cycle.stderr
-    assert json.loads(first_cycle.stdout)["resident"]["version"] == "0.3.12"
-    assert (resident_root / "runtime" / "current").resolve().name == "0.3.12"
+    assert json.loads(first_cycle.stdout)["resident"]["version"] == "0.3.13"
+    assert (resident_root / "runtime" / "current").resolve().name == "0.3.13"
     assert not (home / "Library" / "LaunchAgents" / "com.coreedge.codex-session-presence.plist").exists()
 
     second_cycle = subprocess.run(
@@ -3067,12 +3188,12 @@ def test_real_marketplace_activates_in_isolated_codex_home_and_passes_doctor(tmp
         platform="unsupported",
     )
 
-    assert activation["version"] == "0.3.12"
+    assert activation["version"] == "0.3.13"
     assert health["healthy"] is True
     assert health["issues"] == []
     assert health["cache_versions"] == {
-        "codex-session-logging": ["0.2.13"],
-        "linear-progress-sync": ["0.3.12"],
+        "codex-session-logging": ["0.2.14"],
+        "linear-progress-sync": ["0.3.13"],
     }
     assert subprocess.run(["sh", "-n", str(resident_root / "run.sh")], check=False).returncode == 0
 
@@ -3089,7 +3210,7 @@ def test_resident_hook_repairs_matching_cache_and_runtime_corruption_from_manage
         platform="unsupported",
     )
     managed = resident_root / "marketplace/current/plugins/linear-progress-sync"
-    cache = codex_home / "plugins/cache/coreedge-local/linear-progress-sync/0.3.12"
+    cache = codex_home / "plugins/cache/coreedge-local/linear-progress-sync/0.3.13"
     runtime = resident_root / "runtime/current"
     corrupt_content = (managed / "scripts/linear_sync.py").read_bytes()
     (cache / "scripts/update_plugin.py").write_bytes(corrupt_content)
@@ -4378,7 +4499,7 @@ def test_resident_doctor_reports_content_corruption_and_unloaded_service(tmp_pat
     broken_cache_script = (
         cache_root
         / "linear-progress-sync"
-        / "0.3.12"
+        / "0.3.13"
         / "scripts"
         / "update_plugin.py"
     )
@@ -4627,7 +4748,7 @@ def test_readmes_register_linear_mcp_before_linear_login():
         assert "saves it in `~/.codex/linear-sync/repos.json`" in text
         assert "update_plugin.py --force" in text
         assert "update_plugin.py --doctor" in text
-        assert "`0.3.12`" in text
+        assert "`0.3.13`" in text
         assert "hook-triggered parent and subagent rollout capture" in text
         assert "renewal thread" in text
         assert "every 30 minutes" in text

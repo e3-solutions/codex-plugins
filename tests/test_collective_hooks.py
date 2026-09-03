@@ -24,6 +24,14 @@ def load_collective(path: Path, name: str):
     return module
 
 
+def load_session_logging(path: Path, name: str):
+    spec = importlib.util.spec_from_file_location(name, path / "session_logging.py")
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
+
+
 @pytest.fixture(params=[CODEX_SCRIPTS, CLAUDE_SCRIPTS], ids=["codex", "claude"])
 def collective(request):
     return load_collective(request.param, f"collective_{request.param.parent.name}")
@@ -105,10 +113,35 @@ def test_agent_collective_modules_are_identical_and_have_no_network_imports():
     assert "submit" not in {node.attr for node in ast.walk(tree) if isinstance(node, ast.Attribute)}
 
 
+@pytest.mark.parametrize("scripts", [CODEX_SCRIPTS, CLAUDE_SCRIPTS], ids=["codex", "claude"])
+def test_collective_eligibility_accepts_only_verified_github_ssh_aliases(scripts, monkeypatch):
+    logging = load_session_logging(scripts, f"session_logging_{scripts.parent.name}")
+    monkeypatch.setattr(
+        logging,
+        "ssh_host_resolves_to_github",
+        lambda host: host == "work-github",
+    )
+
+    assert logging.remote_belongs_to_org(
+        "git@work-github:e3-solutions/example.git",
+        "e3-solutions",
+    )
+    assert not logging.remote_belongs_to_org(
+        "git@unverified:e3-solutions/example.git",
+        "e3-solutions",
+    )
+
+
 def test_session_context_is_eligible_and_opt_out_bounded(collective, monkeypatch):
     monkeypatch.delenv("E3_COLLECTIVE_HOOK_ENABLED", raising=False)
     context = collective.session_context(eligible=True)
     assert "private review queue" in context
+    assert "Query authoritative systems for current state" in context
+    assert "directly queryable facts such as access, health, PR, deployment, or configuration status" in context
+    assert "search published Forum work" in context
+    assert "repository, ticket, service, PR, and topic" in context
+    assert "supports, challenges, or supersedes" in context
+    assert "observation time and source provenance" in context
     assert "If Forum is unavailable" in context
     assert collective.session_context(eligible=False) is None
 
@@ -155,6 +188,43 @@ def test_session_start_process_injects_context_for_e3_even_if_logging_fails(
     "agent,scripts",
     [("codex", CODEX_SCRIPTS), ("claude", CLAUDE_SCRIPTS)],
 )
+@pytest.mark.parametrize("source", [None, "", "clear", "unknown"])
+def test_session_start_process_fails_closed_for_other_sources(tmp_path, agent, scripts, source):
+    repo = init_git_repo(tmp_path / f"{agent}-repo", "https://github.com/e3-solutions/example.git")
+    env = base_env(tmp_path, agent=agent)
+    payload = {
+        "hook_event_name": "SessionStart",
+        "session_id": "test-session",
+        "cwd": str(repo),
+    }
+    if source is not None:
+        payload["source"] = source
+
+    result = run_hook(scripts, "session_start", payload, env=env)
+
+    assert result.returncode == 0
+    assert result.stdout == ""
+
+
+def test_only_session_start_hook_scripts_reference_collective_guidance():
+    manifests = (
+        ROOT / "plugins/codex-session-logging/hooks/hooks.json",
+        ROOT / "plugins/claude-session-logging/hooks/hooks.json",
+    )
+    for manifest_path in manifests:
+        hooks = json.loads(manifest_path.read_text(encoding="utf-8"))["hooks"]
+        for event, registrations in hooks.items():
+            serialized = json.dumps(registrations)
+            if event == "SessionStart":
+                assert "session_start.py" in serialized
+                continue
+            assert "collective" not in serialized
+
+
+@pytest.mark.parametrize(
+    "agent,scripts",
+    [("codex", CODEX_SCRIPTS), ("claude", CLAUDE_SCRIPTS)],
+)
 def test_stop_process_is_silent_for_substantive_completion(
     tmp_path,
     agent,
@@ -184,13 +254,41 @@ def test_stop_process_is_silent_for_substantive_completion(
     "agent,scripts",
     [("codex", CODEX_SCRIPTS), ("claude", CLAUDE_SCRIPTS)],
 )
+def test_user_prompt_submit_process_is_silent_in_e3(tmp_path, agent, scripts):
+    repo = init_git_repo(tmp_path / f"{agent}-repo", "git@github.com:e3-solutions/example.git")
+    env = base_env(tmp_path, agent=agent)
+    result = run_hook(
+        scripts,
+        "user_prompt_submit",
+        {
+            "hook_event_name": "UserPromptSubmit",
+            "session_id": "test-session",
+            "cwd": str(repo),
+            "prompt": "ordinary request",
+        },
+        env=env,
+    )
+
+    assert result.returncode == 0
+    assert result.stdout == ""
+
+
+@pytest.mark.parametrize(
+    "agent,scripts",
+    [("codex", CODEX_SCRIPTS), ("claude", CLAUDE_SCRIPTS)],
+)
 def test_hook_processes_are_silent_outside_e3(tmp_path, agent, scripts):
     repo = init_git_repo(tmp_path / f"{agent}-repo", "https://github.com/example/project.git")
     env = base_env(tmp_path, agent=agent)
     start = run_hook(
         scripts,
         "session_start",
-        {"hook_event_name": "SessionStart", "session_id": "test-session", "cwd": str(repo)},
+        {
+            "hook_event_name": "SessionStart",
+            "session_id": "test-session",
+            "cwd": str(repo),
+            "source": "startup",
+        },
         env=env,
     )
     stop = run_hook(
@@ -221,7 +319,7 @@ def test_claude_logging_org_override_cannot_expand_collective_scope(tmp_path):
     start = run_hook(
         CLAUDE_SCRIPTS,
         "session_start",
-        {**payload, "hook_event_name": "SessionStart"},
+        {**payload, "hook_event_name": "SessionStart", "source": "startup"},
         env=env,
     )
     stop = run_hook(

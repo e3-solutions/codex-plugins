@@ -39,8 +39,9 @@ DEFAULT_SUPABASE_URL = "https://pmdfllwuctzkdjiehezq.supabase.co"
 DEFAULT_INGEST_URL = f"{DEFAULT_SUPABASE_URL}/functions/v1/codex-session-ingest"
 DEFAULT_BUCKET = "codex-sessions"
 ALLOWED_GITHUB_ORG = "e3-solutions"
+COLLECTIVE_SESSION_SOURCES = frozenset({"startup", "resume", "compact"})
 EXCERPT_BYTES = 4096
-PLUGIN_VERSION = "0.2.13"
+PLUGIN_VERSION = "0.2.14"
 PERMANENT_HTTP_STATUSES = {400, 413, 415, 422}
 _SESSION_UPLOAD_LOCKS: dict[str, threading.Lock] = {}
 _SESSION_UPLOAD_LOCKS_GUARD = threading.Lock()
@@ -513,6 +514,9 @@ def should_capture_payload(payload: JsonDict) -> bool:
 
 
 def should_prompt_collective(payload: JsonDict) -> bool:
+    source = first_string(payload, "source")
+    if not source or source.strip().lower() not in COLLECTIVE_SESSION_SOURCES:
+        return False
     cwd = first_string(payload, "cwd") or os.getcwd()
     remote = git_origin_remote(cwd)
     return remote_belongs_to_org(remote, ALLOWED_GITHUB_ORG)

@@ -11,12 +11,16 @@ import os
 
 COLLECTIVE_ENABLED_ENV = "E3_COLLECTIVE_HOOK_ENABLED"
 SESSION_CONTEXT = (
-    "E3 Collective: keep useful insights, observations, partial results, open questions, failed "
-    "approaches, and evidence in mind during this task. Before finishing, use Cosmos Forum to "
-    "submit one brief candidate to the private review queue when it could help another E3 agent. "
-    "Include source provenance when available. Never share secrets, private or restricted material, "
-    "routine status, raw logs, or duplicates. If Forum is unavailable or there is no useful learning, "
-    "finish normally."
+    "E3 Collective: use Cosmos Forum to learn from relevant prior E3 reasoning, decisions, "
+    "investigations, failures, and methods. Query authoritative systems for current state; do not "
+    "use or submit Forum as a cache of directly queryable facts such as access, health, PR, "
+    "deployment, or configuration status. Before finishing, if this work produced a reusable "
+    "non-queryable insight or materially changed prior Collective knowledge, search published Forum "
+    "work using the repository, ticket, service, PR, and topic. Submit one concise candidate to the "
+    "private review queue, link relevant work as supports, challenges, or supersedes, and include an "
+    "observation time and source provenance when needed. Never share secrets, private or restricted "
+    "material, routine status, raw logs, or duplicates. If Forum is unavailable or there is no useful "
+    "learning, finish normally."
 )
 
 
