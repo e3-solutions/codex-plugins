@@ -132,16 +132,33 @@ def test_collective_eligibility_accepts_only_verified_github_ssh_aliases(scripts
     )
 
 
+def test_context_requires_a_general_lesson_in_the_full_body(collective, monkeypatch):
+    monkeypatch.delenv("E3_COLLECTIVE_HOOK_ENABLED", raising=False)
+    context = collective.session_context(eligible=True)
+    for required in (
+        "Query authoritative systems for current state",
+        "full post, not just its title",
+        "Evidence/example",
+        "remove the specific example",
+        "trace fallback paths and side effects",
+        "supports, challenges, or supersedes",
+        "approval is required before publication",
+        "Do not manufacture a post",
+    ):
+        assert required in context
+    assert len(context) <= 2600
+
+
 def test_session_context_is_eligible_and_opt_out_bounded(collective, monkeypatch):
     monkeypatch.delenv("E3_COLLECTIVE_HOOK_ENABLED", raising=False)
     context = collective.session_context(eligible=True)
     assert "private review queue" in context
     assert "Query authoritative systems for current state" in context
-    assert "directly queryable facts such as access, health, PR, deployment, or configuration status" in context
-    assert "search published Forum work" in context
+    assert "directly queryable access, health, PR, deployment, customer, or configuration status" in context
+    assert "Search published Forum work" in context
     assert "repository, ticket, service, PR, and topic" in context
     assert "supports, challenges, or supersedes" in context
-    assert "observation time and source provenance" in context
+    assert "dated Evidence/example section with source provenance" in context
     assert "If Forum is unavailable" in context
     assert collective.session_context(eligible=False) is None
 
@@ -181,6 +198,8 @@ def test_session_start_process_injects_context_for_e3_even_if_logging_fails(
 
     assert result.returncode == 0
     assert "E3 Collective:" in result.stdout
+    expected = load_collective(scripts, f"emitted_{agent}").SESSION_CONTEXT
+    assert result.stdout.strip() == expected
     assert "capture failed" in result.stderr
 
 
@@ -188,7 +207,7 @@ def test_session_start_process_injects_context_for_e3_even_if_logging_fails(
     "agent,scripts",
     [("codex", CODEX_SCRIPTS), ("claude", CLAUDE_SCRIPTS)],
 )
-@pytest.mark.parametrize("source", [None, "", "clear", "unknown"])
+@pytest.mark.parametrize("source", [None, "", "clear", "unknown", "user_prompt"])
 def test_session_start_process_fails_closed_for_other_sources(tmp_path, agent, scripts, source):
     repo = init_git_repo(tmp_path / f"{agent}-repo", "https://github.com/e3-solutions/example.git")
     env = base_env(tmp_path, agent=agent)
@@ -204,6 +223,34 @@ def test_session_start_process_fails_closed_for_other_sources(tmp_path, agent, s
 
     assert result.returncode == 0
     assert result.stdout == ""
+
+
+@pytest.mark.parametrize("source", ["startup", "resume", "compact"])
+@pytest.mark.parametrize("agent,scripts", [("codex", CODEX_SCRIPTS), ("claude", CLAUDE_SCRIPTS)])
+@pytest.mark.parametrize("allowed,enabled", [(False, True), (True, False)])
+def test_start_context_respects_scope_and_opt_out(tmp_path, source, agent, scripts, allowed, enabled):
+    org = "e3-solutions" if allowed else "example"
+    repo = init_git_repo(tmp_path / "repo", f"https://github.com/{org}/example.git")
+    env = base_env(tmp_path, agent=agent)
+    env["E3_COLLECTIVE_HOOK_ENABLED"] = "1" if enabled else "0"
+    result = run_hook(scripts, "session_start", {
+        "hook_event_name": "SessionStart", "session_id": "test-session",
+        "cwd": str(repo), "source": source,
+    }, env=env)
+    assert result.returncode == 0
+    assert result.stdout == ""
+
+
+@pytest.mark.parametrize("hook", ["pre_tool_use", "post_tool_use"])
+@pytest.mark.parametrize("agent,scripts", [("codex", CODEX_SCRIPTS), ("claude", CLAUDE_SCRIPTS)])
+def test_ordinary_turn_hooks_do_not_emit_collective_context(tmp_path, hook, agent, scripts):
+    repo = init_git_repo(tmp_path / "repo", "https://github.com/e3-solutions/example.git")
+    result = run_hook(scripts, hook, {
+        "session_id": "test-session", "cwd": str(repo), "source": "startup",
+        "tool_name": "Read", "prompt": "ordinary local test",
+    }, env=base_env(tmp_path, agent=agent))
+    assert result.returncode == 0
+    assert "E3 Collective:" not in result.stdout
 
 
 def test_only_session_start_hook_scripts_reference_collective_guidance():
