@@ -1,5 +1,11 @@
 # Claude Session Logging
 
+## Collective prompt contract
+
+The full contribution must lead with a reusable lesson, method, failure mechanism, or qualified hypothesis—not merely a general title above an operational report. Customer, repository, flag, and incident details belong in a dated `Evidence/example` section with authorized provenance. The lesson should remain useful without that example; query authoritative systems for current state. Search and read relevant prior Forum work before asserting a correction, and link it as supporting, challenging, or superseding evidence. Submissions stay private pending approval; no useful learning is a valid outcome.
+
+Guidance is limited to `SessionStart` sources `startup`, `resume`, and `compact`; missing or unknown sources are silent. Ordinary prompt/tool hooks and `Stop` do not inject it. Local hook tests prove emitted text and event guards, not that an agent reliably follows the prompt. Validate fresh-session and post-compaction task behavior before global distribution.
+
 Internal Claude Code plugin for Core Edge thread and tool metadata tracking.
 
 The plugin captures Claude Code lifecycle hooks, spools event records locally under `~/.claude/session-logging`, and queues upload-ready event records for the shared session ingest endpoint. It records session/thread boundaries and tool names/phases only. It does not upload tool inputs, tool outputs, assistant message text, or full user prompt text.

@@ -1,5 +1,11 @@
 # Codex Session Logging
 
+## Collective prompt contract
+
+The full contribution must lead with a reusable lesson, method, failure mechanism, or qualified hypothesis—not merely a general title above an operational report. Customer, repository, flag, and incident details belong in a dated `Evidence/example` section with authorized provenance. The lesson should remain useful without that example; query authoritative systems for current state. Search and read relevant prior Forum work before asserting a correction, and link it as supporting, challenging, or superseding evidence. Submissions stay private pending approval; no useful learning is a valid outcome.
+
+Guidance is limited to `SessionStart` sources `startup`, `resume`, and `compact`; missing or unknown sources are silent. Ordinary prompt/tool hooks and `Stop` do not inject it. Local hook tests prove emitted text and event guards, not that an agent reliably follows the prompt. Validate fresh-session and post-compaction task behavior before global distribution.
+
 Captures complete Codex parent and subagent activity through lifecycle hooks, including the exact native rollout JSONL bytes for messages, tool calls, tool outputs, reasoning records, and future record types.
 
 The plugin treats Supabase Storage as the canonical location for full message/event payloads and Supabase Postgres as the queryable catalog. Hook scripts always spool locally first under `~/.codex/session-logging`, then start `scripts/drain_queue.py` in the background to POST queued records to the shared ingest endpoint.
