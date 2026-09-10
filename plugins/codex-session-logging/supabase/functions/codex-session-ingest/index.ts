@@ -161,6 +161,7 @@ export async function handleRequest(req: Request): Promise<Response> {
             optionalObject(sanitizedEvent.metadata),
           );
           await upsertEvent(record, userId, storagePath, sanitizedEvent);
+          await publishSessionChangeMarker(sessionId, userId);
         })
       ) {
         return ignoredSessionResponse(record);
@@ -179,8 +180,15 @@ export async function handleRequest(req: Request): Promise<Response> {
     await uploadStorageObject(storagePath, message);
     if (
       await finishSessionObjectWrite(record, storagePath, async () => {
-        await upsertSession(record, client, userId, remote, existing);
+        await upsertSession(
+          record,
+          client,
+          userId,
+          remote,
+          existing,
+        );
         await upsertMessage(record, userId, storagePath);
+        await publishSessionChangeMarker(sessionId, userId);
       })
     ) {
       return ignoredSessionResponse(record);
@@ -349,6 +357,7 @@ async function ingestRolloutChunk(
           metadata,
         );
         await upsertEvent(catalogRecord, userId, storagePath, event);
+        await publishSessionChangeMarker(sessionId, userId);
       },
     )
   ) {
@@ -734,6 +743,26 @@ async function upsertSession(
     updated_at: new Date().toISOString(),
   };
   await restUpsert("codex_sessions", row, "id");
+}
+
+async function publishSessionChangeMarker(
+  sessionId: string,
+  userId: string,
+): Promise<void> {
+  await supabaseFetch(
+    "/rest/v1/rpc/publish_codex_session_change",
+    {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "prefer": "return=minimal",
+      },
+      body: JSON.stringify({
+        p_session_id: sessionId,
+        p_user_id: userId,
+      }),
+    },
+  );
 }
 
 async function upsertSessionUser(

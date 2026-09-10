@@ -639,6 +639,190 @@ Deno.test("handleRequest preserves a reserved object when cataloging fails", asy
   }
 });
 
+Deno.test("handleRequest publishes the session change marker after message commit", async () => {
+  const originalFetch = globalThis.fetch;
+  const previousUrl = Deno.env.get("SUPABASE_URL");
+  const previousServiceRole = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
+  const requests: Array<{
+    url: string;
+    method: string;
+    body: JsonObject | null;
+  }> = [];
+  Deno.env.set("SUPABASE_URL", "https://project.supabase.co");
+  Deno.env.set("SUPABASE_SERVICE_ROLE_KEY", "service-role-key");
+  globalThis.fetch = (input, init = {}) => {
+    const url = input instanceof Request
+      ? input.url
+      : input instanceof URL
+      ? input.toString()
+      : input;
+    const requestInit = init as { method?: string; body?: BodyInit | null };
+    const method = requestInit.method ?? "GET";
+    const body = typeof requestInit.body === "string"
+      ? JSON.parse(requestInit.body) as JsonObject
+      : null;
+    requests.push({ url, method, body });
+    if (url.includes("/rest/v1/rpc/reserve_codex_session_storage")) {
+      return Promise.resolve(reservedStorageResponse());
+    }
+    if (
+      url.includes("/rest/v1/codex_ignored_sessions?") ||
+      url.includes("/rest/v1/codex_sessions?select=") ||
+      url.includes("/rest/v1/codex_session_users?select=")
+    ) {
+      return Promise.resolve(
+        new Response(JSON.stringify([]), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+      );
+    }
+    return Promise.resolve(new Response("", { status: 201 }));
+  };
+
+  try {
+    const response = await handleRequest(
+      new Request("https://example.test/codex-session-ingest", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          version: 1,
+          record: {
+            id: "804fd832-7779-4665-9bec-2f10462c721b",
+            type: "message",
+            session_id: "commit-complete-session",
+            seq: 1,
+            role: "user",
+            content_sha256:
+              "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824",
+            content_byte_size: 5,
+            created_at: "2026-07-07T00:00:00.000Z",
+          },
+          message: { content: "hello" },
+          client: {
+            repo_remote: "https://github.com/e3-solutions/codex-plugins.git",
+            installation_id: "install-1",
+          },
+        }),
+      }),
+    );
+    const discoveryIndex = requests.findIndex((request) =>
+      request.method === "POST" &&
+      request.url.includes("/rest/v1/codex_sessions?on_conflict=id")
+    );
+    const messageIndex = requests.findIndex((request) =>
+      request.method === "POST" &&
+      request.url.includes("/rest/v1/codex_session_messages?on_conflict=id")
+    );
+    const markerIndex = requests.findIndex((request) =>
+      request.method === "POST" &&
+      request.url.includes(
+        "/rest/v1/rpc/publish_codex_session_change",
+      )
+    );
+
+    assertEquals(response.status, 200);
+    assertEquals(discoveryIndex >= 0, true);
+    assertEquals(messageIndex > discoveryIndex, true);
+    assertEquals(markerIndex > messageIndex, true);
+    assertEquals(requests[markerIndex]?.body, {
+      p_session_id: "commit-complete-session",
+      p_user_id: requests.find((request) =>
+        request.url.includes("/rest/v1/codex_sessions?on_conflict=id")
+      )?.body?.user_id,
+    });
+  } finally {
+    globalThis.fetch = originalFetch;
+    restoreEnv("SUPABASE_URL", previousUrl);
+    restoreEnv("SUPABASE_SERVICE_ROLE_KEY", previousServiceRole);
+  }
+});
+
+Deno.test("handleRequest safely retries an ambiguous change-marker failure", async () => {
+  const originalFetch = globalThis.fetch;
+  const previousUrl = Deno.env.get("SUPABASE_URL");
+  const previousServiceRole = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
+  let markerAttempts = 0;
+  let messageUpserts = 0;
+  Deno.env.set("SUPABASE_URL", "https://project.supabase.co");
+  Deno.env.set("SUPABASE_SERVICE_ROLE_KEY", "service-role-key");
+  globalThis.fetch = (input, init = {}) => {
+    const url = input instanceof Request
+      ? input.url
+      : input instanceof URL
+      ? input.toString()
+      : input;
+    if (url.includes("/rest/v1/rpc/reserve_codex_session_storage")) {
+      return Promise.resolve(reservedStorageResponse());
+    }
+    if (
+      url.includes("/rest/v1/codex_ignored_sessions?") ||
+      url.includes("/rest/v1/codex_sessions?select=") ||
+      url.includes("/rest/v1/codex_session_users?select=")
+    ) {
+      return Promise.resolve(
+        new Response(JSON.stringify([]), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+      );
+    }
+    if (url.includes("/rest/v1/codex_session_messages?on_conflict=id")) {
+      messageUpserts += 1;
+    }
+    if (url.includes("/rest/v1/rpc/publish_codex_session_change")) {
+      markerAttempts += 1;
+      if (markerAttempts === 1) {
+        return Promise.resolve(
+          new Response("ambiguous marker response", { status: 500 }),
+        );
+      }
+    }
+    return Promise.resolve(new Response("", { status: 201 }));
+  };
+
+  const request = () =>
+    handleRequest(
+      new Request("https://example.test/codex-session-ingest", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          version: 1,
+          record: {
+            id: "904fd832-7779-4665-9bec-2f10462c721b",
+            type: "message",
+            session_id: "retry-marker-session",
+            seq: 1,
+            role: "user",
+            content_sha256:
+              "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824",
+            content_byte_size: 5,
+            created_at: "2026-07-07T00:00:00.000Z",
+          },
+          message: { content: "hello" },
+          client: {
+            repo_remote: "https://github.com/e3-solutions/codex-plugins.git",
+            installation_id: "install-1",
+          },
+        }),
+      }),
+    );
+
+  try {
+    const first = await request();
+    const second = await request();
+
+    assertEquals(first.status, 500);
+    assertEquals(second.status, 200);
+    assertEquals(messageUpserts, 2);
+    assertEquals(markerAttempts, 2);
+  } finally {
+    globalThis.fetch = originalFetch;
+    restoreEnv("SUPABASE_URL", previousUrl);
+    restoreEnv("SUPABASE_SERVICE_ROLE_KEY", previousServiceRole);
+  }
+});
+
 Deno.test("handleRequest reserves storage before the first upload", async () => {
   const originalFetch = globalThis.fetch;
   const previousUrl = Deno.env.get("SUPABASE_URL");
