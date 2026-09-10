@@ -142,12 +142,13 @@ def teammate_readiness(
     ).expanduser().resolve()
     root = Path(target_repo_root or os.getcwd()).expanduser().resolve()
     plugin = _session_logging_install(codex_home)
-    hooks = _session_logging_hooks(codex_home)
+    hooks = _session_logging_hooks(codex_home, plugin.get("selected_version"))
     upload = _session_logging_upload(codex_home)
     repository = _repository_readiness(root)
     cosmos = _cosmos_readiness(codex_home)
 
     issues: list[str] = []
+    warnings: list[str] = []
     if not plugin["installed"]:
         issues.append("Codex Session Logging plugin is not installed.")
     elif not plugin["enabled"]:
@@ -157,14 +158,17 @@ def teammate_readiness(
     if not upload["enabled"]:
         issues.append("Session upload is disabled; remove the opt-out before expecting new sessions to sync.")
     if upload["dead_letter"]:
-        issues.append("Session logging has dead-letter records that need local inspection.")
+        warnings.append(
+            "Session logging has dead-letter records that need local inspection; "
+            "their presence alone does not prove the current live path is blocked."
+        )
     if repository["eligible"] is not True:
         issues.append("The target repository origin is not a verified e3-solutions GitHub remote.")
     if not cosmos["configured"]:
         issues.append("E3 Cosmos is not configured at the expected endpoint.")
 
     locally_ready = not issues
-    next_steps = list(issues)
+    next_steps = [*issues, *warnings]
     if locally_ready:
         next_steps.append(
             "In Codex, verify E3 Cosmos identity and confirm the Sesh search tool is exposed; "
@@ -182,43 +186,68 @@ def teammate_readiness(
             "e3_cosmos": cosmos,
         },
         "issues": issues,
+        "warnings": warnings,
         "next_steps": next_steps,
     }
 
 
 def _session_logging_install(codex_home: Path) -> dict:
-    manifests = sorted(
-        codex_home.glob("plugins/cache/*/codex-session-logging/*/.codex-plugin/plugin.json")
-    )
-    valid = []
-    for path in manifests:
-        try:
-            value = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            continue
-        if isinstance(value, dict) and value.get("name") == "codex-session-logging":
-            valid.append(value)
+    valid = _session_logging_manifests(codex_home)
     versions = sorted(
-        {str(item["version"]) for item in valid if isinstance(item.get("version"), str)}
+        {
+            str(manifest["version"])
+            for _, manifest in valid
+            if isinstance(manifest.get("version"), str)
+        }
+    )
+    selected = max(
+        valid,
+        key=lambda item: item[0].parents[1].stat().st_mtime_ns,
+        default=None,
+    )
+    selected_version = (
+        str(selected[1]["version"])
+        if selected and isinstance(selected[1].get("version"), str)
+        else None
     )
     config, _ = _read_codex_config(codex_home)
     plugins = config.get("plugins") if isinstance(config, dict) else None
     configured = plugins.get("codex-session-logging@coreedge-local") if isinstance(plugins, dict) else None
     enabled = isinstance(configured, dict) and configured.get("enabled") is True
-    return {"installed": bool(valid), "enabled": enabled, "versions": versions}
+    return {
+        "installed": bool(valid),
+        "enabled": enabled,
+        "versions": versions,
+        "selected_version": selected_version,
+    }
 
 
-def _session_logging_hooks(codex_home: Path) -> dict:
+def _session_logging_manifests(codex_home: Path) -> list[tuple[Path, dict]]:
+    valid: list[tuple[Path, dict]] = []
+    for path in sorted(
+        codex_home.glob(
+            "plugins/cache/coreedge-local/codex-session-logging/*/.codex-plugin/plugin.json"
+        )
+    ):
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if isinstance(value, dict) and value.get("name") == "codex-session-logging":
+            valid.append((path, value))
+    return valid
+
+
+def _session_logging_hooks(codex_home: Path, selected_version: str | None) -> dict:
     valid_events = set()
     declared_events = set()
-    manifests = codex_home.glob(
-        "plugins/cache/*/codex-session-logging/*/.codex-plugin/plugin.json"
-    )
-    for manifest_path in manifests:
+    selected_manifests = [
+        item
+        for item in _session_logging_manifests(codex_home)
+        if item[1].get("version") == selected_version
+    ]
+    for manifest_path, manifest in selected_manifests:
         try:
-            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-            if not isinstance(manifest, dict) or manifest.get("name") != "codex-session-logging":
-                continue
             plugin_root = manifest_path.parents[1].resolve()
             relative = manifest.get("hooks")
             if not isinstance(relative, str) or not relative:

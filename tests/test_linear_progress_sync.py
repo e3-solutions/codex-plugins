@@ -2159,6 +2159,7 @@ def test_sesh_doctor_reports_local_readiness_and_queue_counts(tmp_path, monkeypa
         "installed": True,
         "enabled": True,
         "versions": ["0.2.16"],
+        "selected_version": "0.2.16",
     }
     assert result["checks"]["session_logging_hooks"] == {
         "installed": True,
@@ -2205,7 +2206,33 @@ def test_sesh_doctor_reports_actionable_failures_without_exposing_remote_secrets
     assert result["checks"]["e3_cosmos"]["configured"] is False
     assert "private-user" not in rendered
     assert "private-token" not in rendered
-    assert any("dead-letter" in issue for issue in result["issues"])
+    assert not any("dead-letter" in issue for issue in result["issues"])
+    assert any("dead-letter" in warning for warning in result["warnings"])
+
+
+def test_sesh_doctor_treats_dead_letters_as_a_warning_not_a_readiness_failure(
+    tmp_path, monkeypatch
+):
+    codex_home = write_ready_sesh_doctor_home(tmp_path / "codex")
+    dead = codex_home / "session-logging/queue/dead-letter/old.json"
+    dead.parent.mkdir(parents=True)
+    dead.write_text("{}", encoding="utf-8")
+    repo = init_doctor_repo(
+        tmp_path / "repo",
+        "git@github.com:e3-solutions/codex-plugins.git",
+    )
+    monkeypatch.delenv("CODEX_SESSION_LOG_AUTO_UPLOAD", raising=False)
+    monkeypatch.delenv("CODEX_SESSION_LOG_STATE_DIR", raising=False)
+
+    result = linear_setup.teammate_readiness(
+        target_repo_root=repo,
+        codex_home_path=codex_home,
+    )
+
+    assert result["locally_ready"] is True
+    assert result["issues"] == []
+    assert len(result["warnings"]) == 1
+    assert "dead-letter" in result["warnings"][0]
 
 
 def test_sesh_doctor_summary_requires_live_cosmos_verification(tmp_path, monkeypatch, capsys):
@@ -2270,6 +2297,42 @@ def test_sesh_doctor_rejects_partial_native_hook_manifest(tmp_path, monkeypatch)
     assert hooks["installed"] is False
     assert hooks["missing_events"] == ["UserPromptSubmit"]
     assert hooks["malformed_events"] == []
+    assert result["locally_ready"] is False
+
+
+def test_sesh_doctor_validates_only_the_selected_cached_plugin_version(tmp_path, monkeypatch):
+    codex_home = write_ready_sesh_doctor_home(tmp_path / "codex")
+    old_root = next(
+        codex_home.glob("plugins/cache/coreedge-local/codex-session-logging/0.2.16")
+    )
+    selected_root = old_root.parent / "0.2.17"
+    shutil.copytree(old_root, selected_root)
+    selected_manifest = selected_root / ".codex-plugin/plugin.json"
+    manifest = json.loads(selected_manifest.read_text(encoding="utf-8"))
+    manifest["version"] = "0.2.17"
+    selected_manifest.write_text(json.dumps(manifest), encoding="utf-8")
+    selected_hooks = selected_root / "hooks/hooks.json"
+    hooks = json.loads(selected_hooks.read_text(encoding="utf-8"))
+    del hooks["hooks"]["UserPromptSubmit"]
+    selected_hooks.write_text(json.dumps(hooks), encoding="utf-8")
+    os.utime(selected_root, None)
+    repo = init_doctor_repo(
+        tmp_path / "repo",
+        "git@github.com:e3-solutions/codex-plugins.git",
+    )
+    monkeypatch.delenv("CODEX_SESSION_LOG_AUTO_UPLOAD", raising=False)
+    monkeypatch.delenv("CODEX_SESSION_LOG_STATE_DIR", raising=False)
+
+    result = linear_setup.teammate_readiness(
+        target_repo_root=repo,
+        codex_home_path=codex_home,
+    )
+
+    assert result["checks"]["session_logging_plugin"]["selected_version"] == "0.2.17"
+    assert result["checks"]["session_logging_hooks"]["installed"] is False
+    assert result["checks"]["session_logging_hooks"]["missing_events"] == [
+        "UserPromptSubmit"
+    ]
     assert result["locally_ready"] is False
 
 
