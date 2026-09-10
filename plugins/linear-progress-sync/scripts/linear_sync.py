@@ -37,6 +37,7 @@ DRY_RUN_ENV = "LINEAR_SYNC_DRY_RUN"
 CODEX_COMMAND_ENV = "LINEAR_SYNC_CODEX_COMMAND"
 ALLOWED_GITHUB_ORG = "e3-solutions"
 LINEAR_MCP_URL = "https://mcp.linear.app/mcp"
+E3_COSMOS_MCP_URL = "https://cosmos.e3g.ai/e3/mcp"
 LINEAR_HOOK_EVENTS = ("SessionStart", "PreToolUse", "PostToolUse")
 NATIVE_HOOK_PLUGINS = ("linear-progress-sync", "codex-session-logging")
 READ_ONLY_BASH_EXECUTABLES = {
@@ -1138,6 +1139,7 @@ def setup_plan(
             ]
         ),
         shlex.join(["codex", "mcp", "add", "linear", "--url", LINEAR_MCP_URL]),
+        shlex.join(["codex", "mcp", "add", "e3-cosmos", "--url", E3_COSMOS_MCP_URL]),
     ]
     if with_git_hook:
         hook_script = plugin_root / "plugins" / "linear-progress-sync" / "scripts" / "install_git_hook.py"
@@ -1152,6 +1154,8 @@ def setup_plan(
             "Default setup is user-level: plugin marketplace, plugin install, legacy global hook cleanup, GitHub auth check, and Linear MCP registration.",
             "GitHub auth is a manual prerequisite: run gh auth login when needed.",
             "Linear auth is manual after setup registers the MCP server: run codex mcp login linear after setup when needed.",
+            "E3 Cosmos auth is manual after setup registers the MCP server: run codex mcp login e3-cosmos; then verify Sesh search and opening a returned Coding Sessions source in Codex.",
+            "Run setup.py --doctor from the marketplace clone or installed linear-progress-sync plugin cache for non-networking teammate readiness checks.",
             "If Codex asks to review hooks, trust the Linear Progress Sync and Codex Session Logging hooks once so kickoff and session capture can run.",
             "First use lists Linear users, asks which user to save, and stores it in ~/.codex/linear-sync/user.json for all repos.",
             "First use in a repo lists Linear teams/projects, asks which project to save, and stores it in ~/.codex/linear-sync/repos.json.",

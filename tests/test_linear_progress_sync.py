@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import importlib.util
 import hashlib
+import importlib.util
 import json
 import os
 import shlex
@@ -13,7 +13,6 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
-
 
 ROOT = Path(__file__).resolve().parents[1]
 MODULE_PATH = ROOT / "plugins" / "linear-progress-sync" / "scripts" / "linear_sync.py"
@@ -1988,8 +1987,18 @@ def test_setup_plan_is_global_by_default_and_does_not_install_repo_hook(tmp_path
     assert "codex plugin add codex-session-logging@coreedge-local" in commands
     assert "install_codex_hooks.py" in commands
     assert "codex mcp add linear --url https://mcp.linear.app/mcp" in commands
+    assert "codex mcp add e3-cosmos --url https://cosmos.e3g.ai/e3/mcp" in commands
+    cosmos_command = "codex mcp add e3-cosmos --url https://cosmos.e3g.ai/e3/mcp"
+    assert plan["commands"].count(cosmos_command) == 1
+    assert plan["commands"].index(cosmos_command) > plan["commands"].index(
+        "codex mcp add linear --url https://mcp.linear.app/mcp"
+    )
     assert "codex mcp login linear" not in commands
+    assert "codex mcp login e3-cosmos" not in commands
     assert "codex mcp login linear after setup" in notes
+    assert "codex mcp login e3-cosmos" in notes
+    assert "verify Sesh search" in notes
+    assert "setup.py --doctor" in notes
     assert "review hooks" in notes
     assert "Codex Session Logging hooks" in notes
     assert "First use lists Linear users" in notes
@@ -2044,12 +2053,318 @@ def test_setup_summary_prints_team_next_steps(capsys):
     output = capsys.readouterr().out
 
     assert "Run: codex mcp login linear" in output
+    assert "Run: codex mcp login e3-cosmos" in output
+    assert "Verify Sesh search returns evidence" in output
+    assert "open one returned Coding Sessions source" in output
+    assert "setup.py --doctor from this clone or the installed plugin cache" in output
     assert "trust the Linear Progress Sync and Codex Session Logging hooks once" in output
     assert "list Linear users/projects" in output
     assert "--disable-linear-sync" in output
     assert "LINEAR_SYNC_AUTO_UPDATE=0" in output
     assert "Before Linear kickoff, file edits, write-like Bash commands, and branch creation wait" in output
     assert "No per-repo setup is needed" in output
+
+
+def write_ready_sesh_doctor_home(path: Path) -> Path:
+    manifest = (
+        path
+        / "plugins/cache/coreedge-local/codex-session-logging/0.2.16/.codex-plugin/plugin.json"
+    )
+    manifest.parent.mkdir(parents=True)
+    manifest.write_text(
+        json.dumps(
+            {
+                "name": "codex-session-logging",
+                "version": "0.2.16",
+                "hooks": "./hooks/hooks.json",
+            }
+        ),
+        encoding="utf-8",
+    )
+    plugin_hooks = manifest.parents[1] / "hooks/hooks.json"
+    plugin_hooks.parent.mkdir()
+    plugin_hooks.write_text(
+        json.dumps(
+            {
+                "hooks": {
+                    event: [
+                        {
+                            "hooks": [
+                                {
+                                    "type": "command",
+                                    "command": f"python3 /managed/codex-session-logging/{event}.py",
+                                }
+                            ]
+                        }
+                    ]
+                    for event in (
+                        "SessionStart",
+                        "PreToolUse",
+                        "PostToolUse",
+                        "UserPromptSubmit",
+                        "Stop",
+                    )
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    preferences = path / "session-logging/preferences.json"
+    preferences.parent.mkdir(parents=True)
+    preferences.write_text(json.dumps({"enabled": True}), encoding="utf-8")
+    (path / "config.toml").write_text(
+        '''[plugins."codex-session-logging@coreedge-local"]
+enabled = true
+
+[mcp_servers."e3-cosmos"]
+url = "https://cosmos.e3g.ai/e3/mcp"
+
+[mcp_servers."e3-cosmos".tools.sesh__search_coding_sessions]
+approval_mode = "approve"
+
+[mcp_servers."e3-cosmos".tools.timetracker__get_chat]
+approval_mode = "approve"
+''',
+        encoding="utf-8",
+    )
+    return path
+
+
+def init_doctor_repo(path: Path, remote: str) -> Path:
+    path.mkdir()
+    subprocess.run(["git", "init", "-q", str(path)], check=True)
+    subprocess.run(["git", "-C", str(path), "remote", "add", "origin", remote], check=True)
+    return path
+
+
+def test_sesh_doctor_reports_local_readiness_and_queue_counts(tmp_path, monkeypatch):
+    codex_home = write_ready_sesh_doctor_home(tmp_path / "codex")
+    repo = init_doctor_repo(tmp_path / "repo", "git@github.com:e3-solutions/codex-plugins.git")
+    monkeypatch.delenv("CODEX_SESSION_LOG_AUTO_UPLOAD", raising=False)
+    monkeypatch.delenv("CODEX_SESSION_LOG_STATE_DIR", raising=False)
+    for queue, count in (("pending", 2), ("processing", 1)):
+        directory = codex_home / "session-logging/queue" / queue
+        directory.mkdir(parents=True)
+        for index in range(count):
+            (directory / f"{index}.json").write_text("{}", encoding="utf-8")
+
+    result = linear_setup.teammate_readiness(
+        target_repo_root=repo,
+        codex_home_path=codex_home,
+    )
+
+    assert result["locally_ready"] is True
+    assert result["live_verification_required"] is True
+    assert result["checks"]["session_logging_plugin"] == {
+        "installed": True,
+        "enabled": True,
+        "versions": ["0.2.16"],
+    }
+    assert result["checks"]["session_logging_hooks"] == {
+        "installed": True,
+        "events": ["PostToolUse", "PreToolUse", "SessionStart", "Stop", "UserPromptSubmit"],
+        "missing_events": [],
+        "malformed_events": [],
+    }
+    assert result["checks"]["session_upload"]["pending"] == 2
+    assert result["checks"]["session_upload"]["processing"] == 1
+    assert result["checks"]["session_upload"]["dead_letter"] == 0
+    assert result["checks"]["repository"]["repository"] == "codex-plugins"
+    assert result["checks"]["e3_cosmos"]["configured"] is True
+    assert result["checks"]["e3_cosmos"]["authentication"] == "unverified_non_interactively"
+    assert result["checks"]["e3_cosmos"]["live_tool_exposure"] == "unverified_non_interactively"
+
+
+def test_sesh_doctor_reports_actionable_failures_without_exposing_remote_secrets(tmp_path, monkeypatch):
+    codex_home = tmp_path / "codex"
+    codex_home.mkdir()
+    (codex_home / "config.toml").write_text(
+        '[mcp_servers."e3-cosmos"]\nurl = "https://wrong.invalid/mcp"\n',
+        encoding="utf-8",
+    )
+    state = codex_home / "session-logging/queue/dead-letter"
+    state.mkdir(parents=True)
+    (state / "failed.json").write_text("{}", encoding="utf-8")
+    repo = init_doctor_repo(
+        tmp_path / "repo",
+        "https://private-user:private-token@github.com/not-e3/private.git",
+    )
+    monkeypatch.setenv("CODEX_SESSION_LOG_AUTO_UPLOAD", "0")
+    monkeypatch.delenv("CODEX_SESSION_LOG_STATE_DIR", raising=False)
+
+    result = linear_setup.teammate_readiness(
+        target_repo_root=repo,
+        codex_home_path=codex_home,
+    )
+    rendered = json.dumps(result, sort_keys=True)
+
+    assert result["locally_ready"] is False
+    assert result["checks"]["session_upload"]["enabled"] is False
+    assert result["checks"]["session_upload"]["dead_letter"] == 1
+    assert result["checks"]["repository"]["eligible"] is False
+    assert result["checks"]["e3_cosmos"]["configured"] is False
+    assert "private-user" not in rendered
+    assert "private-token" not in rendered
+    assert any("dead-letter" in issue for issue in result["issues"])
+
+
+def test_sesh_doctor_summary_requires_live_cosmos_verification(tmp_path, monkeypatch, capsys):
+    codex_home = write_ready_sesh_doctor_home(tmp_path / "codex")
+    repo = init_doctor_repo(tmp_path / "repo", "https://github.com/e3-solutions/negotiation.git")
+    monkeypatch.delenv("CODEX_SESSION_LOG_AUTO_UPLOAD", raising=False)
+    monkeypatch.delenv("CODEX_SESSION_LOG_STATE_DIR", raising=False)
+    result = linear_setup.teammate_readiness(
+        target_repo_root=repo,
+        codex_home_path=codex_home,
+    )
+
+    linear_setup.print_doctor_summary(result)
+    output = capsys.readouterr().out
+
+    assert "Local readiness: ready" in output
+    assert "sesh__search_coding_sessions" in output
+    assert "timetracker__get_chat" in output
+    assert "requires live verification in Codex" in output
+    assert "marketplace clone or the installed plugin cache" in output
+
+
+def test_sesh_doctor_accepts_plugin_native_hooks_without_legacy_global_hooks(tmp_path, monkeypatch):
+    codex_home = write_ready_sesh_doctor_home(tmp_path / "codex")
+    assert not (codex_home / "hooks.json").exists()
+    repo = init_doctor_repo(tmp_path / "repo", "git@github.com:e3-solutions/codex-plugins.git")
+    monkeypatch.delenv("CODEX_SESSION_LOG_AUTO_UPLOAD", raising=False)
+    monkeypatch.delenv("CODEX_SESSION_LOG_STATE_DIR", raising=False)
+
+    result = linear_setup.teammate_readiness(
+        target_repo_root=repo,
+        codex_home_path=codex_home,
+    )
+
+    assert result["checks"]["session_logging_plugin"]["enabled"] is True
+    assert result["checks"]["session_logging_hooks"]["installed"] is True
+    assert result["checks"]["session_logging_hooks"]["events"] == [
+        "PostToolUse",
+        "PreToolUse",
+        "SessionStart",
+        "Stop",
+        "UserPromptSubmit",
+    ]
+    assert result["locally_ready"] is True
+
+
+def test_sesh_doctor_rejects_partial_native_hook_manifest(tmp_path, monkeypatch):
+    codex_home = write_ready_sesh_doctor_home(tmp_path / "codex")
+    hook_path = next(codex_home.glob("plugins/cache/*/codex-session-logging/*/hooks/hooks.json"))
+    payload = json.loads(hook_path.read_text(encoding="utf-8"))
+    del payload["hooks"]["UserPromptSubmit"]
+    hook_path.write_text(json.dumps(payload), encoding="utf-8")
+    repo = init_doctor_repo(tmp_path / "repo", "git@github.com:e3-solutions/codex-plugins.git")
+    monkeypatch.delenv("CODEX_SESSION_LOG_AUTO_UPLOAD", raising=False)
+    monkeypatch.delenv("CODEX_SESSION_LOG_STATE_DIR", raising=False)
+
+    result = linear_setup.teammate_readiness(
+        target_repo_root=repo, codex_home_path=codex_home
+    )
+
+    hooks = result["checks"]["session_logging_hooks"]
+    assert hooks["installed"] is False
+    assert hooks["missing_events"] == ["UserPromptSubmit"]
+    assert hooks["malformed_events"] == []
+    assert result["locally_ready"] is False
+
+
+@pytest.mark.parametrize(
+    "malformed",
+    [[], [{"hooks": []}], [{"hooks": [{"type": "command", "command": "  "}]}]],
+)
+def test_sesh_doctor_rejects_malformed_native_hook_command(tmp_path, monkeypatch, malformed):
+    codex_home = write_ready_sesh_doctor_home(tmp_path / "codex")
+    hook_path = next(codex_home.glob("plugins/cache/*/codex-session-logging/*/hooks/hooks.json"))
+    payload = json.loads(hook_path.read_text(encoding="utf-8"))
+    payload["hooks"]["PostToolUse"] = malformed
+    hook_path.write_text(json.dumps(payload), encoding="utf-8")
+    repo = init_doctor_repo(tmp_path / "repo", "git@github.com:e3-solutions/codex-plugins.git")
+    monkeypatch.delenv("CODEX_SESSION_LOG_AUTO_UPLOAD", raising=False)
+    monkeypatch.delenv("CODEX_SESSION_LOG_STATE_DIR", raising=False)
+
+    result = linear_setup.teammate_readiness(
+        target_repo_root=repo, codex_home_path=codex_home
+    )
+
+    hooks = result["checks"]["session_logging_hooks"]
+    assert hooks["installed"] is False
+    assert hooks["missing_events"] == []
+    assert hooks["malformed_events"] == ["PostToolUse"]
+    assert result["locally_ready"] is False
+
+
+def test_sesh_doctor_accepts_locally_verified_github_ssh_alias(tmp_path, monkeypatch):
+    codex_home = write_ready_sesh_doctor_home(tmp_path / "codex")
+    repo = init_doctor_repo(tmp_path / "repo", "ssh://git@work-github/e3-solutions/codex-plugins.git")
+    real_run = linear_setup.subprocess.run
+
+    class SshResult:
+        returncode = 0
+        stdout = "host work-github\nhostname github.com\nuser git\n"
+
+    def run(args, **kwargs):
+        if args[:2] == ["ssh", "-G"]:
+            return SshResult()
+        return real_run(args, **kwargs)
+
+    monkeypatch.setattr(linear_setup.subprocess, "run", run)
+    monkeypatch.delenv("CODEX_SESSION_LOG_AUTO_UPLOAD", raising=False)
+    monkeypatch.delenv("CODEX_SESSION_LOG_STATE_DIR", raising=False)
+
+    result = linear_setup.teammate_readiness(
+        target_repo_root=repo, codex_home_path=codex_home
+    )
+
+    assert result["checks"]["repository"] == {
+        "eligible": True,
+        "organization": "e3-solutions",
+        "repository": "codex-plugins",
+    }
+    assert "work-github" not in json.dumps(result)
+
+
+def test_sesh_doctor_rejects_ssh_alias_not_resolving_to_github(tmp_path, monkeypatch):
+    codex_home = write_ready_sesh_doctor_home(tmp_path / "codex")
+    repo = init_doctor_repo(tmp_path / "repo", "git@work-github:e3-solutions/private.git")
+    real_run = linear_setup.subprocess.run
+
+    class SshResult:
+        returncode = 0
+        stdout = "host work-github\nhostname git.example.test\nuser git\n"
+
+    def run(args, **kwargs):
+        if args[:2] == ["ssh", "-G"]:
+            return SshResult()
+        return real_run(args, **kwargs)
+
+    monkeypatch.setattr(linear_setup.subprocess, "run", run)
+    monkeypatch.delenv("CODEX_SESSION_LOG_AUTO_UPLOAD", raising=False)
+    monkeypatch.delenv("CODEX_SESSION_LOG_STATE_DIR", raising=False)
+
+    result = linear_setup.teammate_readiness(
+        target_repo_root=repo, codex_home_path=codex_home
+    )
+
+    assert result["checks"]["repository"] == {
+        "eligible": False,
+        "organization": None,
+        "repository": None,
+    }
+    assert result["locally_ready"] is False
+    assert "work-github" not in json.dumps(result)
+
+
+def test_setup_script_exposes_non_networking_sesh_doctor():
+    text = SETUP_PATH.read_text(encoding="utf-8")
+
+    assert '"--doctor"' in text
+    assert "without network or login actions" in text
+    assert "teammate_readiness(target_repo_root=args.root)" in text
 
 
 def test_update_plugin_installs_newer_manifest_archive(tmp_path, monkeypatch):
@@ -2096,15 +2411,15 @@ def test_current_marketplace_upgrades_previous_release_and_activates_prompt(tmp_
     cache_parent = cache_root / "linear-progress-sync"
     old_linear = write_minimal_plugin(
         cache_parent,
-        directory_name="0.3.13",
-        version="0.3.13",
+        directory_name="0.3.14",
+        version="0.3.14",
         hook_events=("SessionStart", "PreToolUse"),
     )
     write_minimal_plugin(
         cache_root / "codex-session-logging",
         name="codex-session-logging",
-        directory_name="0.2.14",
-        version="0.2.14",
+        directory_name="0.2.15",
+        version="0.2.15",
         hook_events=("SessionStart", "UserPromptSubmit", "Stop"),
     )
     archive, digest = make_current_marketplace_archive(tmp_path)
@@ -2112,7 +2427,7 @@ def test_current_marketplace_upgrades_previous_release_and_activates_prompt(tmp_
     manifest.write_text(
         json.dumps(
             {
-                "version": "0.3.14",
+                "version": "0.3.15",
                 "archive_url": archive.as_uri(),
                 "sha256": digest,
                 "plugin_subdir": "plugins/linear-progress-sync",
@@ -2129,7 +2444,7 @@ def test_current_marketplace_upgrades_previous_release_and_activates_prompt(tmp_
         force=True,
         install_hooks=False,
     )
-    new_linear = cache_parent / "0.3.14"
+    new_linear = cache_parent / "0.3.15"
     second = update_plugin.run_update(
         current_plugin_root=new_linear,
         cache_parent=cache_parent,
@@ -2152,14 +2467,14 @@ def test_current_marketplace_upgrades_previous_release_and_activates_prompt(tmp_
     )
 
     installed_prompt = (
-        cache_root / "codex-session-logging/0.2.15/scripts/collective.py"
+        cache_root / "codex-session-logging/0.2.16/scripts/collective.py"
     )
     assert first["updated"] is True
     assert second["updated"] is False
     assert second["skipped"] == "current"
-    assert sorted(path.name for path in cache_parent.iterdir() if not path.name.startswith(".")) == ["0.3.14"]
+    assert sorted(path.name for path in cache_parent.iterdir() if not path.name.startswith(".")) == ["0.3.15"]
     codex_versions = cache_root / "codex-session-logging"
-    assert sorted(path.name for path in codex_versions.iterdir() if not path.name.startswith(".")) == ["0.2.15"]
+    assert sorted(path.name for path in codex_versions.iterdir() if not path.name.startswith(".")) == ["0.2.16"]
     assert installed_prompt.read_bytes() == (
         ROOT / "plugins/codex-session-logging/scripts/collective.py"
     ).read_bytes()
@@ -2298,7 +2613,7 @@ def test_legacy_upgrade_keeps_presence_scheduler_decommissioned(tmp_path, monkey
     manifest.write_text(
         json.dumps(
             {
-                    "version": "0.3.14",
+                    "version": "0.3.15",
                 "archive_url": archive.as_uri(),
                 "sha256": hashlib.sha256(archive.read_bytes()).hexdigest(),
                 "plugin_subdir": "plugins/linear-progress-sync",
@@ -2354,8 +2669,8 @@ def test_legacy_upgrade_keeps_presence_scheduler_decommissioned(tmp_path, monkey
     resident_root = codex_home / "coreedge"
 
     assert first_cycle.returncode == 0, first_cycle.stderr
-    assert json.loads(first_cycle.stdout)["resident"]["version"] == "0.3.14"
-    assert (resident_root / "runtime" / "current").resolve().name == "0.3.14"
+    assert json.loads(first_cycle.stdout)["resident"]["version"] == "0.3.15"
+    assert (resident_root / "runtime" / "current").resolve().name == "0.3.15"
     assert not (home / "Library" / "LaunchAgents" / "com.coreedge.codex-session-presence.plist").exists()
 
     second_cycle = subprocess.run(
@@ -3188,13 +3503,21 @@ def test_real_marketplace_activates_in_isolated_codex_home_and_passes_doctor(tmp
         platform="unsupported",
     )
 
-    assert activation["version"] == "0.3.14"
+    assert activation["version"] == "0.3.15"
     assert health["healthy"] is True
     assert health["issues"] == []
     assert health["cache_versions"] == {
-        "codex-session-logging": ["0.2.15"],
-        "linear-progress-sync": ["0.3.14"],
+        "codex-session-logging": ["0.2.16"],
+        "linear-progress-sync": ["0.3.15"],
     }
+    installed_logging = codex_home / "plugins/cache/coreedge-local/codex-session-logging/0.2.16"
+    logging_manifest = json.loads(
+        (installed_logging / ".codex-plugin/plugin.json").read_text(encoding="utf-8")
+    )
+    assert logging_manifest["skills"] == "./skills/"
+    retrieval_skill = installed_logging / "skills/search-coding-sessions/SKILL.md"
+    assert retrieval_skill.is_file()
+    assert "returned passage" in retrieval_skill.read_text(encoding="utf-8")
     assert subprocess.run(["sh", "-n", str(resident_root / "run.sh")], check=False).returncode == 0
 
 
@@ -3210,7 +3533,7 @@ def test_resident_hook_repairs_matching_cache_and_runtime_corruption_from_manage
         platform="unsupported",
     )
     managed = resident_root / "marketplace/current/plugins/linear-progress-sync"
-    cache = codex_home / "plugins/cache/coreedge-local/linear-progress-sync/0.3.14"
+    cache = codex_home / "plugins/cache/coreedge-local/linear-progress-sync/0.3.15"
     runtime = resident_root / "runtime/current"
     corrupt_content = (managed / "scripts/linear_sync.py").read_bytes()
     (cache / "scripts/update_plugin.py").write_bytes(corrupt_content)
@@ -4499,7 +4822,7 @@ def test_resident_doctor_reports_content_corruption_and_unloaded_service(tmp_pat
     broken_cache_script = (
         cache_root
         / "linear-progress-sync"
-        / "0.3.14"
+        / "0.3.15"
         / "scripts"
         / "update_plugin.py"
     )
@@ -4748,7 +5071,7 @@ def test_readmes_register_linear_mcp_before_linear_login():
         assert "saves it in `~/.codex/linear-sync/repos.json`" in text
         assert "update_plugin.py --force" in text
         assert "update_plugin.py --doctor" in text
-        assert "`0.3.14`" in text
+        assert "`0.3.15`" in text
         assert "hook-triggered parent and subagent rollout capture" in text
         assert "renewal thread" in text
         assert "every 30 minutes" in text

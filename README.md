@@ -26,11 +26,12 @@ cd codex-plugins
 gh auth login
 python3 plugins/linear-progress-sync/scripts/setup.py
 codex mcp login linear
+codex mcp login e3-cosmos
 ```
 
 Then restart Codex or start a new Codex thread. If Codex asks to review hooks, trust the Linear Progress Sync and Codex Session Logging hooks once.
 
-`setup.py` checks GitHub CLI auth, installs Linear Progress Sync and Codex Session Logging, removes legacy Core Edge hook copies from `~/.codex/hooks.json`, and registers Linear MCP. It does not log you in to Linear, so `codex mcp login linear` is still required.
+`setup.py` checks GitHub CLI auth, installs Linear Progress Sync and Codex Session Logging, removes legacy Core Edge hook copies from `~/.codex/hooks.json`, and registers Linear MCP plus E3 Cosmos. It does not log you in to either service, so the two `codex mcp login` commands are still required.
 
 Linux requires a systemd-based distribution with a working user service manager. Setup writes the updater units under `$XDG_CONFIG_HOME/systemd/user` when that variable is set and `~/.config/systemd/user` otherwise, then enables the updater timer without requiring root. On a headless VM where updates must continue after logout, an administrator should enable lingering for the teammate account before setup:
 
@@ -43,6 +44,14 @@ Preview setup without changing Codex config:
 ```bash
 python3 plugins/linear-progress-sync/scripts/setup.py --dry-run
 ```
+
+Check local session capture, upload queue, repository eligibility, and Cosmos configuration without making network or login calls:
+
+```bash
+python3 plugins/linear-progress-sync/scripts/setup.py --doctor --root /path/to/e3-repo
+```
+
+The doctor reports live Cosmos authentication, Sesh search, and source opening as unverified until they are exercised in Codex.
 
 ## Normal Use
 
@@ -69,7 +78,7 @@ After kickoff, successful Git commits are synced back to the active Linear issue
 
 Setup installs a resident updater under `~/.codex/coreedge`. It runs independently of Codex tasks through a macOS LaunchAgent or Linux systemd user timer shortly after login and every 30 minutes. It downloads the current `main.zip`, validates and stages the default marketplace plugins, switches `~/.codex/coreedge/marketplace/current` atomically, points the registered marketplace at that stable path, and leaves only the selected version visible in each Codex plugin cache. Previous versions move to `~/.codex/coreedge/rollback/cache` so a failed activation can restore the prior state. `SessionStart` and `PreToolUse` repair a missing resident service without delaying or blocking Codex.
 
-Existing installations download and activate `0.3.14` during one ordinary resident check. This release updates Codex Session Logging `0.2.15` to require a reusable lesson in the full contribution, with applicability and limits, dated examples, and inspected prior work linked as supports, challenges, or supersedes. Agents query authoritative systems for current state, and useful learning is required before proposing a private candidate for approval. Guidance remains limited to startup, resume, and post-compaction context rebuilds; clear/reset, ordinary prompt, tool, and completion hooks remain silent. The guidance hook never contacts Forum or submits automatically, skips non-E3 repositories, supports verified GitHub SSH aliases in both Codex and Claude, and honors `E3_COLLECTIVE_HOOK_ENABLED=0`. The release preserves the `0.3.10` repository synchronization guard, historical-backfill protections, Linux systemd support, commit-only Linear progress comments, complete hook-triggered parent and subagent rollout capture, and the monotonic usage RPC migration. Installations from older releases self-heal without rerunning setup; fresh setup installs and schedules the current plugins immediately.
+Existing installations download and activate `0.3.15` during one ordinary resident check. This release updates Codex Session Logging `0.2.16` with an evidence-first Sesh retrieval skill and a post-child ingestion watermark so appended messages become discoverable only after their catalog rows are durable. Fresh setup also registers E3 Cosmos, and `setup.py --doctor` reports local logging, queue, repository, and Cosmos readiness without claiming that configuration proves live authentication. The release preserves the existing access model, historical-backfill protections, the `0.3.10` repository synchronization guard, Collective guidance, complete hook-triggered parent and subagent rollout capture, and the monotonic usage RPC migration. Installations from older releases self-heal without rerunning setup; no deliberate renewal thread is needed because a normal future task picks up the new skill.
 
 Persistently disable or re-enable automatic network update checks with:
 

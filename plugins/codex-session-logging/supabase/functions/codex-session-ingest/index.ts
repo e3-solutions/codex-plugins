@@ -152,15 +152,28 @@ export async function handleRequest(req: Request): Promise<Response> {
       await uploadStorageObject(storagePath, sanitizedEvent);
       if (
         await finishSessionObjectWrite(record, storagePath, async () => {
-          await upsertSession(
+          const metadata = optionalObject(sanitizedEvent.metadata);
+          if (!existing.found) {
+            await persistSession(
+              record,
+              client,
+              userId,
+              remote,
+              existing,
+              metadata,
+              true,
+            );
+          }
+          await upsertEvent(record, userId, storagePath, sanitizedEvent);
+          await persistSession(
             record,
             client,
             userId,
             remote,
             existing,
-            optionalObject(sanitizedEvent.metadata),
+            metadata,
           );
-          await upsertEvent(record, userId, storagePath, sanitizedEvent);
+          await advanceSessionUpdatedAt(sessionId, userId);
         })
       ) {
         return ignoredSessionResponse(record);
@@ -179,8 +192,20 @@ export async function handleRequest(req: Request): Promise<Response> {
     await uploadStorageObject(storagePath, message);
     if (
       await finishSessionObjectWrite(record, storagePath, async () => {
-        await upsertSession(record, client, userId, remote, existing);
+        if (!existing.found) {
+          await persistSession(
+            record,
+            client,
+            userId,
+            remote,
+            existing,
+            undefined,
+            true,
+          );
+        }
         await upsertMessage(record, userId, storagePath);
+        await persistSession(record, client, userId, remote, existing);
+        await advanceSessionUpdatedAt(sessionId, userId);
       })
     ) {
       return ignoredSessionResponse(record);
@@ -340,7 +365,19 @@ async function ingestRolloutChunk(
       catalogRecord,
       storagePath,
       async () => {
-        await upsertSession(
+        if (!existing.found) {
+          await persistSession(
+            catalogRecord,
+            client,
+            userId,
+            remote,
+            existing,
+            metadata,
+            true,
+          );
+        }
+        await upsertEvent(catalogRecord, userId, storagePath, event);
+        await persistSession(
           catalogRecord,
           client,
           userId,
@@ -348,7 +385,7 @@ async function ingestRolloutChunk(
           existing,
           metadata,
         );
-        await upsertEvent(catalogRecord, userId, storagePath, event);
+        await advanceSessionUpdatedAt(sessionId, userId);
       },
     )
   ) {
@@ -693,13 +730,14 @@ async function finishSessionObjectWrite(
   return true;
 }
 
-async function upsertSession(
+async function persistSession(
   record: JsonObject,
   client: JsonObject,
   userId: string,
   remote: string,
   existing: ExistingSession,
   metadata = optionalObject(record.metadata),
+  createOnly = false,
 ): Promise<void> {
   const sessionId = requireString(record.session_id, "record.session_id");
   const threadId = existing.threadId ??
@@ -731,9 +769,42 @@ async function upsertSession(
     // Codex never sends ended_at, so this stays null for Codex — behavior
     // unchanged.
     ended_at: optionalString(record.ended_at),
-    updated_at: new Date().toISOString(),
   };
-  await restUpsert("codex_sessions", row, "id");
+  if (createOnly) {
+    // The FK parent must exist before the first child write. Insert it once
+    // behind the discovery watermark; a concurrent first writer must never
+    // reset a watermark that another writer has already advanced.
+    await restInsertIgnore(
+      "codex_sessions",
+      { ...row, updated_at: "1970-01-01T00:00:00.000Z" },
+      "id",
+    );
+    return;
+  }
+  await restPatch(
+    "codex_sessions",
+    row,
+    `id=eq.${encodeURIComponent(sessionId)}`,
+  );
+}
+
+async function advanceSessionUpdatedAt(
+  sessionId: string,
+  userId: string,
+): Promise<void> {
+  await supabaseFetch(
+    "/rest/v1/rpc/advance_codex_session_updated_at",
+    {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        p_session_id: sessionId,
+        p_user_id: userId,
+      }),
+    },
+  );
 }
 
 async function upsertSessionUser(
@@ -1148,6 +1219,42 @@ async function restUpsert(
       headers: {
         "content-type": "application/json",
         "prefer": "resolution=merge-duplicates,return=minimal",
+      },
+      body: JSON.stringify(row),
+    },
+  );
+}
+
+async function restInsertIgnore(
+  table: string,
+  row: JsonObject,
+  conflict: string,
+): Promise<void> {
+  await supabaseFetch(
+    `/rest/v1/${table}?on_conflict=${encodeURIComponent(conflict)}`,
+    {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "prefer": "resolution=ignore-duplicates,return=minimal",
+      },
+      body: JSON.stringify(row),
+    },
+  );
+}
+
+async function restPatch(
+  table: string,
+  row: JsonObject,
+  filter: string,
+): Promise<void> {
+  await supabaseFetch(
+    `/rest/v1/${table}?${filter}`,
+    {
+      method: "PATCH",
+      headers: {
+        "content-type": "application/json",
+        "prefer": "return=minimal",
       },
       body: JSON.stringify(row),
     },
