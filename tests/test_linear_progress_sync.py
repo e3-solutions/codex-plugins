@@ -2112,7 +2112,7 @@ def test_current_marketplace_upgrades_previous_release_and_activates_prompt(tmp_
     manifest.write_text(
         json.dumps(
             {
-                "version": "0.3.14",
+                "version": "0.3.15",
                 "archive_url": archive.as_uri(),
                 "sha256": digest,
                 "plugin_subdir": "plugins/linear-progress-sync",
@@ -2129,7 +2129,7 @@ def test_current_marketplace_upgrades_previous_release_and_activates_prompt(tmp_
         force=True,
         install_hooks=False,
     )
-    new_linear = cache_parent / "0.3.14"
+    new_linear = cache_parent / "0.3.15"
     second = update_plugin.run_update(
         current_plugin_root=new_linear,
         cache_parent=cache_parent,
@@ -2152,16 +2152,16 @@ def test_current_marketplace_upgrades_previous_release_and_activates_prompt(tmp_
     )
 
     installed_prompt = (
-        cache_root / "codex-session-logging/0.2.15/scripts/collective.py"
+        cache_root / "codex-session-logging/0.2.16/scripts/collective_feedback.py"
     )
     assert first["updated"] is True
     assert second["updated"] is False
     assert second["skipped"] == "current"
-    assert sorted(path.name for path in cache_parent.iterdir() if not path.name.startswith(".")) == ["0.3.14"]
+    assert sorted(path.name for path in cache_parent.iterdir() if not path.name.startswith(".")) == ["0.3.15"]
     codex_versions = cache_root / "codex-session-logging"
-    assert sorted(path.name for path in codex_versions.iterdir() if not path.name.startswith(".")) == ["0.2.15"]
+    assert sorted(path.name for path in codex_versions.iterdir() if not path.name.startswith(".")) == ["0.2.16"]
     assert installed_prompt.read_bytes() == (
-        ROOT / "plugins/codex-session-logging/scripts/collective.py"
+        ROOT / "plugins/codex-session-logging/scripts/collective_feedback.py"
     ).read_bytes()
     repo = init_git_repo(tmp_path / "e3-repo")
     hook_env = {
@@ -2169,6 +2169,7 @@ def test_current_marketplace_upgrades_previous_release_and_activates_prompt(tmp_
         "CODEX_HOME": str(codex_home),
         "CODEX_SESSION_LOG_AUTO_UPLOAD": "0",
         "CODEX_SESSION_LOG_STATE_DIR": str(tmp_path / "session-state"),
+        "E3_COLLECTIVE_HOOK_STATE_DIR": str(tmp_path / "feedback-state"),
         "E3_COLLECTIVE_HOOK_ENABLED": "1",
     }
     hook_script = installed_prompt.parent / "session_start.py"
@@ -2189,8 +2190,8 @@ def test_current_marketplace_upgrades_previous_release_and_activates_prompt(tmp_
         env=hook_env,
     )
     assert startup.returncode == clear.returncode == 0
-    assert "E3 Collective:" in startup.stdout
-    assert clear.stdout == ""
+    assert "E3 Collective / Forum:" in startup.stdout
+    assert "E3 Collective / Forum:" in clear.stdout
     assert health["healthy"] is True
     assert health["issues"] == []
 
@@ -2298,7 +2299,7 @@ def test_legacy_upgrade_keeps_presence_scheduler_decommissioned(tmp_path, monkey
     manifest.write_text(
         json.dumps(
             {
-                    "version": "0.3.14",
+                    "version": "0.3.15",
                 "archive_url": archive.as_uri(),
                 "sha256": hashlib.sha256(archive.read_bytes()).hexdigest(),
                 "plugin_subdir": "plugins/linear-progress-sync",
@@ -2354,8 +2355,8 @@ def test_legacy_upgrade_keeps_presence_scheduler_decommissioned(tmp_path, monkey
     resident_root = codex_home / "coreedge"
 
     assert first_cycle.returncode == 0, first_cycle.stderr
-    assert json.loads(first_cycle.stdout)["resident"]["version"] == "0.3.14"
-    assert (resident_root / "runtime" / "current").resolve().name == "0.3.14"
+    assert json.loads(first_cycle.stdout)["resident"]["version"] == "0.3.15"
+    assert (resident_root / "runtime" / "current").resolve().name == "0.3.15"
     assert not (home / "Library" / "LaunchAgents" / "com.coreedge.codex-session-presence.plist").exists()
 
     second_cycle = subprocess.run(
@@ -3188,12 +3189,12 @@ def test_real_marketplace_activates_in_isolated_codex_home_and_passes_doctor(tmp
         platform="unsupported",
     )
 
-    assert activation["version"] == "0.3.14"
+    assert activation["version"] == "0.3.15"
     assert health["healthy"] is True
     assert health["issues"] == []
     assert health["cache_versions"] == {
-        "codex-session-logging": ["0.2.15"],
-        "linear-progress-sync": ["0.3.14"],
+        "codex-session-logging": ["0.2.16"],
+        "linear-progress-sync": ["0.3.15"],
     }
     assert subprocess.run(["sh", "-n", str(resident_root / "run.sh")], check=False).returncode == 0
 
@@ -3210,7 +3211,7 @@ def test_resident_hook_repairs_matching_cache_and_runtime_corruption_from_manage
         platform="unsupported",
     )
     managed = resident_root / "marketplace/current/plugins/linear-progress-sync"
-    cache = codex_home / "plugins/cache/coreedge-local/linear-progress-sync/0.3.14"
+    cache = codex_home / "plugins/cache/coreedge-local/linear-progress-sync/0.3.15"
     runtime = resident_root / "runtime/current"
     corrupt_content = (managed / "scripts/linear_sync.py").read_bytes()
     (cache / "scripts/update_plugin.py").write_bytes(corrupt_content)
@@ -4499,7 +4500,7 @@ def test_resident_doctor_reports_content_corruption_and_unloaded_service(tmp_pat
     broken_cache_script = (
         cache_root
         / "linear-progress-sync"
-        / "0.3.14"
+        / "0.3.15"
         / "scripts"
         / "update_plugin.py"
     )
@@ -4748,7 +4749,7 @@ def test_readmes_register_linear_mcp_before_linear_login():
         assert "saves it in `~/.codex/linear-sync/repos.json`" in text
         assert "update_plugin.py --force" in text
         assert "update_plugin.py --doctor" in text
-        assert "`0.3.14`" in text
+        assert "`0.3.15`" in text
         assert "hook-triggered parent and subagent rollout capture" in text
         assert "renewal thread" in text
         assert "every 30 minutes" in text

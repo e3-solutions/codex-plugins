@@ -46,6 +46,7 @@ def init_git_repo(path: Path, remote: str) -> Path:
 
 def base_env(tmp_path: Path, *, agent: str) -> dict[str, str]:
     env = dict(os.environ)
+    env["E3_COLLECTIVE_FEEDBACK_HOOK_ENABLED"] = "0"  # Legacy rollback characterization.
     env["E3_COLLECTIVE_HOOK_ENABLED"] = "1"
     if agent == "codex":
         env.update(
