@@ -2169,6 +2169,7 @@ def test_current_marketplace_upgrades_previous_release_and_activates_prompt(tmp_
         "CODEX_HOME": str(codex_home),
         "CODEX_SESSION_LOG_AUTO_UPLOAD": "0",
         "CODEX_SESSION_LOG_STATE_DIR": str(tmp_path / "session-state"),
+        "E3_COLLECTIVE_HOOK_STATE_DIR": str(tmp_path / "feedback-state"),
         "E3_COLLECTIVE_HOOK_ENABLED": "1",
     }
     hook_script = installed_prompt.parent / "session_start.py"
