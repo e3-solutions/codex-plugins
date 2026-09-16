@@ -7,6 +7,8 @@ description: Retrieve prior E3 coding-session knowledge through Cosmos/Sesh when
 
 Use Cosmos/Sesh to answer questions about prior E3 coding work from the passages that were actually retrieved.
 
+This is optional guidance for relevant prior-work questions. Respect a user request to skip retrieval; do not require a search before unrelated work or delay that work when search fails. Production search may time out while its performance repair is pending. Make at most one search attempt for the question unless the user requests a retry, and continue using other available evidence after reporting the failure. Do not send messages to teammates as part of this skill.
+
 ## Retrieval
 
 1. Discover or load the configured Cosmos/Sesh coding-session search tool when the environment supports lazy tool loading, then call it with the user's question. Preserve distinctive identifiers such as ticket IDs, file paths, symbols, hashes, error text, and repository names in the query. Apply repository or contributor filters only when the user supplies them or the context makes them unambiguous.

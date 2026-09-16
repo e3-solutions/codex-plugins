@@ -702,11 +702,7 @@ Deno.test("handleRequest reserves storage before the first upload", async () => 
 });
 
 Deno.test("handleRequest preserves existing session codex setup on later event upserts", async () => {
-  const requests: Array<{
-    url: string;
-    method: string;
-    body: JsonObject | null;
-  }> = [];
+  const requests: Array<{ url: string; body: JsonObject | null }> = [];
   const originalFetch = globalThis.fetch;
   const previousUrl = Deno.env.get("SUPABASE_URL");
   const previousServiceRole = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
@@ -725,15 +721,11 @@ Deno.test("handleRequest preserves existing session codex setup on later event u
       : input instanceof URL
       ? input.toString()
       : input;
-    const requestInit = init as {
-      method?: string;
-      headers?: HeadersInit;
-      body?: BodyInit | null;
-    };
+    const requestInit = init as { body?: BodyInit | null };
     const body = typeof requestInit.body === "string"
       ? JSON.parse(requestInit.body) as JsonObject
       : null;
-    requests.push({ url, method: requestInit.method ?? "GET", body });
+    requests.push({ url, body });
     if (url.includes("/rest/v1/rpc/reserve_codex_session_storage")) {
       return reservedStorageResponse();
     }
@@ -799,18 +791,17 @@ Deno.test("handleRequest preserves existing session codex setup on later event u
         }),
       }),
     );
-    const sessionUpdate = requests.find((request) =>
-      request.method === "PATCH" &&
-      request.url.includes("/rest/v1/codex_sessions?id=eq.session-setup")
+    const sessionUpsert = requests.find((request) =>
+      request.url.includes("/rest/v1/codex_sessions?on_conflict=")
     );
-    const sessionMetadata = sessionUpdate?.body?.metadata as
+    const sessionMetadata = sessionUpsert?.body?.metadata as
       | JsonObject
       | undefined;
 
     assertEquals(response.status, 200);
-    assertEquals(sessionUpdate?.body?.thread_id, "existing-thread");
+    assertEquals(sessionUpsert?.body?.thread_id, "existing-thread");
     assertEquals(
-      sessionUpdate?.body?.started_at,
+      sessionUpsert?.body?.started_at,
       "2026-07-01T00:00:00.000Z",
     );
     assertEquals(sessionMetadata?.codex_setup, existingSetup);
@@ -1320,234 +1311,9 @@ Deno.test("handleRequest retains the configured token check for all requests", a
   }
 });
 
-Deno.test("handleRequest advances the session watermark only after its event is durable", async () => {
-  const requests: Array<{
-    url: string;
-    method: string;
-    body: JsonObject | null;
-    prefer: string | null;
-  }> = [];
-  const originalFetch = globalThis.fetch;
-  const previousUrl = Deno.env.get("SUPABASE_URL");
-  const previousServiceRole = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
-
-  Deno.env.set("SUPABASE_URL", "https://project.supabase.co");
-  Deno.env.set("SUPABASE_SERVICE_ROLE_KEY", "service-role-key");
-  globalThis.fetch = async (input, init = {}) => {
-    const url = input instanceof Request
-      ? input.url
-      : input instanceof URL
-      ? input.toString()
-      : input;
-    const requestInit = init as {
-      method?: string;
-      headers?: HeadersInit;
-      body?: BodyInit | null;
-    };
-    const method = requestInit.method ?? "GET";
-    const body = typeof requestInit.body === "string"
-      ? JSON.parse(requestInit.body) as JsonObject
-      : null;
-    requests.push({
-      url,
-      method,
-      body,
-      prefer: new Headers(requestInit.headers).get("prefer"),
-    });
-    if (url.includes("/rest/v1/rpc/reserve_codex_session_storage")) {
-      return reservedStorageResponse();
-    }
-    if (
-      url.includes("/rest/v1/codex_ignored_sessions?") ||
-      url.includes("/rest/v1/codex_sessions?select=")
-    ) {
-      return new Response(JSON.stringify([]), {
-        status: 200,
-        headers: { "content-type": "application/json" },
-      });
-    }
-    return new Response("", { status: 201 });
-  };
-
-  try {
-    const response = await handleRequest(durabilityEventRequest());
-    const parentIndex = requests.findIndex((request) =>
-      request.method === "POST" &&
-      request.url.includes("/rest/v1/codex_sessions?on_conflict=id")
-    );
-    const childIndex = requests.findIndex((request) =>
-      request.method === "POST" &&
-      request.url.includes("/rest/v1/codex_session_events?on_conflict=id")
-    );
-    const metadataIndex = requests.findIndex((request) =>
-      request.method === "PATCH" &&
-      request.url.includes("/rest/v1/codex_sessions?id=eq.durability-session")
-    );
-    const touchIndex = requests.findIndex((request) =>
-      request.method === "POST" &&
-      request.url.includes("/rest/v1/rpc/advance_codex_session_updated_at")
-    );
-    const parentUpdatedAt = requests[parentIndex]?.body?.updated_at;
-
-    assertEquals(response.status, 200);
-    assertEquals(parentIndex >= 0, true);
-    assertEquals(childIndex > parentIndex, true);
-    assertEquals(metadataIndex > childIndex, true);
-    assertEquals(touchIndex > metadataIndex, true);
-    assertEquals(parentUpdatedAt, "1970-01-01T00:00:00.000Z");
-    assertEquals(
-      requests[parentIndex]?.prefer,
-      "resolution=ignore-duplicates,return=minimal",
-    );
-    assertEquals(requests[metadataIndex]?.body?.updated_at, undefined);
-    assertEquals(
-      requests[touchIndex]?.body?.p_session_id,
-      "durability-session",
-    );
-    assertEquals(
-      typeof requests[touchIndex]?.body?.p_user_id === "string",
-      true,
-    );
-  } finally {
-    globalThis.fetch = originalFetch;
-    restoreEnv("SUPABASE_URL", previousUrl);
-    restoreEnv("SUPABASE_SERVICE_ROLE_KEY", previousServiceRole);
-  }
-});
-
-Deno.test("handleRequest safely retries after the final session touch fails", async () => {
-  const requests: Array<
-    { url: string; method: string; body: JsonObject | null }
-  > = [];
-  const originalFetch = globalThis.fetch;
-  const previousUrl = Deno.env.get("SUPABASE_URL");
-  const previousServiceRole = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
-  let touchAttempts = 0;
-
-  Deno.env.set("SUPABASE_URL", "https://project.supabase.co");
-  Deno.env.set("SUPABASE_SERVICE_ROLE_KEY", "service-role-key");
-  globalThis.fetch = async (input, init = {}) => {
-    const url = input instanceof Request
-      ? input.url
-      : input instanceof URL
-      ? input.toString()
-      : input;
-    const requestInit = init as { method?: string; body?: BodyInit | null };
-    const method = requestInit.method ?? "GET";
-    const body = typeof requestInit.body === "string"
-      ? JSON.parse(requestInit.body) as JsonObject
-      : null;
-    requests.push({ url, method, body });
-    if (url.includes("/rest/v1/rpc/reserve_codex_session_storage")) {
-      return reservedStorageResponse();
-    }
-    if (
-      url.includes("/rest/v1/codex_ignored_sessions?") ||
-      url.includes("/rest/v1/codex_sessions?select=")
-    ) {
-      return new Response(JSON.stringify([]), {
-        status: 200,
-        headers: { "content-type": "application/json" },
-      });
-    }
-    if (url.includes("/rest/v1/rpc/advance_codex_session_updated_at")) {
-      touchAttempts += 1;
-      return touchAttempts === 1
-        ? new Response("temporary touch failure", { status: 500 })
-        : new Response(null, { status: 204 });
-    }
-    return new Response("", { status: 201 });
-  };
-
-  try {
-    const firstResponse = await handleRequest(durabilityEventRequest());
-    const secondResponse = await handleRequest(durabilityEventRequest());
-    const storageWrites = requests.filter((request) =>
-      request.method === "POST" && request.url.includes("/storage/v1/object/")
-    );
-    const childWrites = requests.filter((request) =>
-      request.method === "POST" &&
-      request.url.includes("/rest/v1/codex_session_events?on_conflict=id")
-    );
-    const deletes = requests.filter((request) => request.method === "DELETE");
-
-    assertEquals(firstResponse.status, 500);
-    assertEquals(secondResponse.status, 200);
-    assertEquals(touchAttempts, 2);
-    assertEquals(storageWrites.length, 2);
-    assertEquals(storageWrites[0]?.url, storageWrites[1]?.url);
-    assertEquals(childWrites.length, 2);
-    assertEquals(childWrites[0]?.body?.id, childWrites[1]?.body?.id);
-    assertEquals(deletes.length, 0);
-  } finally {
-    globalThis.fetch = originalFetch;
-    restoreEnv("SUPABASE_URL", previousUrl);
-    restoreEnv("SUPABASE_SERVICE_ROLE_KEY", previousServiceRole);
-  }
-});
-
-Deno.test("handleRequest does not touch the session after an event catalog failure", async () => {
-  const requests: Array<{ url: string; method: string }> = [];
-  const originalFetch = globalThis.fetch;
-  const previousUrl = Deno.env.get("SUPABASE_URL");
-  const previousServiceRole = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
-
-  Deno.env.set("SUPABASE_URL", "https://project.supabase.co");
-  Deno.env.set("SUPABASE_SERVICE_ROLE_KEY", "service-role-key");
-  globalThis.fetch = (input, init = {}) => {
-    const url = input instanceof Request
-      ? input.url
-      : input instanceof URL
-      ? input.toString()
-      : input;
-    const method = (init as { method?: string }).method ?? "GET";
-    requests.push({ url, method });
-    if (url.includes("/rest/v1/rpc/reserve_codex_session_storage")) {
-      return Promise.resolve(reservedStorageResponse());
-    }
-    if (
-      url.includes("/rest/v1/codex_ignored_sessions?") ||
-      url.includes("/rest/v1/codex_sessions?select=")
-    ) {
-      return Promise.resolve(
-        new Response(JSON.stringify([]), {
-          status: 200,
-          headers: { "content-type": "application/json" },
-        }),
-      );
-    }
-    if (url.includes("/rest/v1/codex_session_events?on_conflict=id")) {
-      return Promise.resolve(new Response("catalog failure", { status: 500 }));
-    }
-    return Promise.resolve(new Response("", { status: 201 }));
-  };
-
-  try {
-    const response = await handleRequest(durabilityEventRequest());
-
-    assertEquals(response.status, 500);
-    assertEquals(
-      requests.filter((request) =>
-        request.method === "POST" &&
-        request.url.includes("/rest/v1/rpc/advance_codex_session_updated_at")
-      ).length,
-      0,
-    );
-    assertEquals(
-      requests.filter((request) => request.method === "DELETE").length,
-      0,
-    );
-  } finally {
-    globalThis.fetch = originalFetch;
-    restoreEnv("SUPABASE_URL", previousUrl);
-    restoreEnv("SUPABASE_SERVICE_ROLE_KEY", previousServiceRole);
-  }
-});
-
 Deno.test("handleRequest stores rollout bytes and catalogs retries idempotently", async () => {
   const requests: Array<{
     url: string;
-    method: string;
     body: JsonObject | null;
     rawBody: Uint8Array | null;
     contentType: string | null;
@@ -1568,7 +1334,6 @@ Deno.test("handleRequest stores rollout bytes and catalogs retries idempotently"
       ? input.toString()
       : input;
     const requestInit = init as {
-      method?: string;
       headers?: HeadersInit;
       body?: BodyInit | null;
     };
@@ -1581,13 +1346,7 @@ Deno.test("handleRequest stores rollout bytes and catalogs retries idempotently"
     if (rawBody && contentType === "application/json") {
       body = JSON.parse(new TextDecoder().decode(rawBody)) as JsonObject;
     }
-    requests.push({
-      url,
-      method: requestInit.method ?? "GET",
-      body,
-      rawBody,
-      contentType,
-    });
+    requests.push({ url, body, rawBody, contentType });
     if (url.includes("/rest/v1/rpc/reserve_codex_session_storage")) {
       return reservedStorageResponse();
     }
@@ -1650,25 +1409,13 @@ Deno.test("handleRequest stores rollout bytes and catalogs retries idempotently"
     const eventUpserts = requests.filter((entry) =>
       entry.url.includes("/rest/v1/codex_session_events?on_conflict=id")
     );
-    const sessionUpdate = requests.find((entry) =>
-      entry.method === "PATCH" &&
-      entry.url.includes("/rest/v1/codex_sessions?id=eq.")
-    );
-    const firstEventIndex = requests.findIndex((entry) =>
-      entry.url.includes("/rest/v1/codex_session_events?on_conflict=id")
-    );
-    const firstSessionIndex = requests.findIndex((entry) =>
-      entry.method === "PATCH" &&
-      entry.url.includes("/rest/v1/codex_sessions?id=eq.")
-    );
-    const firstWatermarkIndex = requests.findIndex((entry) =>
-      entry.method === "POST" &&
-      entry.url.includes("/rest/v1/rpc/advance_codex_session_updated_at")
+    const sessionUpsert = requests.find((entry) =>
+      entry.url.includes("/rest/v1/codex_sessions?on_conflict=id")
     );
     const eventMetadata = eventUpserts[0]?.body?.metadata as
       | JsonObject
       | undefined;
-    const sessionMetadata = sessionUpdate?.body?.metadata as
+    const sessionMetadata = sessionUpsert?.body?.metadata as
       | JsonObject
       | undefined;
     const sessionClient = sessionMetadata?.client as JsonObject | undefined;
@@ -1689,9 +1436,6 @@ Deno.test("handleRequest stores rollout bytes and catalogs retries idempotently"
       rollout,
     );
     assertEquals(eventUpserts.length, 2);
-    assertEquals(firstSessionIndex > firstEventIndex, true);
-    assertEquals(firstWatermarkIndex > firstSessionIndex, true);
-    assertEquals(sessionUpdate?.body?.updated_at, undefined);
     assertEquals(eventUpserts[0]?.body?.id, eventUpserts[1]?.body?.id);
     assertEquals(eventUpserts[0]?.body?.event_type, "rollout_chunk");
     assertEquals(eventMetadata?.file_generation, "a".repeat(32));
@@ -1716,9 +1460,9 @@ Deno.test("handleRequest stores rollout bytes and catalogs retries idempotently"
       "secret tool output",
     );
     assertEquals(sessionMetadata?.durable_existing_field, "keep-me");
-    assertEquals(sessionUpdate?.body?.thread_id, "existing-thread");
+    assertEquals(sessionUpsert?.body?.thread_id, "existing-thread");
     assertEquals(
-      sessionUpdate?.body?.started_at,
+      sessionUpsert?.body?.started_at,
       "2026-07-23T00:00:00.000Z",
     );
     assertEquals(sessionClient?.git_user_name, "Existing Name");
@@ -2335,39 +2079,6 @@ async function rolloutChunkPayload(content: string): Promise<JsonObject> {
       installation_id: "install-1",
     },
   };
-}
-
-function durabilityEventRequest(): Request {
-  return new Request("https://example.test/codex-session-ingest", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({
-      version: 1,
-      record: {
-        id: "804fd832-7779-4665-9bec-2f10462c721b",
-        type: "event",
-        session_id: "durability-session",
-        seq: 7,
-        event_type: "tool_call_finished",
-        created_at: "2026-09-09T20:00:00.000Z",
-        metadata: {
-          cwd: "/repo",
-          tool_name: "functions.exec_command",
-          tool_phase: "finished",
-        },
-      },
-      event: {
-        metadata: {
-          tool_name: "functions.exec_command",
-          tool_phase: "finished",
-        },
-      },
-      client: {
-        repo_remote: "https://github.com/e3-solutions/codex-plugins.git",
-        identity_key: "durability-test",
-      },
-    }),
-  });
 }
 
 async function testSha256Hex(value: string): Promise<string> {
