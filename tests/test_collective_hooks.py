@@ -48,6 +48,7 @@ def base_env(tmp_path: Path, *, agent: str) -> dict[str, str]:
     env = dict(os.environ)
     env["E3_COLLECTIVE_FEEDBACK_HOOK_ENABLED"] = "0"  # Legacy rollback characterization.
     env["E3_COLLECTIVE_HOOK_ENABLED"] = "1"
+    env["E3_SESH_CONTEXT_ENABLED"] = "0"  # Isolate exact legacy Forum output.
     if agent == "codex":
         env.update(
             {

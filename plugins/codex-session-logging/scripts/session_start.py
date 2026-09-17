@@ -11,6 +11,14 @@ from session_logging import capture_hook_event, read_stdin_json, should_prompt_c
 
 def main() -> None:
     payload = read_stdin_json()
+    try:
+        from sesh_context import sesh_context
+
+        context = sesh_context(payload)
+        if context:
+            print(context, flush=True)
+    except Exception:
+        pass  # Retrieval guidance must not interrupt existing hooks.
     preview = os.environ.get("E3_COLLECTIVE_FEEDBACK_HOOK_ENABLED", "1") == "1"
     if preview:
         try:
