@@ -961,10 +961,6 @@ def auto_upload_enabled() -> bool:
 
 
 def auto_upload_preference_path() -> Path:
-    if os.environ.get("JOLLY_ROGER_MANAGED") == "1":
-        mapped = os.environ.get("CODEX_SESSION_LOG_PREFERENCES_DIR")
-        if mapped:
-            return Path(mapped).expanduser().resolve() / "preferences.json"
     codex_home = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex").expanduser().resolve()
     return codex_home / "session-logging" / "preferences.json"
 
@@ -983,9 +979,8 @@ def persist_auto_upload_preference(enabled: bool) -> None:
 
 def spawn_drain() -> None:
     script = Path(__file__).with_name("drain_queue.py")
-    python_flags = ["-I", "-B"] if os.environ.get("JOLLY_ROGER_MANAGED") == "1" else []
     subprocess.Popen(
-        [sys.executable, *python_flags, str(script)],
+        [sys.executable, str(script)],
         stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,

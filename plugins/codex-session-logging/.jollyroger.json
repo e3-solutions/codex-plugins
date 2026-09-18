@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "id": "codex-session-logging",
-  "version": "0.2.22",
+  "version": "0.2.24",
   "owner": "Core Edge",
   "providers": [
     "codex",
@@ -11,8 +11,6 @@
     "python_min": "3.11"
   },
   "include": [
-    "scripts/jolly_roger.py",
-    "scripts/jolly_roger_guidance.py",
     "scripts/session_logging.py",
     "scripts/rollout_sync.py",
     "scripts/rollout_usage.py",
@@ -21,91 +19,150 @@
     "scripts/collective.py",
     "scripts/collective_feedback.py",
     "scripts/sesh_context.py",
+    "scripts/session_start.py",
+    "scripts/user_prompt_submit.py",
+    "scripts/pre_tool_use.py",
+    "scripts/post_tool_use.py",
+    "scripts/stop.py",
     "skills/search-coding-sessions"
   ],
   "hooks": [
     {
-      "id": "forum-sesh-guidance",
+      "id": "forum-guidance",
       "event": "SessionStart",
       "providers": [
         "codex",
         "claude"
       ],
-      "entrypoint": "scripts/jolly_roger_guidance.py",
-      "timeout_seconds": 3,
+      "entrypoint": "scripts/collective_feedback.py",
+      "invocation": {
+        "kind": "python-function",
+        "function": "feedback_context",
+        "kwargs": {
+          "event_name": "event",
+          "agent": "provider"
+        },
+        "output": "context"
+      },
+      "timeout_seconds": 2,
       "failure_policy": "continue",
       "background_work": {
         "mode": "none"
       }
     },
     {
-      "id": "capture-session-start",
+      "id": "sesh-guidance",
+      "event": "SessionStart",
+      "providers": [
+        "codex",
+        "claude"
+      ],
+      "entrypoint": "scripts/sesh_context.py",
+      "invocation": {
+        "kind": "python-function",
+        "function": "sesh_context",
+        "kwargs": {},
+        "output": "context"
+      },
+      "timeout_seconds": 2,
+      "failure_policy": "continue",
+      "background_work": {
+        "mode": "none"
+      }
+    },
+    {
+      "id": "native-session-start",
       "event": "SessionStart",
       "providers": [
         "codex"
       ],
-      "entrypoint": "scripts/jolly_roger.py",
+      "entrypoint": "scripts/session_start.py",
+      "invocation": {
+        "kind": "python-script",
+        "args": [],
+        "output": "context"
+      },
       "timeout_seconds": 10,
       "failure_policy": "continue",
       "background_work": {
         "mode": "existing-worker",
-        "purpose": "Drain existing durable upload queue under its existing nonblocking exclusive lock; foreground success is not upload completion"
+        "purpose": "Existing capture and detached upload; native SessionStart also emits guidance, so never select it alongside the function guidance hooks. Activation requires separate worker/state proof."
       }
     },
     {
-      "id": "capture-user-prompt-submit",
+      "id": "native-user-prompt-submit",
       "event": "UserPromptSubmit",
       "providers": [
         "codex"
       ],
-      "entrypoint": "scripts/jolly_roger.py",
+      "entrypoint": "scripts/user_prompt_submit.py",
+      "invocation": {
+        "kind": "python-script",
+        "args": [],
+        "output": "ignore"
+      },
       "timeout_seconds": 10,
       "failure_policy": "continue",
       "background_work": {
         "mode": "existing-worker",
-        "purpose": "Drain existing durable upload queue under its existing nonblocking exclusive lock; foreground success is not upload completion"
+        "purpose": "Existing capture and detached upload; native SessionStart also emits guidance, so never select it alongside the function guidance hooks. Activation requires separate worker/state proof."
       }
     },
     {
-      "id": "capture-pre-tool-use",
+      "id": "native-pre-tool-use",
       "event": "PreToolUse",
       "providers": [
         "codex"
       ],
-      "entrypoint": "scripts/jolly_roger.py",
+      "entrypoint": "scripts/pre_tool_use.py",
+      "invocation": {
+        "kind": "python-script",
+        "args": [],
+        "output": "ignore"
+      },
       "timeout_seconds": 10,
       "failure_policy": "continue",
       "background_work": {
         "mode": "existing-worker",
-        "purpose": "Drain existing durable upload queue under its existing nonblocking exclusive lock; foreground success is not upload completion"
+        "purpose": "Existing capture and detached upload; native SessionStart also emits guidance, so never select it alongside the function guidance hooks. Activation requires separate worker/state proof."
       }
     },
     {
-      "id": "capture-post-tool-use",
+      "id": "native-post-tool-use",
       "event": "PostToolUse",
       "providers": [
         "codex"
       ],
-      "entrypoint": "scripts/jolly_roger.py",
+      "entrypoint": "scripts/post_tool_use.py",
+      "invocation": {
+        "kind": "python-script",
+        "args": [],
+        "output": "ignore"
+      },
       "timeout_seconds": 10,
       "failure_policy": "continue",
       "background_work": {
         "mode": "existing-worker",
-        "purpose": "Drain existing durable upload queue under its existing nonblocking exclusive lock; foreground success is not upload completion"
+        "purpose": "Existing capture and detached upload; native SessionStart also emits guidance, so never select it alongside the function guidance hooks. Activation requires separate worker/state proof."
       }
     },
     {
-      "id": "capture-stop",
+      "id": "native-stop",
       "event": "Stop",
       "providers": [
         "codex"
       ],
-      "entrypoint": "scripts/jolly_roger.py",
+      "entrypoint": "scripts/stop.py",
+      "invocation": {
+        "kind": "python-script",
+        "args": [],
+        "output": "ignore"
+      },
       "timeout_seconds": 10,
       "failure_policy": "continue",
       "background_work": {
         "mode": "existing-worker",
-        "purpose": "Drain existing durable upload queue under its existing nonblocking exclusive lock; foreground success is not upload completion"
+        "purpose": "Existing capture and detached upload; native SessionStart also emits guidance, so never select it alongside the function guidance hooks. Activation requires separate worker/state proof."
       }
     }
   ],
@@ -136,18 +193,21 @@
   "state": [
     {
       "id": "logger-state",
-      "purpose": "Existing raw capture, upload queue, sequence and rollout checkpoints",
-      "rollback_compatible": true
-    },
-    {
-      "id": "logger-preferences",
-      "purpose": "Existing upload privacy preference",
+      "purpose": "Original Codex session-logging queue, checkpoints and preferences; keep original provider-home path before enabling capture.",
       "rollback_compatible": true
     },
     {
       "id": "forum-feedback",
-      "purpose": "Existing Forum guidance debounce database",
+      "purpose": "Existing shared Forum guidance debounce directory.",
       "rollback_compatible": true
     }
-  ]
+  ],
+  "environment": {
+    "CODEX_SESSION_LOG_STATE_DIR": {
+      "state": "logger-state"
+    },
+    "E3_COLLECTIVE_HOOK_STATE_DIR": {
+      "state": "forum-feedback"
+    }
+  }
 }
