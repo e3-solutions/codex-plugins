@@ -42,7 +42,7 @@ DEFAULT_BUCKET = "codex-sessions"
 ALLOWED_GITHUB_ORG = "e3-solutions"
 COLLECTIVE_SESSION_SOURCES = frozenset({"startup", "resume", "compact"})
 EXCERPT_BYTES = 4096
-PLUGIN_VERSION = "0.2.23"
+PLUGIN_VERSION = "0.2.24"
 PERMANENT_HTTP_STATUSES = {400, 413, 415, 422}
 _SESSION_UPLOAD_LOCKS: dict[str, threading.Lock] = {}
 _SESSION_UPLOAD_LOCKS_GUARD = threading.Lock()
@@ -236,7 +236,12 @@ def event_from_payload(hook_event: str, payload: JsonDict) -> tuple[str | None, 
 
 
 SESH_SEARCH_TOOL = 'mcp__e3_cosmos__sesh__search_coding_sessions'
-SESH_SEARCH_TOOLS = (SESH_SEARCH_TOOL, 'mcp__e3__sesh__search_coding_sessions')
+SESH_SEARCH_TOOLS = (
+    SESH_SEARCH_TOOL,
+    'mcp__e3__sesh__search_coding_sessions',
+    'mcp__cosmos__sesh__search_coding_sessions',
+    'mcp__cosmos_e3__sesh__search_coding_sessions',
+)
 SESH_MAX_RESPONSE_BYTES = 262144
 SESH_UUID_PATTERN = re.compile(
     r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[89ab][0-9a-f]{3}-[0-9a-f]{12}'

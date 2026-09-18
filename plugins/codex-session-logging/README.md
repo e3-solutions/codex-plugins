@@ -3,7 +3,10 @@
 ## Sesh receipt correlation
 
 The metadata-only `PostToolUse` event retains `sesh_request_id` only for the exact
-`mcp__e3_cosmos__sesh__search_coding_sessions` tool. It extracts the canonical UUID
+Sesh search tool under the observed exact connector prefixes `mcp__e3_cosmos__`,
+`mcp__e3__`, `mcp__cosmos__`, or `mcp__cosmos_e3__`, each followed by
+`sesh__search_coding_sessions`. Other names and suffix variants are rejected.
+It extracts the canonical UUID
 from a direct response, `structuredContent`, or one JSON text-content block.
 Conflicting, malformed, duplicate-key, or oversized text envelopes omit this
 optional field. They do not block the tool or change the base event.

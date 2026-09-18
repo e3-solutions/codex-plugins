@@ -1687,7 +1687,7 @@ Deno.test("sanitizeEventPayload keeps only allowlisted tool event fields", () =>
   assertNotIncludes(serialized, "arbitrary_secret");
 });
 
-for (const seshToolName of ["mcp__e3_cosmos__sesh__search_coding_sessions", "mcp__e3__sesh__search_coding_sessions"]) {
+for (const seshToolName of ["mcp__e3_cosmos__sesh__search_coding_sessions", "mcp__e3__sesh__search_coding_sessions", "mcp__cosmos__sesh__search_coding_sessions", "mcp__cosmos_e3__sesh__search_coding_sessions"]) {
 Deno.test(`Sesh request correlation keeps only a canonical UUID on ${seshToolName}`, () => {
   const requestId = "aaaaaaaa-1111-4111-8111-111111111111";
   const record = {
@@ -1755,7 +1755,7 @@ Deno.test(`Sesh request correlation keeps only a canonical UUID on ${seshToolNam
     const override of [
       { tool_name: "other" },
       { tool_name: "mcp__other__sesh__search_coding_sessions" },
-      { tool_name: "mcp__e3__sesh__search_coding_sessions_extra" },
+      { tool_name: `${seshToolName}_extra` },
       { tool_name: " " + record.metadata.tool_name },
       { tool_phase: "started" },
       { tool_phase: "" },

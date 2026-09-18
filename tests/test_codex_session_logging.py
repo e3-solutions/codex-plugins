@@ -17,6 +17,11 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 MODULE_PATH = ROOT / "plugins" / "codex-session-logging" / "scripts" / "session_logging.py"
 SESH_SEARCH_TOOL = "mcp__e3_cosmos__sesh__search_coding_sessions"
+SESH_SEARCH_ALIASES = [
+    SESH_SEARCH_TOOL, "mcp__e3__sesh__search_coding_sessions",
+    "mcp__cosmos__sesh__search_coding_sessions",
+    "mcp__cosmos_e3__sesh__search_coding_sessions",
+]
 SESH_REQUEST_ID = "11111111-1111-4111-8111-111111111111"
 OTHER_SESH_REQUEST_ID = "22222222-2222-4222-8222-222222222222"
 
@@ -94,7 +99,7 @@ def test_invalid_host_tool_call_id_is_omitted(value):
         },
     ],
 )
-@pytest.mark.parametrize("tool_name", [SESH_SEARCH_TOOL, "mcp__e3__sesh__search_coding_sessions"])
+@pytest.mark.parametrize("tool_name", SESH_SEARCH_ALIASES)
 def test_sesh_request_id_accepts_supported_consistent_response_envelopes(tool_response, tool_name):
     module = load_session_logging()
 
@@ -149,7 +154,7 @@ def test_sesh_request_id_accepts_supported_consistent_response_envelopes(tool_re
         {"search_request_id": SESH_REQUEST_ID + "\n"},
     ],
 )
-@pytest.mark.parametrize("tool_name", [SESH_SEARCH_TOOL, "mcp__e3__sesh__search_coding_sessions"])
+@pytest.mark.parametrize("tool_name", SESH_SEARCH_ALIASES)
 def test_sesh_request_id_omits_ambiguous_malformed_or_noncanonical_values(tool_response, tool_name):
     module = load_session_logging()
 
@@ -169,6 +174,10 @@ def test_sesh_request_id_omits_ambiguous_malformed_or_noncanonical_values(tool_r
         ("PostToolUse", {"tool_name": "mcp__other__sesh__search_coding_sessions"}),
         ("PostToolUse", {"tool_name": "mcp__e3__sesh__search_coding_sessions_extra"}),
         ("PreToolUse", {"tool_name": "mcp__e3__sesh__search_coding_sessions"}),
+        ("PostToolUse", {"tool_name": "mcp__cosmos__sesh__search_coding_sessions_extra"}),
+        ("PostToolUse", {"tool_name": " mcp__cosmos__sesh__search_coding_sessions"}),
+        ("PostToolUse", {"tool_name": "mcp__cosmos_e3__sesh__search_coding_sessions_extra"}),
+        ("PostToolUse", {"tool_name": " mcp__cosmos_e3__sesh__search_coding_sessions"}),
         ("PostToolUse", {"tool": {"name": SESH_SEARCH_TOOL}}),
     ],
 )
@@ -504,7 +513,7 @@ def test_post_tool_use_records_tool_completion_without_output(tmp_path, monkeypa
     assert "large output" not in detail_text
 
 
-@pytest.mark.parametrize("tool_name", [SESH_SEARCH_TOOL, "mcp__e3__sesh__search_coding_sessions"])
+@pytest.mark.parametrize("tool_name", SESH_SEARCH_ALIASES)
 def test_sesh_post_tool_use_queues_request_and_host_call_ids_without_raw_content(tmp_path, monkeypatch, tool_name):
     monkeypatch.setenv("CODEX_SESSION_LOG_STATE_DIR", str(tmp_path / "state"))
     session_logging = load_session_logging()

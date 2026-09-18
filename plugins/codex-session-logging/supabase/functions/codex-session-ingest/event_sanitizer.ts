@@ -81,7 +81,9 @@ function sanitizeEventMetadata(
     if (
       eventType === "tool_call_finished" &&
       (source.tool_name === "mcp__e3_cosmos__sesh__search_coding_sessions" ||
-        source.tool_name === "mcp__e3__sesh__search_coding_sessions") &&
+        source.tool_name === "mcp__e3__sesh__search_coding_sessions" ||
+        source.tool_name === "mcp__cosmos__sesh__search_coding_sessions" ||
+        source.tool_name === "mcp__cosmos_e3__sesh__search_coding_sessions") &&
       source.tool_phase === "finished" &&
       typeof requestId === "string" && requestId.length === 36 &&
       /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
