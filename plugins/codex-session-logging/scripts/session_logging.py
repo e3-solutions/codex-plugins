@@ -42,7 +42,7 @@ DEFAULT_BUCKET = "codex-sessions"
 ALLOWED_GITHUB_ORG = "e3-solutions"
 COLLECTIVE_SESSION_SOURCES = frozenset({"startup", "resume", "compact"})
 EXCERPT_BYTES = 4096
-PLUGIN_VERSION = "0.2.24"
+PLUGIN_VERSION = "0.2.25"
 PERMANENT_HTTP_STATUSES = {400, 413, 415, 422}
 _SESSION_UPLOAD_LOCKS: dict[str, threading.Lock] = {}
 _SESSION_UPLOAD_LOCKS_GUARD = threading.Lock()
@@ -406,7 +406,33 @@ def tool_name(payload: JsonDict) -> str:
     return ""
 
 
+SOURCE_OPEN_TOOLS = frozenset(
+    f"mcp__{namespace}__{tool}"
+    for namespace in ("e3_cosmos", "e3", "cosmos", "cosmos_e3")
+    for tool in ("timetracker__get_chat", "sesh__open_coding_session_source")
+)
+
+
 def tool_success(payload: JsonDict) -> bool | None:
+    reported = _reported_tool_success(payload)
+    if tool_name(payload) not in SOURCE_OPEN_TOOLS:
+        return reported
+    response = payload.get("tool_response")
+    # Inspect only the MCP envelope, never passage text or nested user content.
+    if isinstance(response, dict) and response.get("isError") is True:
+        return False
+    if any(payload.get(key) is False for key in ("success", "succeeded", "ok")):
+        return False
+    if any(isinstance(payload.get(key), str) and payload[key].strip().lower()
+           in {"failure", "failed", "error", "errored"}
+           for key in ("status", "result")):
+        return False
+    # A completed transport (including isError=false) does not prove that the
+    # requested source content was returned. Success needs a separate witness.
+    return None
+
+
+def _reported_tool_success(payload: JsonDict) -> bool | None:
     for key in ("success", "succeeded", "ok"):
         value = payload.get(key)
         if isinstance(value, bool):
