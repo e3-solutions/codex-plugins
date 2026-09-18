@@ -21,6 +21,7 @@ export function sanitizeEventPayload(
       eventType,
       optionalObject(record.metadata),
       optionalObject(event.metadata),
+      requireString(record.session_id, "record.session_id"),
     ),
   };
 }
@@ -29,6 +30,7 @@ function sanitizeEventMetadata(
   eventType: string,
   recordMetadata: JsonObject,
   eventMetadata: JsonObject,
+  contextSessionId: string,
 ): JsonObject {
   const source = { ...eventMetadata, ...recordMetadata };
   const metadata: JsonObject = {};
@@ -79,13 +81,34 @@ function sanitizeEventMetadata(
     if (
       eventType === "tool_call_finished" &&
       (source.tool_name === "mcp__e3_cosmos__sesh__search_coding_sessions" ||
-        source.tool_name === "mcp__e3__sesh__search_coding_sessions") &&
+        source.tool_name === "mcp__e3__sesh__search_coding_sessions" ||
+        source.tool_name === "mcp__cosmos__sesh__search_coding_sessions" ||
+        source.tool_name === "mcp__cosmos_e3__sesh__search_coding_sessions") &&
       source.tool_phase === "finished" &&
       typeof requestId === "string" && requestId.length === 36 &&
       /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
         .test(requestId)
     ) {
       metadata.sesh_request_id = requestId;
+      const linkageKeys = ["tool_name", "tool_phase", "sesh_request_id",
+        "sesh_origin_session_id", "sesh_context_session_id", "sesh_origin_basis"];
+      const eventHasLinkage = linkageKeys.some((key) => key in eventMetadata);
+      const copiesAgree = !eventHasLinkage || linkageKeys.every(
+        (key) => recordMetadata[key] === eventMetadata[key],
+      );
+      const origin = recordMetadata.sesh_origin_session_id;
+      const context = recordMetadata.sesh_context_session_id;
+      const canonical = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+      if (copiesAgree && recordMetadata.tool_name === source.tool_name &&
+          recordMetadata.tool_phase === "finished" && recordMetadata.sesh_request_id === requestId &&
+          recordMetadata.sesh_origin_basis === "client_transcript_header_v1" &&
+          typeof origin === "string" && origin.length === 36 && canonical.test(origin) &&
+          typeof context === "string" && context.length === 36 && canonical.test(context) &&
+          context === contextSessionId) {
+        metadata.sesh_origin_session_id = origin;
+        metadata.sesh_context_session_id = context;
+        metadata.sesh_origin_basis = "client_transcript_header_v1";
+      }
     }
   }
 
