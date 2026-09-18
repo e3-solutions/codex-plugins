@@ -16,6 +16,9 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 MODULE_PATH = ROOT / "plugins" / "codex-session-logging" / "scripts" / "session_logging.py"
+SESH_SEARCH_TOOL = "mcp__e3_cosmos__sesh__search_coding_sessions"
+SESH_REQUEST_ID = "11111111-1111-4111-8111-111111111111"
+OTHER_SESH_REQUEST_ID = "22222222-2222-4222-8222-222222222222"
 
 
 @pytest.fixture(autouse=True)
@@ -64,6 +67,116 @@ def test_invalid_host_tool_call_id_is_omitted(value):
     metadata = module.tool_event_metadata({"tool_name": "synthetic",
         "tool_use_id": value}, phase="finished")
     assert "tool_call_id" not in metadata
+
+
+@pytest.mark.parametrize(
+    "tool_response",
+    [
+        {"search_request_id": SESH_REQUEST_ID},
+        {"structuredContent": {"search_request_id": SESH_REQUEST_ID}},
+        {
+            "content": [
+                {
+                    "type": "text",
+                    "text": json.dumps({"search_request_id": SESH_REQUEST_ID}),
+                }
+            ]
+        },
+        {
+            "search_request_id": SESH_REQUEST_ID,
+            "structuredContent": {"search_request_id": SESH_REQUEST_ID},
+            "content": [
+                {
+                    "type": "text",
+                    "text": json.dumps({"search_request_id": SESH_REQUEST_ID}),
+                }
+            ],
+        },
+    ],
+)
+def test_sesh_request_id_accepts_supported_consistent_response_envelopes(tool_response):
+    module = load_session_logging()
+
+    event_type, metadata = module.event_from_payload(
+        "PostToolUse",
+        {"tool_name": SESH_SEARCH_TOOL, "tool_response": tool_response},
+    )
+
+    assert event_type == "tool_call_finished"
+    assert metadata == {
+        "tool_name": SESH_SEARCH_TOOL,
+        "tool_phase": "finished",
+        "sesh_request_id": SESH_REQUEST_ID,
+    }
+
+
+@pytest.mark.parametrize(
+    "tool_response",
+    [
+        {
+            "search_request_id": SESH_REQUEST_ID,
+            "structuredContent": {"search_request_id": OTHER_SESH_REQUEST_ID},
+        },
+        {"content": [{"type": "text", "text": "{malformed"}]},
+        {
+            "content": [
+                {
+                    "type": "text",
+                    "text": (
+                        '{"search_request_id":"' + SESH_REQUEST_ID + '",'
+                        '"search_request_id":"' + OTHER_SESH_REQUEST_ID + '"}'
+                    ),
+                }
+            ]
+        },
+        {
+            "search_request_id": SESH_REQUEST_ID,
+            "content": [{"type": "text", "text": "{malformed"}],
+        },
+        {
+            "search_request_id": SESH_REQUEST_ID,
+            "structuredContent": [],
+        },
+        {
+            "content": [
+                {"type": "text", "text": json.dumps({"search_request_id": SESH_REQUEST_ID})},
+                {"type": "text", "text": "unexpected second block"},
+            ]
+        },
+        {"search_request_id": "11111111-1111-4111-1111-111111111111"},
+        {"search_request_id": "ABCDEFAB-CDEF-4ABC-8DEF-ABCDEFABCDEF"},
+        {"search_request_id": SESH_REQUEST_ID + "\n"},
+    ],
+)
+def test_sesh_request_id_omits_ambiguous_malformed_or_noncanonical_values(tool_response):
+    module = load_session_logging()
+
+    _, metadata = module.event_from_payload(
+        "PostToolUse",
+        {"tool_name": SESH_SEARCH_TOOL, "tool_response": tool_response},
+    )
+
+    assert "sesh_request_id" not in metadata
+
+
+@pytest.mark.parametrize(
+    ("hook_event", "tool_fields"),
+    [
+        ("PreToolUse", {"tool_name": SESH_SEARCH_TOOL}),
+        ("PostToolUse", {"tool_name": SESH_SEARCH_TOOL + "_other"}),
+        ("PostToolUse", {"tool": {"name": SESH_SEARCH_TOOL}}),
+    ],
+)
+def test_sesh_request_id_requires_post_tool_use_and_exact_direct_tool_name(hook_event, tool_fields):
+    module = load_session_logging()
+    payload = {
+        **tool_fields,
+        "tool_response": {"search_request_id": SESH_REQUEST_ID},
+    }
+
+    _, metadata = module.event_from_payload(hook_event, payload)
+
+    assert "sesh_request_id" not in metadata
 
 
 def read_queue_records(path: Path) -> list[dict]:
@@ -384,6 +497,50 @@ def test_post_tool_use_records_tool_completion_without_output(tmp_path, monkeypa
     assert queued[0]["metadata"] == detail["metadata"]
     assert "tool_response" not in detail_text
     assert "large output" not in detail_text
+
+
+def test_sesh_post_tool_use_queues_request_and_host_call_ids_without_raw_content(tmp_path, monkeypatch):
+    monkeypatch.setenv("CODEX_SESSION_LOG_STATE_DIR", str(tmp_path / "state"))
+    session_logging = load_session_logging()
+    repo = init_git_repo(tmp_path / "repo", "https://github.com/e3-solutions/codex-plugins.git")
+    private_query = "private search query must not persist"
+    private_passage = "private returned passage must not persist"
+
+    result = session_logging.capture_hook_event(
+        {
+            "hook_event_name": "PostToolUse",
+            "tool_use_id": "call_sesh_host",
+            "session_id": "session-sesh",
+            "cwd": str(repo),
+            "tool_name": SESH_SEARCH_TOOL,
+            "success": True,
+            "tool_input": {"query": private_query},
+            "tool_response": {
+                "structuredContent": {
+                    "search_request_id": SESH_REQUEST_ID,
+                    "results": [{"passage": private_passage}],
+                }
+            },
+        }
+    )
+
+    detail = json.loads((tmp_path / "state" / result["local_content_path"]).read_text(encoding="utf-8"))
+    queued = read_queue_records(tmp_path / "state")
+    assert len(queued) == 1
+    assert detail["metadata"] == {
+        "cwd": str(repo),
+        "success": True,
+        "tool_name": SESH_SEARCH_TOOL,
+        "tool_phase": "finished",
+        "tool_call_id": "call_sesh_host",
+        "sesh_request_id": SESH_REQUEST_ID,
+    }
+    assert queued[0]["metadata"] == detail["metadata"]
+    serialized = json.dumps({"detail": detail, "queued": queued}, sort_keys=True)
+    assert "tool_input" not in serialized
+    assert "tool_response" not in serialized
+    assert private_query not in serialized
+    assert private_passage not in serialized
 
 
 def test_parallel_hook_processes_allocate_unique_sequence_paths(tmp_path, monkeypatch):

@@ -74,6 +74,18 @@ function sanitizeEventMetadata(
       "tool_phase",
       "tool_call_id",
     ]);
+    // Client-attested correlation only; never an authorization or success claim.
+    const requestId = source.sesh_request_id;
+    if (
+      eventType === "tool_call_finished" &&
+      source.tool_name === "mcp__e3_cosmos__sesh__search_coding_sessions" &&
+      source.tool_phase === "finished" &&
+      typeof requestId === "string" && requestId.length === 36 &&
+      /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
+        .test(requestId)
+    ) {
+      metadata.sesh_request_id = requestId;
+    }
   }
 
   if (
