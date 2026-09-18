@@ -16,6 +16,9 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 MODULE_PATH = ROOT / "plugins" / "codex-session-logging" / "scripts" / "session_logging.py"
+SESH_SEARCH_TOOL = "mcp__e3_cosmos__sesh__search_coding_sessions"
+SESH_REQUEST_ID = "11111111-1111-4111-8111-111111111111"
+OTHER_SESH_REQUEST_ID = "22222222-2222-4222-8222-222222222222"
 
 
 @pytest.fixture(autouse=True)
@@ -35,6 +38,150 @@ def load_session_logging():
 
 def read_jsonl(path: Path) -> list[dict]:
     return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+
+
+@pytest.mark.parametrize("event", ["PreToolUse", "PostToolUse"])
+@pytest.mark.parametrize("key", ["tool_use_id", "tool_call_id", "toolCallId", "call_id", "callId"])
+def test_host_tool_call_id_aliases(event, key):
+    module = load_session_logging()
+    _, metadata = module.event_from_payload(event, {
+        "tool_name": "mcp__e3_cosmos__sesh__search_coding_sessions",
+        key: "call_synthetic",
+        "tool_input": {"query": "private question"},
+        "tool_response": {"content": "private response"},
+    })
+    assert metadata["tool_call_id"] == "call_synthetic"
+    assert "private" not in repr(metadata)
+
+
+def test_host_tool_call_id_alias_keeps_legacy_precedence():
+    module = load_session_logging()
+    metadata = module.tool_event_metadata({"tool_name": "synthetic",
+        "tool_call_id": "legacy", "tool_use_id": "host"}, phase="finished")
+    assert metadata["tool_call_id"] == "legacy"
+
+
+@pytest.mark.parametrize("value", [None, "", 1, {}, []])
+def test_invalid_host_tool_call_id_is_omitted(value):
+    module = load_session_logging()
+    metadata = module.tool_event_metadata({"tool_name": "synthetic",
+        "tool_use_id": value}, phase="finished")
+    assert "tool_call_id" not in metadata
+
+
+@pytest.mark.parametrize(
+    "tool_response",
+    [
+        {"search_request_id": SESH_REQUEST_ID},
+        {"structuredContent": {"search_request_id": SESH_REQUEST_ID}},
+        {
+            "content": [
+                {
+                    "type": "text",
+                    "text": json.dumps({"search_request_id": SESH_REQUEST_ID}),
+                }
+            ]
+        },
+        {
+            "search_request_id": SESH_REQUEST_ID,
+            "structuredContent": {"search_request_id": SESH_REQUEST_ID},
+            "content": [
+                {
+                    "type": "text",
+                    "text": json.dumps({"search_request_id": SESH_REQUEST_ID}),
+                }
+            ],
+        },
+    ],
+)
+@pytest.mark.parametrize("tool_name", [SESH_SEARCH_TOOL, "mcp__e3__sesh__search_coding_sessions"])
+def test_sesh_request_id_accepts_supported_consistent_response_envelopes(tool_response, tool_name):
+    module = load_session_logging()
+
+    event_type, metadata = module.event_from_payload(
+        "PostToolUse",
+        {"tool_name": tool_name, "tool_response": tool_response},
+    )
+
+    assert event_type == "tool_call_finished"
+    assert metadata == {
+        "tool_name": tool_name,
+        "tool_phase": "finished",
+        "sesh_request_id": SESH_REQUEST_ID,
+    }
+
+
+@pytest.mark.parametrize(
+    "tool_response",
+    [
+        {
+            "search_request_id": SESH_REQUEST_ID,
+            "structuredContent": {"search_request_id": OTHER_SESH_REQUEST_ID},
+        },
+        {"content": [{"type": "text", "text": "{malformed"}]},
+        {
+            "content": [
+                {
+                    "type": "text",
+                    "text": (
+                        '{"search_request_id":"' + SESH_REQUEST_ID + '",'
+                        '"search_request_id":"' + OTHER_SESH_REQUEST_ID + '"}'
+                    ),
+                }
+            ]
+        },
+        {
+            "search_request_id": SESH_REQUEST_ID,
+            "content": [{"type": "text", "text": "{malformed"}],
+        },
+        {
+            "search_request_id": SESH_REQUEST_ID,
+            "structuredContent": [],
+        },
+        {
+            "content": [
+                {"type": "text", "text": json.dumps({"search_request_id": SESH_REQUEST_ID})},
+                {"type": "text", "text": "unexpected second block"},
+            ]
+        },
+        {"search_request_id": "11111111-1111-4111-1111-111111111111"},
+        {"search_request_id": "ABCDEFAB-CDEF-4ABC-8DEF-ABCDEFABCDEF"},
+        {"search_request_id": SESH_REQUEST_ID + "\n"},
+    ],
+)
+@pytest.mark.parametrize("tool_name", [SESH_SEARCH_TOOL, "mcp__e3__sesh__search_coding_sessions"])
+def test_sesh_request_id_omits_ambiguous_malformed_or_noncanonical_values(tool_response, tool_name):
+    module = load_session_logging()
+
+    _, metadata = module.event_from_payload(
+        "PostToolUse",
+        {"tool_name": tool_name, "tool_response": tool_response},
+    )
+
+    assert "sesh_request_id" not in metadata
+
+
+@pytest.mark.parametrize(
+    ("hook_event", "tool_fields"),
+    [
+        ("PreToolUse", {"tool_name": SESH_SEARCH_TOOL}),
+        ("PostToolUse", {"tool_name": SESH_SEARCH_TOOL + "_other"}),
+        ("PostToolUse", {"tool_name": "mcp__other__sesh__search_coding_sessions"}),
+        ("PostToolUse", {"tool_name": "mcp__e3__sesh__search_coding_sessions_extra"}),
+        ("PreToolUse", {"tool_name": "mcp__e3__sesh__search_coding_sessions"}),
+        ("PostToolUse", {"tool": {"name": SESH_SEARCH_TOOL}}),
+    ],
+)
+def test_sesh_request_id_requires_post_tool_use_and_exact_direct_tool_name(hook_event, tool_fields):
+    module = load_session_logging()
+    payload = {
+        **tool_fields,
+        "tool_response": {"search_request_id": SESH_REQUEST_ID},
+    }
+
+    _, metadata = module.event_from_payload(hook_event, payload)
+
+    assert "sesh_request_id" not in metadata
 
 
 def read_queue_records(path: Path) -> list[dict]:
@@ -320,7 +467,8 @@ def test_pre_tool_use_records_only_tool_name_without_arguments(tmp_path, monkeyp
     assert "super-secret-value" not in detail_text
 
 
-def test_post_tool_use_records_tool_completion_without_output(tmp_path, monkeypatch):
+@pytest.mark.parametrize("host_call_id", [None, "call_synthetic_host"])
+def test_post_tool_use_records_tool_completion_without_output(tmp_path, monkeypatch, host_call_id):
     monkeypatch.setenv("CODEX_SESSION_LOG_STATE_DIR", str(tmp_path / "state"))
     session_logging = load_session_logging()
     repo = init_git_repo(tmp_path / "repo", "https://github.com/e3-solutions/codex-plugins.git")
@@ -328,6 +476,7 @@ def test_post_tool_use_records_tool_completion_without_output(tmp_path, monkeypa
     result = session_logging.capture_hook_event(
         {
             "hook_event_name": "PostToolUse",
+            "tool_use_id": host_call_id,
             "session_id": "session-tools",
             "cwd": str(repo),
             "tool": {"name": "web.run"},
@@ -346,9 +495,58 @@ def test_post_tool_use_records_tool_completion_without_output(tmp_path, monkeypa
         "success": True,
         "tool_name": "web.run",
         "tool_phase": "finished",
+        **({"tool_call_id": host_call_id} if host_call_id else {}),
     }
+    queued = read_queue_records(tmp_path / "state")
+    assert len(queued) == 1
+    assert queued[0]["metadata"] == detail["metadata"]
     assert "tool_response" not in detail_text
     assert "large output" not in detail_text
+
+
+@pytest.mark.parametrize("tool_name", [SESH_SEARCH_TOOL, "mcp__e3__sesh__search_coding_sessions"])
+def test_sesh_post_tool_use_queues_request_and_host_call_ids_without_raw_content(tmp_path, monkeypatch, tool_name):
+    monkeypatch.setenv("CODEX_SESSION_LOG_STATE_DIR", str(tmp_path / "state"))
+    session_logging = load_session_logging()
+    repo = init_git_repo(tmp_path / "repo", "https://github.com/e3-solutions/codex-plugins.git")
+    private_query = "private search query must not persist"
+    private_passage = "private returned passage must not persist"
+
+    result = session_logging.capture_hook_event(
+        {
+            "hook_event_name": "PostToolUse",
+            "tool_use_id": "call_sesh_host",
+            "session_id": "session-sesh",
+            "cwd": str(repo),
+            "tool_name": tool_name,
+            "success": True,
+            "tool_input": {"query": private_query},
+            "tool_response": {
+                "structuredContent": {
+                    "search_request_id": SESH_REQUEST_ID,
+                    "results": [{"passage": private_passage}],
+                }
+            },
+        }
+    )
+
+    detail = json.loads((tmp_path / "state" / result["local_content_path"]).read_text(encoding="utf-8"))
+    queued = read_queue_records(tmp_path / "state")
+    assert len(queued) == 1
+    assert detail["metadata"] == {
+        "cwd": str(repo),
+        "success": True,
+        "tool_name": tool_name,
+        "tool_phase": "finished",
+        "tool_call_id": "call_sesh_host",
+        "sesh_request_id": SESH_REQUEST_ID,
+    }
+    assert queued[0]["metadata"] == detail["metadata"]
+    serialized = json.dumps({"detail": detail, "queued": queued}, sort_keys=True)
+    assert "tool_input" not in serialized
+    assert "tool_response" not in serialized
+    assert private_query not in serialized
+    assert private_passage not in serialized
 
 
 def test_parallel_hook_processes_allocate_unique_sequence_paths(tmp_path, monkeypatch):
@@ -937,6 +1135,7 @@ def test_ingest_payload_includes_saved_linear_user_name_when_git_identity_is_mis
 
 def test_plugin_packaging_and_supabase_migration_are_present():
     manifest_path = ROOT / "plugins" / "codex-session-logging" / ".codex-plugin" / "plugin.json"
+    assert json.loads(manifest_path.read_text())["version"] == load_session_logging().PLUGIN_VERSION
     hooks_path = ROOT / "plugins" / "codex-session-logging" / "hooks" / "hooks.json"
     marketplace_path = ROOT / ".agents" / "plugins" / "marketplace.json"
     migration_path = (

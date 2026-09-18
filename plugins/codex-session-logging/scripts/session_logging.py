@@ -41,7 +41,7 @@ DEFAULT_BUCKET = "codex-sessions"
 ALLOWED_GITHUB_ORG = "e3-solutions"
 COLLECTIVE_SESSION_SOURCES = frozenset({"startup", "resume", "compact"})
 EXCERPT_BYTES = 4096
-PLUGIN_VERSION = "0.2.15"
+PLUGIN_VERSION = "0.2.22"
 PERMANENT_HTTP_STATUSES = {400, 413, 415, 422}
 _SESSION_UPLOAD_LOCKS: dict[str, threading.Lock] = {}
 _SESSION_UPLOAD_LOCKS_GUARD = threading.Lock()
@@ -224,11 +224,79 @@ def event_from_payload(hook_event: str, payload: JsonDict) -> tuple[str | None, 
         return ("tool_call_started", metadata) if metadata.get("tool_name") else (None, {})
     if hook_event == "PostToolUse":
         metadata = tool_event_metadata(payload, phase="finished")
+        metadata.update(search_receipt_metadata(payload))
         success = tool_success(payload)
         if success is not None:
             metadata["success"] = success
         return ("tool_call_finished", metadata) if metadata.get("tool_name") else (None, {})
     return None, {}
+
+
+SESH_SEARCH_TOOL = 'mcp__e3_cosmos__sesh__search_coding_sessions'
+SESH_SEARCH_TOOLS = (SESH_SEARCH_TOOL, 'mcp__e3__sesh__search_coding_sessions')
+SESH_MAX_RESPONSE_BYTES = 262144
+SESH_UUID_PATTERN = re.compile(
+    r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[89ab][0-9a-f]{3}-[0-9a-f]{12}'
+)
+
+
+def _sesh_unique_object(pairs):
+    value = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError('ambiguous JSON object')
+        value[key] = item
+    return value
+
+
+def search_receipt_metadata(payload):
+    if not isinstance(payload, dict) or payload.get('tool_name') not in SESH_SEARCH_TOOLS:
+        return {}
+    response = payload.get('tool_response')
+    if not isinstance(response, dict):
+        return {}
+    # Do not traverse passages, arbitrary nested data, or the user's tool input.
+    bodies = []
+    if 'search_request_id' in response:
+        bodies.append(response)
+    structured = response.get('structuredContent')
+    if 'structuredContent' in response and not isinstance(structured, dict):
+        return {}
+    if isinstance(structured, dict):
+        bodies.append(structured)
+    content = response.get('content')
+    if 'content' in response and (not isinstance(content, list) or len(content) != 1):
+        return {}
+    if isinstance(content, list) and len(content) == 1:
+        item = content[0]
+        if isinstance(item, dict) and item.get('type') == 'text':
+            raw = item.get('text')
+            if isinstance(raw, str) and len(raw) <= SESH_MAX_RESPONSE_BYTES:
+                try:
+                    if len(raw.encode('utf-8')) <= SESH_MAX_RESPONSE_BYTES:
+                        decoded = json.loads(raw, object_pairs_hook=_sesh_unique_object)
+                        if isinstance(decoded, dict):
+                            bodies.append(decoded)
+                        else:
+                            return {}
+                    else:
+                        return {}
+                except (ValueError, UnicodeError, RecursionError):
+                    return {}
+            else:
+                return {}
+        else:
+            return {}
+    ids = set()
+    for body in bodies:
+        value = body.get('search_request_id')
+        if value is None:
+            continue
+        if not isinstance(value, str) or SESH_UUID_PATTERN.fullmatch(value) is None:
+            return {}
+        ids.add(value)
+    # Conflicting envelopes are ambiguous, never choose whichever appears first.
+    return {'sesh_request_id': ids.pop()} if len(ids) == 1 else {}
 
 
 def metadata_from_payload(payload: JsonDict) -> JsonDict:
@@ -260,7 +328,7 @@ def tool_event_metadata(payload: JsonDict, *, phase: str) -> JsonDict:
         "tool_name": tool,
         "tool_phase": phase,
     }
-    call_id = first_string(payload, "tool_call_id", "toolCallId", "call_id", "callId")
+    call_id = first_string(payload, "tool_call_id", "toolCallId", "call_id", "callId", "tool_use_id")
     if call_id:
         metadata["tool_call_id"] = call_id
     return metadata

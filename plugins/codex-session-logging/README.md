@@ -1,5 +1,23 @@
 # Codex Session Logging
 
+## Sesh receipt correlation
+
+The metadata-only `PostToolUse` event retains `sesh_request_id` only for the exact
+`mcp__e3_cosmos__sesh__search_coding_sessions` tool. It extracts the canonical UUID
+from a direct response, `structuredContent`, or one JSON text-content block.
+Conflicting, malformed, duplicate-key, or oversized text envelopes omit this
+optional field. They do not block the tool or change the base event.
+
+The ingest sanitizer accepts this field only on that tool's finished event with
+phase `finished`. No query, passage, or raw tool response is copied into event
+metadata. Existing rollout capture and privacy controls are unchanged. The ID is
+client-attested correlation, not authorization, provenance, relevance, successful
+source opening, or proof that the evidence helped. Older clients/events lack it;
+do not infer missing usage or usefulness from a missing link.
+
+Deploy the compatible sanitizer before distributing logging 0.2.21. Rollback of
+either side safely omits the optional field; no schema migration is required.
+
 ## Collective prompt contract
 
 The full contribution must lead with a reusable lesson, method, failure mechanism, or qualified hypothesis—not merely a general title above an operational report. Customer, repository, flag, and incident details belong in a dated `Evidence/example` section with authorized provenance. The lesson should remain useful without that example; query authoritative systems for current state. Search and read relevant prior Forum work before asserting a correction, and link it as supporting, challenging, or superseding evidence. Submissions stay private pending approval; no useful learning is a valid outcome.
