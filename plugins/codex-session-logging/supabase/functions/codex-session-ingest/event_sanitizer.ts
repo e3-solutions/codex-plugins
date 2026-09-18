@@ -88,7 +88,8 @@ function sanitizeEventMetadata(
         .test(requestId)
     ) {
       metadata.sesh_request_id = requestId;
-      const linkageKeys = ["sesh_origin_session_id", "sesh_context_session_id", "sesh_origin_basis"];
+      const linkageKeys = ["tool_name", "tool_phase", "sesh_request_id",
+        "sesh_origin_session_id", "sesh_context_session_id", "sesh_origin_basis"];
       const eventHasLinkage = linkageKeys.some((key) => key in eventMetadata);
       const copiesAgree = !eventHasLinkage || linkageKeys.every(
         (key) => recordMetadata[key] === eventMetadata[key],
@@ -96,7 +97,9 @@ function sanitizeEventMetadata(
       const origin = recordMetadata.sesh_origin_session_id;
       const context = recordMetadata.sesh_context_session_id;
       const canonical = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
-      if (copiesAgree && recordMetadata.sesh_origin_basis === "client_transcript_header_v1" &&
+      if (copiesAgree && recordMetadata.tool_name === source.tool_name &&
+          recordMetadata.tool_phase === "finished" && recordMetadata.sesh_request_id === requestId &&
+          recordMetadata.sesh_origin_basis === "client_transcript_header_v1" &&
           typeof origin === "string" && origin.length === 36 && canonical.test(origin) &&
           typeof context === "string" && context.length === 36 && canonical.test(context) &&
           context === contextSessionId) {

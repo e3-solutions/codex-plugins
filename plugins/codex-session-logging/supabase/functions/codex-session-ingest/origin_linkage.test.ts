@@ -21,6 +21,15 @@ Deno.test("origin linkage is bounded client-attested finished-search metadata", 
     ...record.metadata, sesh_origin_session_id: context,
   } });
   assertEquals((conflicting.metadata as Record<string, unknown>).sesh_origin_session_id, undefined);
+  const wrongRequest = sanitizeEventPayload(record, { metadata: {
+    ...record.metadata, sesh_request_id: origin,
+  } });
+  assertEquals((wrongRequest.metadata as Record<string, unknown>).sesh_origin_session_id, undefined);
+  const originOnly = { sesh_origin_session_id: origin, sesh_context_session_id: context,
+    sesh_origin_basis: "client_transcript_header_v1" };
+  const borrowedRequest = sanitizeEventPayload({ ...record, metadata: originOnly },
+    { metadata: record.metadata });
+  assertEquals((borrowedRequest.metadata as Record<string, unknown>).sesh_origin_session_id, undefined);
   const incomplete = { ...record.metadata } as Record<string, unknown>;
   delete incomplete.sesh_origin_basis;
   const spliced = sanitizeEventPayload({ ...record, metadata: incomplete },

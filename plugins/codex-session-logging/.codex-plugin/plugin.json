@@ -1,6 +1,6 @@
 {
   "name": "codex-session-logging",
-  "version": "0.2.22",
+  "version": "0.2.23",
   "description": "Capture E3 Codex sessions and cue useful learnings for the Forum Collective review queue.",
   "author": {
     "name": "Core Edge Solution"
