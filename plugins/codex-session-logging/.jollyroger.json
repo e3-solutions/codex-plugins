@@ -1,0 +1,104 @@
+{
+  "schema_version": 1,
+  "id": "codex-session-logging",
+  "version": "0.2.24",
+  "owner": "Core Edge",
+  "providers": ["codex", "claude"],
+  "include": [
+    "scripts/session_logging.py",
+    "scripts/rollout_sync.py",
+    "scripts/rollout_usage.py",
+    "scripts/publish_presence.py",
+    "scripts/drain_queue.py",
+    "scripts/collective.py",
+    "scripts/collective_feedback.py",
+    "scripts/sesh_context.py",
+    "scripts/session_start.py",
+    "scripts/user_prompt_submit.py",
+    "scripts/pre_tool_use.py",
+    "scripts/post_tool_use.py",
+    "scripts/stop.py",
+    "skills/search-coding-sessions"
+  ],
+  "hook_defaults": {
+    "providers": ["codex"],
+    "timeout_seconds": 10,
+    "background_work": {
+      "mode": "existing-worker",
+      "purpose": "Existing capture and detached upload; native SessionStart also emits guidance, so never select it alongside the function guidance hooks. Activation requires separate worker/state proof."
+    }
+  },
+  "hooks": [
+    {
+      "id": "forum-guidance",
+      "event": "SessionStart",
+      "providers": ["codex", "claude"],
+      "entrypoint": "scripts/collective_feedback.py",
+      "invocation": {
+        "kind": "python-function",
+        "function": "feedback_context",
+        "kwargs": {"event_name": "event", "agent": "provider"},
+        "output": "context"
+      },
+      "timeout_seconds": 2,
+      "background_work": {"mode": "none"}
+    },
+    {
+      "id": "sesh-guidance",
+      "event": "SessionStart",
+      "providers": ["codex", "claude"],
+      "entrypoint": "scripts/sesh_context.py",
+      "invocation": {"kind": "python-function", "function": "sesh_context", "kwargs": {}, "output": "context"},
+      "timeout_seconds": 2,
+      "background_work": {"mode": "none"}
+    },
+    {
+      "id": "native-session-start",
+      "event": "SessionStart",
+      "entrypoint": "scripts/session_start.py",
+      "invocation": {"kind": "python-script", "args": [], "output": "context"}
+    },
+    {
+      "id": "native-user-prompt-submit",
+      "event": "UserPromptSubmit",
+      "entrypoint": "scripts/user_prompt_submit.py",
+      "invocation": {"kind": "python-script", "args": [], "output": "ignore"}
+    },
+    {
+      "id": "native-pre-tool-use",
+      "event": "PreToolUse",
+      "entrypoint": "scripts/pre_tool_use.py",
+      "invocation": {"kind": "python-script", "args": [], "output": "ignore"}
+    },
+    {
+      "id": "native-post-tool-use",
+      "event": "PostToolUse",
+      "entrypoint": "scripts/post_tool_use.py",
+      "invocation": {"kind": "python-script", "args": [], "output": "ignore"}
+    },
+    {
+      "id": "native-stop",
+      "event": "Stop",
+      "entrypoint": "scripts/stop.py",
+      "invocation": {"kind": "python-script", "args": [], "output": "ignore"}
+    }
+  ],
+  "skills": [{"path": "skills/search-coding-sessions", "providers": ["codex", "claude"]}],
+  "dependencies": [{"kind": "executable", "name": "git"}, {"kind": "mcp", "name": "cosmos", "providers": ["codex", "claude"]}],
+  "state": [
+    {
+      "id": "logger-state",
+      "purpose": "Original Codex session-logging queue, checkpoints and preferences; keep original provider-home path before enabling capture.",
+      "rollback_compatible": true
+    },
+    {
+      "id": "forum-feedback",
+      "purpose": "Existing shared Forum guidance debounce directory.",
+      "rollback_compatible": true
+    }
+  ],
+  "environment": {
+    "CODEX_SESSION_LOG_STATE_DIR": {"state": "logger-state"},
+    "E3_COLLECTIVE_HOOK_STATE_DIR": {"state": "forum-feedback"}
+  }
+}
