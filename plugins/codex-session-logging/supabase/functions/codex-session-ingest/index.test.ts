@@ -1687,6 +1687,94 @@ Deno.test("sanitizeEventPayload keeps only allowlisted tool event fields", () =>
   assertNotIncludes(serialized, "arbitrary_secret");
 });
 
+Deno.test("Sesh request correlation keeps only a canonical UUID on the exact finished event", () => {
+  const requestId = "aaaaaaaa-1111-4111-8111-111111111111";
+  const record = {
+    id: "804fd832-7779-4665-9bec-2f10462c721b",
+    session_id: "session-sesh-correlation",
+    seq: 7,
+    event_type: "tool_call_finished",
+    hook_event_name: "PostToolUse",
+    created_at: "2026-09-18T00:00:00.000Z",
+    metadata: {
+      tool_name: "mcp__e3_cosmos__sesh__search_coding_sessions",
+      tool_phase: "finished",
+      tool_call_id: "call-synthetic",
+      sesh_request_id: requestId,
+      tool_input: { query: "private-question" },
+      tool_response: { passage: "private-passage" },
+    },
+  };
+  const clean = sanitizeEventPayload(record, {});
+  assertEquals(clean.metadata, {
+    tool_name: record.metadata.tool_name,
+    tool_phase: "finished",
+    tool_call_id: "call-synthetic",
+    sesh_request_id: requestId,
+  });
+  assertNotIncludes(JSON.stringify(clean), "private-");
+  for (
+    const invalid of [
+      null,
+      1,
+      [],
+      {},
+      "",
+      "private-text",
+      requestId.toUpperCase(),
+      requestId + "\n",
+      "11111111-1111-4111-1111-111111111111",
+      "00000000-0000-0000-0000-000000000000",
+    ]
+  ) {
+    const result = sanitizeEventPayload({
+      ...record,
+      metadata: { ...record.metadata, sesh_request_id: invalid },
+    }, {});
+    assertEquals((result.metadata as JsonObject).sesh_request_id, undefined);
+    assertEquals(
+      (result.metadata as JsonObject).tool_call_id,
+      "call-synthetic",
+    );
+  }
+  for (
+    const eventType of [
+      "tool_call_started",
+      "tool_call_failed",
+      "thread_finished",
+    ]
+  ) {
+    const result = sanitizeEventPayload(
+      { ...record, event_type: eventType },
+      {},
+    );
+    assertEquals((result.metadata as JsonObject).sesh_request_id, undefined);
+  }
+  for (
+    const override of [
+      { tool_name: "other" },
+      { tool_name: " " + record.metadata.tool_name },
+      { tool_phase: "started" },
+      { tool_phase: "" },
+    ]
+  ) {
+    const result = sanitizeEventPayload({
+      ...record,
+      metadata: { ...record.metadata, ...override },
+    }, {});
+    assertEquals((result.metadata as JsonObject).sesh_request_id, undefined);
+  }
+  // Existing record-over-event precedence cannot be used to revive an invalid ID.
+  const invalidRecord = sanitizeEventPayload({
+    ...record,
+    metadata: { ...record.metadata, sesh_request_id: "invalid" },
+  }, { metadata: { sesh_request_id: requestId } });
+  assertEquals(
+    (invalidRecord.metadata as JsonObject).sesh_request_id,
+    undefined,
+  );
+});
+
 Deno.test("sanitizeEventPayload keeps resident presence metadata content-free", () => {
   const sanitized = sanitizeEventPayload(
     {
