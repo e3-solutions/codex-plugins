@@ -10,6 +10,7 @@ import json
 import os
 import re
 import socket
+import stat
 import subprocess
 import sys
 import threading
@@ -41,7 +42,7 @@ DEFAULT_BUCKET = "codex-sessions"
 ALLOWED_GITHUB_ORG = "e3-solutions"
 COLLECTIVE_SESSION_SOURCES = frozenset({"startup", "resume", "compact"})
 EXCERPT_BYTES = 4096
-PLUGIN_VERSION = "0.2.22"
+PLUGIN_VERSION = "0.2.23"
 PERMANENT_HTTP_STATUSES = {400, 413, 415, 422}
 _SESSION_UPLOAD_LOCKS: dict[str, threading.Lock] = {}
 _SESSION_UPLOAD_LOCKS_GUARD = threading.Lock()
@@ -225,6 +226,8 @@ def event_from_payload(hook_event: str, payload: JsonDict) -> tuple[str | None, 
     if hook_event == "PostToolUse":
         metadata = tool_event_metadata(payload, phase="finished")
         metadata.update(search_receipt_metadata(payload))
+        if metadata.get("sesh_request_id"):
+            metadata.update(search_origin_metadata(payload))
         success = tool_success(payload)
         if success is not None:
             metadata["success"] = success
@@ -297,6 +300,59 @@ def search_receipt_metadata(payload):
         ids.add(value)
     # Conflicting envelopes are ambiguous, never choose whichever appears first.
     return {'sesh_request_id': ids.pop()} if len(ids) == 1 else {}
+
+
+def search_origin_metadata(payload: JsonDict) -> JsonDict:
+    """Client-observed session linkage, never an authorization or origin claim."""
+    context_id = first_string(payload, "session_id", "sessionId")
+    transcript = first_string(payload, "transcript_path", "transcriptPath")
+    if not context_id or not SESH_UUID_PATTERN.fullmatch(context_id) or not transcript:
+        return {}
+    path = Path(transcript)
+    if not path.is_absolute():
+        return {}
+    try:
+        # Read only the bounded session header, never tool bodies or passages.
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+        with os.fdopen(fd, "rb") as stream:
+            if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
+                return {}
+            raw = stream.readline(524289)
+        if len(raw) > 524288:
+            return {}
+        header = json.loads(raw, object_pairs_hook=_sesh_unique_object)
+        if not isinstance(header, dict) or header.get("type") != "session_meta":
+            return {}
+        meta = header.get("payload")
+        if not isinstance(meta, dict):
+            return {}
+        origin_id = meta.get("id")
+        if not isinstance(origin_id, str) or not SESH_UUID_PATTERN.fullmatch(origin_id):
+            return {}
+        if not path.name.endswith(f"-{origin_id}.jsonl"):
+            return {}
+        if "session_id" in meta and meta["session_id"] != context_id:
+            return {}
+        if context_id != origin_id:
+            source = meta.get("source")
+            subagent = source.get("subagent") if isinstance(source, dict) else None
+            spawn = subagent.get("thread_spawn") if isinstance(subagent, dict) else None
+            if isinstance(source, dict) and "subagent" in source and not isinstance(subagent, dict):
+                return {}
+            if isinstance(subagent, dict) and "thread_spawn" in subagent and not isinstance(spawn, dict):
+                return {}
+            parents = []
+            if "parent_thread_id" in meta:
+                parents.append(meta["parent_thread_id"])
+            if isinstance(spawn, dict) and "parent_thread_id" in spawn:
+                parents.append(spawn["parent_thread_id"])
+            if not parents or any(parent != context_id for parent in parents):
+                return {}
+        return {"sesh_origin_session_id": origin_id,
+                "sesh_context_session_id": context_id,
+                "sesh_origin_basis": "client_transcript_header_v1"}
+    except (OSError, ValueError, UnicodeError, RecursionError):
+        return {}
 
 
 def metadata_from_payload(payload: JsonDict) -> JsonDict:
