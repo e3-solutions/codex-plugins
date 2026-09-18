@@ -1,0 +1,153 @@
+{
+  "schema_version": 1,
+  "id": "codex-session-logging",
+  "version": "0.2.22",
+  "owner": "Core Edge",
+  "providers": [
+    "codex",
+    "claude"
+  ],
+  "runtime": {
+    "python_min": "3.11"
+  },
+  "include": [
+    "scripts/jolly_roger.py",
+    "scripts/jolly_roger_guidance.py",
+    "scripts/session_logging.py",
+    "scripts/rollout_sync.py",
+    "scripts/rollout_usage.py",
+    "scripts/publish_presence.py",
+    "scripts/drain_queue.py",
+    "scripts/collective.py",
+    "scripts/collective_feedback.py",
+    "scripts/sesh_context.py",
+    "skills/search-coding-sessions"
+  ],
+  "hooks": [
+    {
+      "id": "forum-sesh-guidance",
+      "event": "SessionStart",
+      "providers": [
+        "codex",
+        "claude"
+      ],
+      "entrypoint": "scripts/jolly_roger_guidance.py",
+      "timeout_seconds": 3,
+      "failure_policy": "continue",
+      "background_work": {
+        "mode": "none"
+      }
+    },
+    {
+      "id": "capture-session-start",
+      "event": "SessionStart",
+      "providers": [
+        "codex"
+      ],
+      "entrypoint": "scripts/jolly_roger.py",
+      "timeout_seconds": 10,
+      "failure_policy": "continue",
+      "background_work": {
+        "mode": "existing-worker",
+        "purpose": "Drain existing durable upload queue under its existing nonblocking exclusive lock; foreground success is not upload completion"
+      }
+    },
+    {
+      "id": "capture-user-prompt-submit",
+      "event": "UserPromptSubmit",
+      "providers": [
+        "codex"
+      ],
+      "entrypoint": "scripts/jolly_roger.py",
+      "timeout_seconds": 10,
+      "failure_policy": "continue",
+      "background_work": {
+        "mode": "existing-worker",
+        "purpose": "Drain existing durable upload queue under its existing nonblocking exclusive lock; foreground success is not upload completion"
+      }
+    },
+    {
+      "id": "capture-pre-tool-use",
+      "event": "PreToolUse",
+      "providers": [
+        "codex"
+      ],
+      "entrypoint": "scripts/jolly_roger.py",
+      "timeout_seconds": 10,
+      "failure_policy": "continue",
+      "background_work": {
+        "mode": "existing-worker",
+        "purpose": "Drain existing durable upload queue under its existing nonblocking exclusive lock; foreground success is not upload completion"
+      }
+    },
+    {
+      "id": "capture-post-tool-use",
+      "event": "PostToolUse",
+      "providers": [
+        "codex"
+      ],
+      "entrypoint": "scripts/jolly_roger.py",
+      "timeout_seconds": 10,
+      "failure_policy": "continue",
+      "background_work": {
+        "mode": "existing-worker",
+        "purpose": "Drain existing durable upload queue under its existing nonblocking exclusive lock; foreground success is not upload completion"
+      }
+    },
+    {
+      "id": "capture-stop",
+      "event": "Stop",
+      "providers": [
+        "codex"
+      ],
+      "entrypoint": "scripts/jolly_roger.py",
+      "timeout_seconds": 10,
+      "failure_policy": "continue",
+      "background_work": {
+        "mode": "existing-worker",
+        "purpose": "Drain existing durable upload queue under its existing nonblocking exclusive lock; foreground success is not upload completion"
+      }
+    }
+  ],
+  "skills": [
+    {
+      "path": "skills/search-coding-sessions",
+      "providers": [
+        "codex",
+        "claude"
+      ]
+    }
+  ],
+  "commands": [],
+  "dependencies": [
+    {
+      "kind": "executable",
+      "name": "git"
+    },
+    {
+      "kind": "mcp",
+      "name": "cosmos",
+      "providers": [
+        "codex",
+        "claude"
+      ]
+    }
+  ],
+  "state": [
+    {
+      "id": "logger-state",
+      "purpose": "Existing raw capture, upload queue, sequence and rollout checkpoints",
+      "rollback_compatible": true
+    },
+    {
+      "id": "logger-preferences",
+      "purpose": "Existing upload privacy preference",
+      "rollback_compatible": true
+    },
+    {
+      "id": "forum-feedback",
+      "purpose": "Existing Forum guidance debounce database",
+      "rollback_compatible": true
+    }
+  ]
+}
