@@ -6,12 +6,16 @@ function assertEquals(actual: unknown, expected: unknown): void {
   }
 }
 
-Deno.test("origin linkage is bounded client-attested finished-search metadata", () => {
+for (const toolName of ["mcp__e3__sesh__search_coding_sessions",
+  "mcp__e3_cosmos__sesh__search_coding_sessions",
+  "mcp__cosmos__sesh__search_coding_sessions",
+  "mcp__cosmos_e3__sesh__search_coding_sessions"]) {
+Deno.test(`origin linkage is bounded client-attested finished-search metadata: ${toolName}`, () => {
   const context = "11111111-1111-4111-8111-111111111111";
   const origin = "22222222-2222-4222-8222-222222222222";
   const record = { id: context, session_id: context, seq: 1,
     event_type: "tool_call_finished", created_at: "2026-09-18T00:00:00Z",
-    metadata: { tool_name: "mcp__e3__sesh__search_coding_sessions",
+    metadata: { tool_name: toolName,
       tool_phase: "finished", sesh_request_id: context,
       sesh_origin_session_id: origin, sesh_context_session_id: context,
       sesh_origin_basis: "client_transcript_header_v1" } };
@@ -41,6 +45,7 @@ Deno.test("origin linkage is bounded client-attested finished-search metadata", 
     { sesh_origin_basis: "server_verified" },
     { sesh_request_id: "invalid" },
     { tool_name: "unrelated" },
+    { tool_name: `${toolName}_extra` },
   ]) {
     const result = sanitizeEventPayload({ ...record,
       metadata: { ...record.metadata, ...patch } }, {});
@@ -49,3 +54,4 @@ Deno.test("origin linkage is bounded client-attested finished-search metadata", 
   const started = sanitizeEventPayload({ ...record, event_type: "tool_call_started" }, {});
   assertEquals((started.metadata as Record<string, unknown>).sesh_origin_session_id, undefined);
 });
+}

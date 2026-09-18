@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from test_codex_session_logging import load_session_logging, SESH_SEARCH_TOOL, SESH_REQUEST_ID
+from test_codex_session_logging import load_session_logging, SESH_SEARCH_TOOL, SESH_SEARCH_ALIASES, SESH_REQUEST_ID
 
 
 PARENT = "11111111-1111-4111-8111-111111111111"
@@ -24,9 +24,11 @@ def fixture_payload(tmp_path, origin=CHILD, context=PARENT):
 
 
 @pytest.mark.parametrize("same", [False, True])
-def test_verified_direct_or_child_origin(tmp_path, same):
+@pytest.mark.parametrize("tool_name", SESH_SEARCH_ALIASES)
+def test_verified_direct_or_child_origin(tmp_path, same, tool_name):
     module = load_session_logging()
     payload, _, _ = fixture_payload(tmp_path, context=CHILD if same else PARENT)
+    payload["tool_name"] = tool_name
     _, metadata = module.event_from_payload("PostToolUse", payload)
     assert metadata["sesh_origin_session_id"] == CHILD
     assert metadata["sesh_context_session_id"] == payload["session_id"]
@@ -97,12 +99,14 @@ def test_direct_parent_only(tmp_path):
     assert module.search_origin_metadata(payload)["sesh_origin_session_id"] == CHILD
 
 
-def test_capture_to_server_sanitizer_roundtrip(tmp_path, monkeypatch):
+@pytest.mark.parametrize("tool_name", SESH_SEARCH_ALIASES)
+def test_capture_to_server_sanitizer_roundtrip(tmp_path, monkeypatch, tool_name):
     deno = os.environ.get("SESH_TEST_DENO") or shutil.which("deno")
     if not deno:
         pytest.skip("Deno required for cross-runtime contract test")
     module = load_session_logging()
     payload, _, _ = fixture_payload(tmp_path)
+    payload["tool_name"] = tool_name
     payload["tool_input"] = {"query": "PRIVATE QUESTION"}
     monkeypatch.setenv("CODEX_SESSION_LOG_STATE_DIR", str(tmp_path / "state"))
     monkeypatch.setenv("CODEX_SESSION_LOG_AUTO_UPLOAD", "0")
