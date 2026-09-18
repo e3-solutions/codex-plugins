@@ -37,6 +37,35 @@ def read_jsonl(path: Path) -> list[dict]:
     return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
 
 
+@pytest.mark.parametrize("event", ["PreToolUse", "PostToolUse"])
+@pytest.mark.parametrize("key", ["tool_use_id", "tool_call_id", "toolCallId", "call_id", "callId"])
+def test_host_tool_call_id_aliases(event, key):
+    module = load_session_logging()
+    _, metadata = module.event_from_payload(event, {
+        "tool_name": "mcp__e3_cosmos__sesh__search_coding_sessions",
+        key: "call_synthetic",
+        "tool_input": {"query": "private question"},
+        "tool_response": {"content": "private response"},
+    })
+    assert metadata["tool_call_id"] == "call_synthetic"
+    assert "private" not in repr(metadata)
+
+
+def test_host_tool_call_id_alias_keeps_legacy_precedence():
+    module = load_session_logging()
+    metadata = module.tool_event_metadata({"tool_name": "synthetic",
+        "tool_call_id": "legacy", "tool_use_id": "host"}, phase="finished")
+    assert metadata["tool_call_id"] == "legacy"
+
+
+@pytest.mark.parametrize("value", [None, "", 1, {}, []])
+def test_invalid_host_tool_call_id_is_omitted(value):
+    module = load_session_logging()
+    metadata = module.tool_event_metadata({"tool_name": "synthetic",
+        "tool_use_id": value}, phase="finished")
+    assert "tool_call_id" not in metadata
+
+
 def read_queue_records(path: Path) -> list[dict]:
     pending_dir = path / "queue" / "pending"
     if pending_dir.exists():
@@ -320,7 +349,8 @@ def test_pre_tool_use_records_only_tool_name_without_arguments(tmp_path, monkeyp
     assert "super-secret-value" not in detail_text
 
 
-def test_post_tool_use_records_tool_completion_without_output(tmp_path, monkeypatch):
+@pytest.mark.parametrize("host_call_id", [None, "call_synthetic_host"])
+def test_post_tool_use_records_tool_completion_without_output(tmp_path, monkeypatch, host_call_id):
     monkeypatch.setenv("CODEX_SESSION_LOG_STATE_DIR", str(tmp_path / "state"))
     session_logging = load_session_logging()
     repo = init_git_repo(tmp_path / "repo", "https://github.com/e3-solutions/codex-plugins.git")
@@ -328,6 +358,7 @@ def test_post_tool_use_records_tool_completion_without_output(tmp_path, monkeypa
     result = session_logging.capture_hook_event(
         {
             "hook_event_name": "PostToolUse",
+            "tool_use_id": host_call_id,
             "session_id": "session-tools",
             "cwd": str(repo),
             "tool": {"name": "web.run"},
@@ -346,7 +377,11 @@ def test_post_tool_use_records_tool_completion_without_output(tmp_path, monkeypa
         "success": True,
         "tool_name": "web.run",
         "tool_phase": "finished",
+        **({"tool_call_id": host_call_id} if host_call_id else {}),
     }
+    queued = read_queue_records(tmp_path / "state")
+    assert len(queued) == 1
+    assert queued[0]["metadata"] == detail["metadata"]
     assert "tool_response" not in detail_text
     assert "large output" not in detail_text
 

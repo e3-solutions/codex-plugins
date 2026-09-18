@@ -260,7 +260,7 @@ def tool_event_metadata(payload: JsonDict, *, phase: str) -> JsonDict:
         "tool_name": tool,
         "tool_phase": phase,
     }
-    call_id = first_string(payload, "tool_call_id", "toolCallId", "call_id", "callId")
+    call_id = first_string(payload, "tool_call_id", "toolCallId", "call_id", "callId", "tool_use_id")
     if call_id:
         metadata["tool_call_id"] = call_id
     return metadata
