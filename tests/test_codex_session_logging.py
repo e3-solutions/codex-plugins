@@ -972,6 +972,7 @@ def test_ingest_payload_includes_saved_linear_user_name_when_git_identity_is_mis
 
 def test_plugin_packaging_and_supabase_migration_are_present():
     manifest_path = ROOT / "plugins" / "codex-session-logging" / ".codex-plugin" / "plugin.json"
+    assert json.loads(manifest_path.read_text())["version"] == load_session_logging().PLUGIN_VERSION
     hooks_path = ROOT / "plugins" / "codex-session-logging" / "hooks" / "hooks.json"
     marketplace_path = ROOT / ".agents" / "plugins" / "marketplace.json"
     migration_path = (
