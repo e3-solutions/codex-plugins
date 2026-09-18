@@ -1687,7 +1687,8 @@ Deno.test("sanitizeEventPayload keeps only allowlisted tool event fields", () =>
   assertNotIncludes(serialized, "arbitrary_secret");
 });
 
-Deno.test("Sesh request correlation keeps only a canonical UUID on the exact finished event", () => {
+for (const seshToolName of ["mcp__e3_cosmos__sesh__search_coding_sessions", "mcp__e3__sesh__search_coding_sessions"]) {
+Deno.test(`Sesh request correlation keeps only a canonical UUID on ${seshToolName}`, () => {
   const requestId = "aaaaaaaa-1111-4111-8111-111111111111";
   const record = {
     id: "804fd832-7779-4665-9bec-2f10462c721b",
@@ -1697,7 +1698,7 @@ Deno.test("Sesh request correlation keeps only a canonical UUID on the exact fin
     hook_event_name: "PostToolUse",
     created_at: "2026-09-18T00:00:00.000Z",
     metadata: {
-      tool_name: "mcp__e3_cosmos__sesh__search_coding_sessions",
+      tool_name: seshToolName,
       tool_phase: "finished",
       tool_call_id: "call-synthetic",
       sesh_request_id: requestId,
@@ -1753,6 +1754,8 @@ Deno.test("Sesh request correlation keeps only a canonical UUID on the exact fin
   for (
     const override of [
       { tool_name: "other" },
+      { tool_name: "mcp__other__sesh__search_coding_sessions" },
+      { tool_name: "mcp__e3__sesh__search_coding_sessions_extra" },
       { tool_name: " " + record.metadata.tool_name },
       { tool_phase: "started" },
       { tool_phase: "" },
@@ -1774,6 +1777,8 @@ Deno.test("Sesh request correlation keeps only a canonical UUID on the exact fin
     undefined,
   );
 });
+
+}
 
 Deno.test("sanitizeEventPayload keeps resident presence metadata content-free", () => {
   const sanitized = sanitizeEventPayload(
