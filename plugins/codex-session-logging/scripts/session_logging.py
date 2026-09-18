@@ -41,7 +41,7 @@ DEFAULT_BUCKET = "codex-sessions"
 ALLOWED_GITHUB_ORG = "e3-solutions"
 COLLECTIVE_SESSION_SOURCES = frozenset({"startup", "resume", "compact"})
 EXCERPT_BYTES = 4096
-PLUGIN_VERSION = "0.2.15"
+PLUGIN_VERSION = "0.2.20"
 PERMANENT_HTTP_STATUSES = {400, 413, 415, 422}
 _SESSION_UPLOAD_LOCKS: dict[str, threading.Lock] = {}
 _SESSION_UPLOAD_LOCKS_GUARD = threading.Lock()
@@ -260,7 +260,7 @@ def tool_event_metadata(payload: JsonDict, *, phase: str) -> JsonDict:
         "tool_name": tool,
         "tool_phase": phase,
     }
-    call_id = first_string(payload, "tool_call_id", "toolCallId", "call_id", "callId")
+    call_id = first_string(payload, "tool_call_id", "toolCallId", "call_id", "callId", "tool_use_id")
     if call_id:
         metadata["tool_call_id"] = call_id
     return metadata
