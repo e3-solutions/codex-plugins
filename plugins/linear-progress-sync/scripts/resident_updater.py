@@ -17,6 +17,11 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
 
+try:
+    import tomllib
+except ModuleNotFoundError:  # pragma: no cover - Python < 3.11 fallback.
+    tomllib = None  # type: ignore[assignment]
+
 
 JsonDict = dict[str, Any]
 MARKETPLACE_NAME = "coreedge-local"
@@ -295,6 +300,104 @@ def update_marketplace_config(config_path: str | Path, source: str | Path) -> bo
         new = "".join(lines)
     if new == old:
         return False
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    temporary.write_text(new, encoding="utf-8")
+    if path.exists():
+        os.chmod(temporary, stat.S_IMODE(path.stat().st_mode))
+    os.replace(temporary, path)
+    return True
+
+
+def register_default_plugins_with_codex(
+    config_path: Path,
+    plugin_names: list[str],
+    *,
+    runner: Callable[..., Any] = subprocess.run,
+) -> bool:
+    environment = os.environ.copy()
+    environment["CODEX_HOME"] = str(config_path.parent)
+
+    def run_codex(args: list[str]) -> Any:
+        try:
+            completed = runner(
+                args,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+                env=environment,
+            )
+        except (FileNotFoundError, OSError) as exc:
+            raise RuntimeError(f"Codex CLI is required to register default plugins: {exc}") from exc
+        if completed.returncode != 0:
+            message = (completed.stderr or completed.stdout or str(completed.returncode)).strip()
+            raise RuntimeError(f"Codex plugin registration failed: {message}")
+        return completed
+
+    listing = run_codex(["codex", "plugin", "list", "--json"])
+    try:
+        payload = json.loads(listing.stdout)
+        installed = payload.get("installed", [])
+        existing = {
+            str(item["pluginId"])
+            for item in installed
+            if isinstance(item, dict) and isinstance(item.get("pluginId"), str)
+        }
+    except (AttributeError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise RuntimeError("Codex plugin list returned invalid JSON") from exc
+
+    changed = False
+    for name in plugin_names:
+        plugin_id = f"{name}@{MARKETPLACE_NAME}"
+        if plugin_id in existing:
+            continue
+        run_codex(["codex", "plugin", "add", plugin_id, "--json"])
+        changed = True
+    return changed
+
+
+def register_default_plugins(
+    config_path: str | Path,
+    plugin_names: list[str],
+    *,
+    runner: Callable[..., Any] = subprocess.run,
+) -> bool:
+    path = Path(config_path).expanduser().resolve()
+    old = path.read_text(encoding="utf-8") if path.exists() else ""
+    if tomllib is None:
+        return register_default_plugins_with_codex(path, plugin_names, runner=runner)
+
+    try:
+        parsed = tomllib.loads(old) if old.strip() else {}
+    except Exception as exc:
+        raise ValueError(f"Cannot register default plugins in invalid TOML: {path}") from exc
+    configured = parsed.get("plugins", {})
+    if not isinstance(configured, dict):
+        raise ValueError(f"Codex plugins config must be a table: {path}")
+    existing_plugins = {str(name) for name in configured}
+
+    missing = [
+        name
+        for name in plugin_names
+        if f"{name}@{MARKETPLACE_NAME}" not in existing_plugins
+    ]
+    if not missing:
+        return False
+
+    new = old
+    if new and not new.endswith("\n"):
+        new += "\n"
+    if new and not new.endswith("\n\n"):
+        new += "\n"
+    new += "\n".join(
+        f"[plugins.{toml_string(f'{name}@{MARKETPLACE_NAME}')}]\nenabled = true\n"
+        for name in missing
+    )
+    try:
+        tomllib.loads(new)
+    except Exception as exc:  # pragma: no cover - generated keys are escaped above.
+        raise ValueError(f"Generated invalid Codex plugin config: {path}") from exc
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
     temporary.write_text(new, encoding="utf-8")
@@ -1086,6 +1189,7 @@ def ensure_resident_updater(
     bootstrap_root = Path(plugin_root).expanduser().resolve()
     runtime_source = bootstrap_root
     managed_plugins: list[JsonDict] = []
+    registrations_changed = False
     try:
         managed_plugins = marketplace_plugins(resident / "marketplace" / "current")
         runtime_source = next(
@@ -1118,6 +1222,11 @@ def ensure_resident_updater(
             rollback_plugin_cache_installs(replacements)
             raise
         commit_plugin_cache_installs(replacements)
+    if managed_plugins:
+        registrations_changed = register_default_plugins(
+            codex / "config.toml",
+            [str(plugin["name"]) for plugin in managed_plugins],
+        )
     runner_path = resident / "run.sh"
     runner_changed = write_if_changed(
         runner_path,
@@ -1197,6 +1306,7 @@ def ensure_resident_updater(
                     "scheduled": True,
                     "changed": bool(
                         preference_changed
+                        or registrations_changed
                         or runtime["changed"]
                         or repaired_caches
                         or runner_changed
@@ -1219,6 +1329,7 @@ def ensure_resident_updater(
                 "scheduled": False,
                 "changed": bool(
                     preference_changed
+                    or registrations_changed
                     or runtime["changed"]
                     or repaired_caches
                     or runner_changed
@@ -1257,6 +1368,7 @@ def ensure_resident_updater(
             "scheduled": scheduled,
             "changed": bool(
                 preference_changed
+                or registrations_changed
                 or runtime["changed"]
                 or repaired_caches
                 or runner_changed
@@ -1293,6 +1405,7 @@ def ensure_resident_updater(
             "reason": "unsupported_platform",
             "changed": bool(
                 preference_changed
+                or registrations_changed
                 or runtime["changed"]
                 or repaired_caches
                 or runner_changed
@@ -1331,6 +1444,7 @@ def ensure_resident_updater(
                 "scheduled": True,
                 "changed": bool(
                     preference_changed
+                    or registrations_changed
                     or runtime["changed"]
                     or repaired_caches
                     or runner_changed
@@ -1360,6 +1474,7 @@ def ensure_resident_updater(
         "scheduled": scheduled,
         "changed": bool(
             preference_changed
+            or registrations_changed
             or runtime["changed"]
             or repaired_caches
             or runner_changed
@@ -1433,6 +1548,10 @@ def activate_release(
                 )
         pointer_changed = atomic_symlink(staged_root, current)
         config_changed = update_marketplace_config(config_path, current)
+        config_changed = register_default_plugins(
+            config_path,
+            [str(plugin["name"]) for plugin in plugins],
+        ) or config_changed
         moved = activate_plugin_caches(
             plugins,
             cache_root=cache,
