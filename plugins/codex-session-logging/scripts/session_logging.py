@@ -42,7 +42,7 @@ DEFAULT_BUCKET = "codex-sessions"
 ALLOWED_GITHUB_ORG = "e3-solutions"
 COLLECTIVE_SESSION_SOURCES = frozenset({"startup", "resume", "compact"})
 EXCERPT_BYTES = 4096
-PLUGIN_VERSION = "0.2.25"
+PLUGIN_VERSION = "0.2.26"
 PERMANENT_HTTP_STATUSES = {400, 413, 415, 422}
 _SESSION_UPLOAD_LOCKS: dict[str, threading.Lock] = {}
 _SESSION_UPLOAD_LOCKS_GUARD = threading.Lock()
@@ -228,6 +228,7 @@ def event_from_payload(hook_event: str, payload: JsonDict) -> tuple[str | None, 
         metadata.update(search_receipt_metadata(payload))
         if metadata.get("sesh_request_id"):
             metadata.update(search_origin_metadata(payload))
+        metadata.update(source_open_metadata(payload))
         success = tool_success(payload)
         if success is not None:
             metadata["success"] = success
@@ -243,8 +244,16 @@ SESH_SEARCH_TOOLS = (
     'mcp__cosmos_e3__sesh__search_coding_sessions',
 )
 SESH_MAX_RESPONSE_BYTES = 262144
+SESH_MAX_DELIVERED_SOURCE_HANDLES = 75
+SESH_MAX_SOURCE_HANDLE_OCCURRENCES = 80
 SESH_UUID_PATTERN = re.compile(
     r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[89ab][0-9a-f]{3}-[0-9a-f]{12}'
+)
+SESH_ANY_UUID_PATTERN = re.compile(
+    r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
+)
+SESH_ROLLOUT_REFERENCE_PATTERN = re.compile(
+    r'[0-9a-f]{64}:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
 )
 
 
@@ -257,45 +266,144 @@ def _sesh_unique_object(pairs):
     return value
 
 
+def _sesh_response_bodies(response):
+    """Return only bounded, unambiguous response objects; never tool input."""
+    if not isinstance(response, dict):
+        return None
+    bodies = []
+    if 'search_request_id' in response or 'results' in response:
+        bodies.append(response)
+    structured = response.get('structuredContent')
+    if 'structuredContent' in response and not isinstance(structured, dict):
+        return None
+    if isinstance(structured, dict):
+        bodies.append(structured)
+    content = response.get('content')
+    if 'content' in response and (not isinstance(content, list) or len(content) != 1):
+        return None
+    if isinstance(content, list) and len(content) == 1:
+        item = content[0]
+        if not isinstance(item, dict) or item.get('type') != 'text':
+            return None
+        raw = item.get('text')
+        if not isinstance(raw, str) or len(raw) > SESH_MAX_RESPONSE_BYTES:
+            return None
+        try:
+            if len(raw.encode('utf-8')) > SESH_MAX_RESPONSE_BYTES:
+                return None
+            decoded = json.loads(raw, object_pairs_hook=_sesh_unique_object)
+        except (ValueError, UnicodeError, RecursionError):
+            return None
+        if not isinstance(decoded, dict):
+            return None
+        bodies.append(decoded)
+    return bodies
+
+
+def _canonical_uuid(value):
+    if not isinstance(value, str) or SESH_ANY_UUID_PATTERN.fullmatch(value) is None:
+        return False
+    try:
+        return str(uuid.UUID(value)) == value and uuid.UUID(value).int != 0
+    except (ValueError, AttributeError):
+        return False
+
+
+def _canonical_source_handle(tool, arguments):
+    """Validate the two exact displayed source-handle shapes."""
+    if tool == 'open_coding_session_source':
+        if not isinstance(arguments, dict) or set(arguments) != {'reference_id'}:
+            return None
+        reference_id = arguments.get('reference_id')
+        if (not isinstance(reference_id, str) or
+                SESH_ROLLOUT_REFERENCE_PATTERN.fullmatch(reference_id) is None):
+            return None
+        message_id = reference_id.rsplit(':', 1)[-1]
+        if not _canonical_uuid(message_id):
+            return None
+        leaf = 'sesh__open_coding_session_source'
+    elif tool == 'get_chat':
+        if (not isinstance(arguments, dict) or
+                set(arguments) != {'sessionId', 'includeContent'} or
+                arguments.get('includeContent') is not True or
+                not _canonical_uuid(arguments.get('sessionId'))):
+            return None
+        leaf = 'timetracker__get_chat'
+    else:
+        return None
+    encoded = json.dumps(arguments, sort_keys=True, separators=(',', ':'),
+                         ensure_ascii=True, allow_nan=False)
+    return leaf, encoded
+
+
+def _source_handle_digest(tool, arguments):
+    canonical = _canonical_source_handle(tool, arguments)
+    if canonical is None:
+        return None
+    leaf, encoded = canonical
+    return hashlib.sha256(f'v1\n{leaf}\n{encoded}'.encode('ascii')).hexdigest()
+
+
+def _delivered_source_handle_digests(body):
+    if 'results' not in body:
+        return None
+    results = body.get('results')
+    if not isinstance(results, list) or len(results) > 5:
+        raise ValueError('invalid Sesh result count')
+    digests = []
+    seen = set()
+    visited = 0
+
+    def add_source(source, depth=0):
+        nonlocal visited
+        visited += 1
+        if visited > SESH_MAX_SOURCE_HANDLE_OCCURRENCES or depth > 4:
+            raise ValueError('too many or too deeply nested Sesh source handles')
+        if not isinstance(source, dict):
+            raise ValueError('invalid Sesh source handle')
+        digest = _source_handle_digest(source.get('tool'), source.get('arguments'))
+        if digest is None:
+            raise ValueError('invalid Sesh source handle')
+        if digest not in seen:
+            seen.add(digest)
+            digests.append(digest)
+            if len(digests) > SESH_MAX_DELIVERED_SOURCE_HANDLES:
+                raise ValueError('too many unique Sesh source handles')
+        additional = source.get('additional_sources', [])
+        if not isinstance(additional, list):
+            raise ValueError('invalid additional Sesh sources')
+        for item in additional:
+            add_source(item, depth + 1)
+
+    for result in results:
+        if not isinstance(result, dict):
+            raise ValueError('invalid Sesh result')
+        if 'source' not in result:
+            raise ValueError('missing Sesh result source')
+        add_source(result['source'])
+        evidence = result.get('evidence', [])
+        if not isinstance(evidence, list) or len(evidence) > 15:
+            raise ValueError('invalid Sesh evidence count')
+        for item in evidence:
+            if not isinstance(item, dict) or 'source' not in item:
+                raise ValueError('invalid Sesh evidence source')
+            add_source(item['source'])
+    return digests
+
+
 def search_receipt_metadata(payload):
     if not isinstance(payload, dict) or payload.get('tool_name') not in SESH_SEARCH_TOOLS:
         return {}
     response = payload.get('tool_response')
     if not isinstance(response, dict):
         return {}
-    # Do not traverse passages, arbitrary nested data, or the user's tool input.
-    bodies = []
-    if 'search_request_id' in response:
-        bodies.append(response)
-    structured = response.get('structuredContent')
-    if 'structuredContent' in response and not isinstance(structured, dict):
+    # Traverse only exact bounded handle fields; never passages or tool input.
+    bodies = _sesh_response_bodies(response)
+    if bodies is None:
         return {}
-    if isinstance(structured, dict):
-        bodies.append(structured)
-    content = response.get('content')
-    if 'content' in response and (not isinstance(content, list) or len(content) != 1):
-        return {}
-    if isinstance(content, list) and len(content) == 1:
-        item = content[0]
-        if isinstance(item, dict) and item.get('type') == 'text':
-            raw = item.get('text')
-            if isinstance(raw, str) and len(raw) <= SESH_MAX_RESPONSE_BYTES:
-                try:
-                    if len(raw.encode('utf-8')) <= SESH_MAX_RESPONSE_BYTES:
-                        decoded = json.loads(raw, object_pairs_hook=_sesh_unique_object)
-                        if isinstance(decoded, dict):
-                            bodies.append(decoded)
-                        else:
-                            return {}
-                    else:
-                        return {}
-                except (ValueError, UnicodeError, RecursionError):
-                    return {}
-            else:
-                return {}
-        else:
-            return {}
     ids = set()
+    delivered_sets = []
+    delivered_invalid = False
     for body in bodies:
         value = body.get('search_request_id')
         if value is None:
@@ -303,8 +411,77 @@ def search_receipt_metadata(payload):
         if not isinstance(value, str) or SESH_UUID_PATTERN.fullmatch(value) is None:
             return {}
         ids.add(value)
+        try:
+            delivered = _delivered_source_handle_digests(body)
+            if delivered is not None:
+                delivered_sets.append(delivered)
+        except (ValueError, TypeError, UnicodeError, RecursionError):
+            delivered_invalid = True
     # Conflicting envelopes are ambiguous, never choose whichever appears first.
-    return {'sesh_request_id': ids.pop()} if len(ids) == 1 else {}
+    if len(ids) != 1:
+        return {}
+    metadata = {'sesh_request_id': ids.pop()}
+    if (not delivered_invalid and delivered_sets and
+            all(item == delivered_sets[0] for item in delivered_sets[1:])):
+        metadata['sesh_delivered_source_handle_sha256_v1'] = delivered_sets[0]
+    return metadata
+
+
+def _direct_source_open_tool(payload):
+    name = payload.get('tool_name') if isinstance(payload, dict) else None
+    if not isinstance(name, str):
+        return None
+    for namespace in ('e3_cosmos', 'e3', 'cosmos', 'cosmos_e3'):
+        prefix = f'mcp__{namespace}__'
+        if name == prefix + 'sesh__open_coding_session_source':
+            return 'open_coding_session_source'
+        if name == prefix + 'timetracker__get_chat':
+            return 'get_chat'
+    return None
+
+
+def _verified_sesh_source_open(payload, reference_id):
+    response = payload.get('tool_response')
+    bodies = _sesh_response_bodies(response)
+    if bodies is None:
+        return False
+    if (isinstance(response, dict) and
+            any(key in response for key in ('reference_id', 'message_id', 'verification')) and
+            response not in bodies):
+        bodies.append(response)
+    witnessed = False
+    expected_message = reference_id.rsplit(':', 1)[-1]
+    for body in bodies:
+        keys_present = any(key in body for key in ('reference_id', 'message_id', 'verification'))
+        if not keys_present:
+            continue
+        if (body.get('reference_id') != reference_id or
+                body.get('message_id') != expected_message or
+                body.get('verification') != 'exact_source_bytes'):
+            return False
+        witnessed = True
+    return witnessed
+
+
+def source_open_metadata(payload):
+    """Content-free source-handle correlation; never an authorization claim."""
+    try:
+        tool = _direct_source_open_tool(payload)
+        if tool is None:
+            return {}
+        arguments = payload.get('tool_input')
+        digest = _source_handle_digest(tool, arguments)
+        if digest is None:
+            return {}
+        success = tool_success(payload)
+        witness = 'failed' if success is False else 'unknown'
+        if (success is not False and tool == 'open_coding_session_source' and
+                _verified_sesh_source_open(payload, arguments['reference_id'])):
+            witness = 'verified'
+        return {'sesh_opened_source_handle_sha256_v1': digest,
+                'sesh_source_open_witness_v1': witness}
+    except (ValueError, TypeError, UnicodeError, RecursionError):
+        return {}
 
 
 def search_origin_metadata(payload: JsonDict) -> JsonDict:

@@ -1780,6 +1780,149 @@ Deno.test(`Sesh request correlation keeps only a canonical UUID on ${seshToolNam
 
 }
 
+Deno.test("Sesh delivery digests stay bounded, canonical, and copy-agreed", () => {
+  const digestA = "a".repeat(64);
+  const digestB = "b".repeat(64);
+  const requestId = "aaaaaaaa-1111-4111-8111-111111111111";
+  const metadata = {
+    tool_name: "mcp__e3_cosmos__sesh__search_coding_sessions",
+    tool_phase: "finished",
+    sesh_request_id: requestId,
+    sesh_delivered_source_handle_sha256_v1: [digestA, digestB],
+    tool_input: { query: "PRIVATE QUESTION" },
+    tool_response: { passage: "PRIVATE PASSAGE" },
+  };
+  const record = {
+    id: "804fd832-7779-4665-9bec-2f10462c721b",
+    session_id: "session-sesh-delivery",
+    seq: 8,
+    event_type: "tool_call_finished",
+    hook_event_name: "PostToolUse",
+    created_at: "2026-09-21T00:00:00.000Z",
+    metadata,
+  };
+  const clean = sanitizeEventPayload(record, { metadata: { ...metadata } });
+  assertEquals((clean.metadata as JsonObject).sesh_delivered_source_handle_sha256_v1,
+    [digestA, digestB]);
+  assertNotIncludes(JSON.stringify(clean), "PRIVATE");
+
+  for (const invalid of [
+    [digestA, digestA],
+    [digestA.toUpperCase()],
+    ["short"],
+    Array.from({ length: 76 }, (_, index) => index.toString(16).padStart(64, "0")),
+  ]) {
+    const result = sanitizeEventPayload({
+      ...record, metadata: { ...metadata,
+        sesh_delivered_source_handle_sha256_v1: invalid },
+    }, {});
+    assertEquals(
+      (result.metadata as JsonObject).sesh_delivered_source_handle_sha256_v1,
+      undefined,
+    );
+    assertEquals((result.metadata as JsonObject).sesh_request_id, requestId);
+  }
+
+  const conflict = sanitizeEventPayload(record, { metadata: {
+    ...metadata, sesh_delivered_source_handle_sha256_v1: [digestB, digestA],
+  } });
+  assertEquals(
+    (conflict.metadata as JsonObject).sesh_delivered_source_handle_sha256_v1,
+    undefined,
+  );
+  assertEquals((conflict.metadata as JsonObject).sesh_request_id, requestId);
+});
+
+Deno.test("Sesh source-open digest and witness require exact tools and agreeing copies", () => {
+  const digest = "c".repeat(64);
+  for (const toolName of [
+    "mcp__e3_cosmos__sesh__open_coding_session_source",
+    "mcp__e3__timetracker__get_chat",
+    "mcp__cosmos__sesh__open_coding_session_source",
+    "mcp__cosmos_e3__timetracker__get_chat",
+  ]) {
+    const witness = toolName.includes("timetracker__get_chat") ? "unknown" : "verified";
+    const metadata = {
+      tool_name: toolName,
+      tool_phase: "finished",
+      tool_call_id: "call-source-open",
+      sesh_opened_source_handle_sha256_v1: digest,
+      sesh_source_open_witness_v1: witness,
+      tool_input: { reference_id: "PRIVATE HANDLE" },
+      tool_response: { text: "PRIVATE SOURCE" },
+    };
+    const record = {
+      id: "804fd832-7779-4665-9bec-2f10462c721b",
+      session_id: "session-sesh-source-open",
+      seq: 9,
+      event_type: "tool_call_finished",
+      hook_event_name: "PostToolUse",
+      created_at: "2026-09-21T00:00:00.000Z",
+      metadata,
+    };
+    const clean = sanitizeEventPayload(record, { metadata: { ...metadata } });
+    assertEquals(clean.metadata, {
+      tool_name: toolName,
+      tool_phase: "finished",
+      tool_call_id: "call-source-open",
+      sesh_opened_source_handle_sha256_v1: digest,
+      sesh_source_open_witness_v1: witness,
+    });
+    assertNotIncludes(JSON.stringify(clean), "PRIVATE");
+
+    for (const override of [
+      { sesh_opened_source_handle_sha256_v1: digest.toUpperCase() },
+      { sesh_opened_source_handle_sha256_v1: "short" },
+      { sesh_source_open_witness_v1: "success" },
+      { tool_phase: "started" },
+      { tool_name: toolName + "_extra" },
+    ]) {
+      const result = sanitizeEventPayload({
+        ...record, metadata: { ...metadata, ...override },
+      }, {});
+      assertEquals(
+        (result.metadata as JsonObject).sesh_opened_source_handle_sha256_v1,
+        undefined,
+      );
+      assertEquals(
+        (result.metadata as JsonObject).sesh_source_open_witness_v1,
+        undefined,
+      );
+    }
+
+    const conflict = sanitizeEventPayload(record, { metadata: {
+      ...metadata, sesh_source_open_witness_v1: witness === "unknown" ? "failed" : "unknown",
+    } });
+    assertEquals(
+      (conflict.metadata as JsonObject).sesh_opened_source_handle_sha256_v1,
+      undefined,
+    );
+    assertEquals(
+      (conflict.metadata as JsonObject).sesh_source_open_witness_v1,
+      undefined,
+    );
+  }
+
+  const forgedCosmosVerified = sanitizeEventPayload({
+    id: "804fd832-7779-4665-9bec-2f10462c721b",
+    session_id: "session-sesh-source-open",
+    seq: 10,
+    event_type: "tool_call_finished",
+    hook_event_name: "PostToolUse",
+    created_at: "2026-09-21T00:00:00.000Z",
+    metadata: {
+      tool_name: "mcp__e3_cosmos__timetracker__get_chat",
+      tool_phase: "finished",
+      sesh_opened_source_handle_sha256_v1: digest,
+      sesh_source_open_witness_v1: "verified",
+    },
+  }, {});
+  assertEquals(
+    (forgedCosmosVerified.metadata as JsonObject).sesh_source_open_witness_v1,
+    undefined,
+  );
+});
+
 Deno.test("sanitizeEventPayload keeps resident presence metadata content-free", () => {
   const sanitized = sanitizeEventPayload(
     {
