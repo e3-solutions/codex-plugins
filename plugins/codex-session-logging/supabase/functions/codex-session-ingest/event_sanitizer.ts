@@ -80,10 +80,7 @@ function sanitizeEventMetadata(
     const requestId = source.sesh_request_id;
     if (
       eventType === "tool_call_finished" &&
-      (source.tool_name === "mcp__e3_cosmos__sesh__search_coding_sessions" ||
-        source.tool_name === "mcp__e3__sesh__search_coding_sessions" ||
-        source.tool_name === "mcp__cosmos__sesh__search_coding_sessions" ||
-        source.tool_name === "mcp__cosmos_e3__sesh__search_coding_sessions") &&
+      isSeshSearchTool(source.tool_name) &&
       source.tool_phase === "finished" &&
       typeof requestId === "string" && requestId.length === 36 &&
       /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
@@ -109,6 +106,41 @@ function sanitizeEventMetadata(
         metadata.sesh_context_session_id = context;
         metadata.sesh_origin_basis = "client_transcript_header_v1";
       }
+      const deliveredKey = "sesh_delivered_source_handle_sha256_v1";
+      const delivered = canonicalDigestArray(recordMetadata[deliveredKey], 75);
+      const eventHasDelivered = deliveredKey in eventMetadata;
+      const deliveredCopiesAgree = !eventHasDelivered ||
+        sameStringArray(delivered, canonicalDigestArray(eventMetadata[deliveredKey], 75));
+      if (delivered !== null && deliveredCopiesAgree &&
+          recordMetadata.tool_name === source.tool_name &&
+          recordMetadata.tool_phase === "finished" &&
+          recordMetadata.sesh_request_id === requestId) {
+        metadata[deliveredKey] = delivered;
+      }
+    }
+
+    if (
+      eventType === "tool_call_finished" &&
+      isSeshSourceOpenTool(source.tool_name) &&
+      source.tool_phase === "finished"
+    ) {
+      const digestKey = "sesh_opened_source_handle_sha256_v1";
+      const witnessKey = "sesh_source_open_witness_v1";
+      const digest = canonicalDigest(recordMetadata[digestKey]);
+      const witness = recordMetadata[witnessKey];
+      const eventHasSourceOpen = digestKey in eventMetadata || witnessKey in eventMetadata;
+      const copiesAgree = !eventHasSourceOpen ||
+        (digest === canonicalDigest(eventMetadata[digestKey]) &&
+          witness === eventMetadata[witnessKey]);
+      const verifiedAllowed = witness !== "verified" ||
+        isSeshExactBytesSourceOpenTool(source.tool_name);
+      if (digest !== null &&
+          (witness === "verified" || witness === "failed" || witness === "unknown") &&
+          verifiedAllowed && copiesAgree && recordMetadata.tool_name === source.tool_name &&
+          recordMetadata.tool_phase === "finished") {
+        metadata[digestKey] = digest;
+        metadata[witnessKey] = witness;
+      }
     }
   }
 
@@ -132,6 +164,54 @@ function sanitizeEventMetadata(
   }
 
   return metadata;
+}
+
+function isSeshSearchTool(value: unknown): boolean {
+  return value === "mcp__e3_cosmos__sesh__search_coding_sessions" ||
+    value === "mcp__e3__sesh__search_coding_sessions" ||
+    value === "mcp__cosmos__sesh__search_coding_sessions" ||
+    value === "mcp__cosmos_e3__sesh__search_coding_sessions";
+}
+
+function isSeshSourceOpenTool(value: unknown): boolean {
+  return ["e3_cosmos", "e3", "cosmos", "cosmos_e3"].some((namespace) =>
+    value === `mcp__${namespace}__sesh__open_coding_session_source` ||
+    value === `mcp__${namespace}__timetracker__get_chat`
+  );
+}
+
+function isSeshExactBytesSourceOpenTool(value: unknown): boolean {
+  return ["e3_cosmos", "e3", "cosmos", "cosmos_e3"].some((namespace) =>
+    value === `mcp__${namespace}__sesh__open_coding_session_source`
+  );
+}
+
+function canonicalDigest(value: unknown): string | null {
+  return typeof value === "string" && /^[0-9a-f]{64}$/.test(value)
+    ? value
+    : null;
+}
+
+function canonicalDigestArray(value: unknown, maximum: number): string[] | null {
+  if (!Array.isArray(value) || value.length > maximum) {
+    return null;
+  }
+  const result: string[] = [];
+  const seen = new Set<string>();
+  for (const item of value) {
+    const digest = canonicalDigest(item);
+    if (digest === null || seen.has(digest)) {
+      return null;
+    }
+    seen.add(digest);
+    result.push(digest);
+  }
+  return result;
+}
+
+function sameStringArray(left: string[] | null, right: string[] | null): boolean {
+  return left !== null && right !== null && left.length === right.length &&
+    left.every((value, index) => value === right[index]);
 }
 
 function sanitizeCodexSetup(value: JsonObject): JsonObject {

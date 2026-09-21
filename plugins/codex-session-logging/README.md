@@ -18,7 +18,19 @@ client-attested correlation, not authorization, provenance, relevance, successfu
 source opening, or proof that the evidence helped. Older clients/events lack it;
 do not infer missing usage or usefulness from a missing link.
 
-Deploy the compatible sanitizer before distributing logging 0.2.21. Rollback of
+Finished search events may also retain an ordered, deduplicated list of at most
+75 SHA-256 digests for the exact bounded source handles present in the returned
+result/evidence envelopes. Finished `open_coding_session_source` and
+`timetracker__get_chat` events may retain the matching opened-handle digest and
+a `verified`, `failed`, or `unknown` witness. `verified` is limited to an exact
+Sesh source response whose reference/message IDs agree and whose verification is
+`exact_source_bytes`; Cosmos `get_chat` remains `unknown` absent a separately
+specified strict witness. Digests use canonical public tool arguments and never
+retain the raw reference/session ID, query, passage, source body, or arbitrary
+tool input/output. Malformed, conflicting, oversized, duplicate, or unsupported
+envelopes omit the optional metadata without changing tool behavior.
+
+Deploy the compatible sanitizer before distributing this logging release. Rollback of
 either side safely omits the optional field; no schema migration is required.
 
 ## Collective prompt contract
