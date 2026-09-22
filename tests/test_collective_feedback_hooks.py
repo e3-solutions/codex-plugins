@@ -202,7 +202,13 @@ def test_non_context_events_never_prompt(name, local):
             continue
         payload = {**local[2], "hook_event_name": event, "tool_name": "Read",
                    "last_assistant_message": "Substantive reusable result with evidence"}
-        assert "E3 Collective" not in invoke(name, local, event, payload)
+        output = invoke(name, local, event, payload)
+        if event == "UserPromptSubmit" and name == "codex-session-logging":
+            # Only the decision-time Forum cue; never contribution/feedback guidance.
+            assert "E3 Collective / Forum:" not in output and "E3 Collective:" not in output
+            assert "share_with_collective" not in output
+            continue
+        assert "E3 Collective" not in output
 
 
 @pytest.mark.parametrize("remote", [

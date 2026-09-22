@@ -303,23 +303,33 @@ def test_stop_process_is_silent_for_substantive_completion(
     "agent,scripts",
     [("codex", CODEX_SCRIPTS), ("claude", CLAUDE_SCRIPTS)],
 )
-def test_user_prompt_submit_process_is_silent_in_e3(tmp_path, agent, scripts):
+def test_user_prompt_submit_process_in_e3_emits_only_the_forum_decision_cue(tmp_path, agent, scripts):
     repo = init_git_repo(tmp_path / f"{agent}-repo", "git@github.com:e3-solutions/example.git")
     env = base_env(tmp_path, agent=agent)
-    result = run_hook(
-        scripts,
-        "user_prompt_submit",
-        {
-            "hook_event_name": "UserPromptSubmit",
-            "session_id": "test-session",
-            "cwd": str(repo),
-            "prompt": "ordinary request",
-        },
-        env=env,
-    )
+    prompt = {
+        "hook_event_name": "UserPromptSubmit",
+        "session_id": "test-session",
+        "cwd": str(repo),
+        "prompt": "ordinary request",
+    }
+    result = run_hook(scripts, "user_prompt_submit", prompt, env=env)
 
     assert result.returncode == 0
-    assert result.stdout == ""
+    if agent == "claude":
+        assert result.stdout == ""
+        return
+    # Codex: one hook JSON object carrying only the decision-time Forum cue.
+    output = json.loads(result.stdout)
+    context = output["hookSpecificOutput"]["additionalContext"]
+    assert output["hookSpecificOutput"]["hookEventName"] == "UserPromptSubmit"
+    assert context.startswith("Forum check (E3 Collective)") and "Forum: USE" in context
+    assert "E3 Collective / Forum:" not in context and "share_with_collective" not in context
+    # A short follow-up in the same thread stays silent.
+    again = run_hook(scripts, "user_prompt_submit", {**prompt, "prompt": "go ahead"}, env=env)
+    assert again.returncode == 0 and again.stdout == ""
+    env["FORUM_CUE_ENABLED"] = "0"
+    optout = run_hook(scripts, "user_prompt_submit", {**prompt, "session_id": "other"}, env=env)
+    assert optout.returncode == 0 and optout.stdout == ""
 
 
 @pytest.mark.parametrize(
