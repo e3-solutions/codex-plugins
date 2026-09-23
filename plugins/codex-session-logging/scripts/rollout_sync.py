@@ -116,6 +116,10 @@ def sync_rollouts(
         )
         descriptors = tracked_descriptors + pending_descriptors[:pending_quota]
         descriptors = list({str(item["session_id"]): item for item in descriptors}.values())
+        descriptors = [
+            item for item in descriptors
+            if not session_logging.session_excluded(str(item["session_id"]), str(item["path"]))
+        ]
         attach_root_threads(descriptors, files)
         queued = 0
         captured_bytes = 0
@@ -296,6 +300,11 @@ def eligible_rollout_thread(row: JsonDict) -> bool:
 
 
 def permanently_out_of_scope(row: JsonDict) -> bool:
+    if session_logging.session_excluded(
+        str(row.get("id") or ""),
+        str(row["rollout_path"]) if row.get("rollout_path") else None,
+    ):
+        return True
     remote = row.get("git_origin_url")
     return bool(remote) and not session_logging.remote_belongs_to_org(
         str(remote),
