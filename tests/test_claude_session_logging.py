@@ -350,7 +350,7 @@ def test_claude_plugin_packaging_and_internal_marketplace_are_present():
     hooks_text = json.dumps(hooks)
 
     assert manifest["name"] == "claude-session-logging"
-    assert manifest["version"] == "0.2.16"
+    assert manifest["version"] == "0.2.17"
     assert "Codex" not in manifest["description"]
     assert "SessionStart" in hooks["hooks"]
     assert "UserPromptSubmit" in hooks["hooks"]

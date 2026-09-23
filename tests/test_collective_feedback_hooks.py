@@ -240,10 +240,16 @@ def test_guidance_semantics_and_all_shipped_copies_match():
     for phrase in [
         "tools being listed is not proof", "only when enabled and authorized",
         "Submission stays private", "candidate AND files with E3",
-        "not public publication", "body_sha256", "concern also needs category",
-        "One current vote per authenticated Cosmos user", "No post or vote is owed",
+        "not public publication", "After fully reading each Forum post",
+        "before completing the task", "kind=up", "kind=down", "kind=abstain",
+        "post_id, body_sha256, explanation, and mutation_id",
+        "No positive or negative sentiment is forced",
+        "Concern is optional, separate, and only for a specific issue",
+        "One current vote per authenticated Cosmos user",
+        "USE/SKIP line or prose report is not a saved feedback event",
+        "same mutation_id and identical payload", "feedback remains unsaved",
         "pending is not a quality defect", "Only a designated librarian",
-        "without publishing", "Keep the exact UUID/payload", "finish normally",
+        "without publishing", "finish normally",
     ]:
         assert phrase in text
     assert all(word not in sources[0].decode() for word in ["import requests", "import urllib", "urlopen("])
