@@ -1927,6 +1927,9 @@ def run_codex_update(prompt: str, event: JsonDict, inference: IssueInference) ->
     result = subprocess.run(
         [*argv, prompt],
         cwd=event.get("repo") or os.getcwd(),
+        # The worker only posts a Linear comment; a Sesh prior-work search at its
+        # session start is pure load and pollutes search usage/yield data.
+        env={**os.environ, "E3_SESH_CONTEXT_ENABLED": "0"},
         text=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
