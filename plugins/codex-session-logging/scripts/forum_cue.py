@@ -24,12 +24,12 @@ CUE = (
     "evaluate or investigate something, run ONE forum__search_research_posts before you commit "
     "to an approach. Use 2-4 plain words naming the mechanism or failure (e.g. \"latency timeout\", "
     "\"retry idempotency\"); do not include function, file, table or ticket names, repo names, or a "
-    "post title you already know. If it returns nothing, retry once with fewer words and "
-    "mode=\"related\". For each returned post you read, write one line exactly like "
-    "`Forum: USE <post_id> - <how it changes or confirms the plan>` or "
-    "`Forum: SKIP <post_id> - <why it does not apply>`. If nothing relevant came back, write "
-    "`Forum: NONE - <query>`. Then continue normally. Skip this for status questions, approvals "
-    "and short follow-ups."
+    "post title you already know. For each returned post you read, put one line in your final "
+    "answer exactly like `Forum: USE <post_id> - <how it changes or confirms the plan>` or "
+    "`Forum: SKIP <post_id> - <why it does not apply>`, and record each with "
+    "forum__give_collective_feedback (kind \"use\" or \"skip\", the same reason). If nothing "
+    "relevant came back, put `Forum: NONE - <query>` in your final answer. Then continue normally. "
+    "Skip this for status questions, approvals and short follow-ups."
 )
 
 _E3_REMOTE = re.compile(

@@ -37,6 +37,8 @@ def test_first_prompt_in_e3_repository_gets_cue_and_log_without_prompt_text(tmp_
     output = cue.forum_cue(payload("secret task words"), directory=tmp_path, now=1000.0)
     assert context_of(output) == cue.CUE
     assert "Forum: USE" in cue.CUE and "2-4 plain words" in cue.CUE
+    # Lines belong in the user-visible final answer; Forum itself retries empty searches.
+    assert "final answer" in cue.CUE and "related" not in cue.CUE
     log = [json.loads(line) for line in (tmp_path / "cue-log.jsonl").read_text().splitlines()]
     assert log == [{"ts": "1970-01-01T00:16:40Z", "session_id": "s1", "reason": "first_prompt",
                     "prompt_words": 3}]
