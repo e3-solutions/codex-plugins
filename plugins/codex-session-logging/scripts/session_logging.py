@@ -91,6 +91,11 @@ def capture_hook_event(payload: JsonDict, *, event_name: str | None = None) -> J
     if not should_capture_payload(payload):
         return None
     if role and content is not None:
+        if hook_event == "Stop":
+            capture_turn_commentary(payload, hook_event=hook_event)
+            return capture_message_event(
+                payload, hook_event=hook_event, role=role, content=content,
+                extra_metadata={"message_phase": "final_answer"})
         return capture_message_event(payload, hook_event=hook_event, role=role, content=content)
     event_type, event_metadata = event_from_payload(hook_event, payload)
     if not event_type:
@@ -98,7 +103,14 @@ def capture_hook_event(payload: JsonDict, *, event_name: str | None = None) -> J
     return capture_metadata_event(payload, hook_event=hook_event, event_type=event_type, event_metadata=event_metadata)
 
 
-def capture_message_event(payload: JsonDict, *, hook_event: str, role: str, content: str) -> JsonDict:
+def capture_message_event(
+    payload: JsonDict,
+    *,
+    hook_event: str,
+    role: str,
+    content: str,
+    extra_metadata: JsonDict | None = None,
+) -> JsonDict:
     base = ensure_state_dir()
     session_id = safe_segment(first_string(payload, "session_id", "sessionId") or "unknown-session")
     thread_id = thread_id_from_payload(payload)
@@ -111,6 +123,8 @@ def capture_message_event(payload: JsonDict, *, hook_event: str, role: str, cont
     local_content_path = storage_path
     created_at = now_iso()
     metadata = metadata_from_payload(payload)
+    if extra_metadata:
+        metadata.update(extra_metadata)
     message = {
         "id": uuid.uuid4().hex,
         "session_id": session_id,
@@ -207,6 +221,93 @@ def capture_metadata_event(
     enqueue_record(base, event)
     try_auto_drain()
     return event
+
+
+COMMENTARY_INITIAL_TAIL_BYTES = 8 * 1024 * 1024
+COMMENTARY_MAX_PER_TURN = 50
+COMMENTARY_SEEN_LIMIT = 500
+
+
+def commentary_capture_enabled() -> bool:
+    value = os.environ.get("CODEX_SESSION_LOG_COMMENTARY", "1").strip().lower()
+    return value not in {"0", "false", "no", "off"}
+
+
+def capture_turn_commentary(payload: JsonDict, *, hook_event: str) -> list[JsonDict]:
+    """Record the turn's progress updates ("commentary") before its final answer.
+
+    The Stop payload carries only the final message, but agents state most
+    concrete findings in commentary. Only transcript bytes appended since the
+    previous Stop are read, so long sessions are never rescanned. Never raises.
+    """
+    if not commentary_capture_enabled():
+        return []
+    try:
+        transcript = first_string(payload, "transcript_path", "transcriptPath")
+        if not transcript:
+            return []
+        path = Path(transcript).expanduser()
+        if not path.is_file():
+            return []
+        turn_id = first_string(payload, "turn_id", "turnId")
+        base = ensure_state_dir()
+        state_path = base / "commentary_offsets" / f"{sha256_hex(str(path))}.json"
+        state: JsonDict = {}
+        if state_path.is_file():
+            try:
+                loaded = json.loads(state_path.read_text(encoding="utf-8"))
+                state = loaded if isinstance(loaded, dict) else {}
+            except (OSError, ValueError):
+                state = {}
+        size = path.stat().st_size
+        stored = state.get("offset")
+        resume = isinstance(stored, int) and 0 <= stored <= size
+        offset = stored if resume else max(0, size - COMMENTARY_INITIAL_TAIL_BYTES)
+        seen = [value for value in state.get("seen", []) if isinstance(value, str)]
+        seen_set = set(seen)
+        found: list[tuple[str, str]] = []
+        with path.open("rb") as handle:
+            handle.seek(offset)
+            if offset and not resume:
+                handle.readline()  # Skip the partial line when starting mid-file.
+            for raw in handle:
+                if b'"AgentMessage"' not in raw or b'"commentary"' not in raw:
+                    continue
+                try:
+                    record = json.loads(raw)
+                except ValueError:
+                    continue
+                body = record.get("payload") if isinstance(record, dict) else None
+                item = body.get("item") if isinstance(body, dict) else None
+                if (not isinstance(item, dict) or item.get("type") != "AgentMessage"
+                        or item.get("phase") != "commentary"):
+                    continue
+                if turn_id and body.get("turn_id") not in (None, turn_id):
+                    continue
+                item_id = str(item.get("id") or "")
+                if item_id and item_id in seen_set:
+                    continue
+                text = "\n".join(
+                    part["text"] for part in item.get("content", [])
+                    if isinstance(part, dict) and isinstance(part.get("text"), str)
+                ).strip()
+                if text:
+                    found.append((item_id, text))
+                    if item_id:
+                        seen_set.add(item_id)
+            next_offset = handle.tell()
+        captured = []
+        for item_id, text in found[-COMMENTARY_MAX_PER_TURN:]:
+            captured.append(capture_message_event(
+                payload, hook_event=hook_event, role="assistant", content=text,
+                extra_metadata={"message_phase": "commentary"}))
+            if item_id:
+                seen.append(item_id)
+        write_json_atomic(state_path, {"offset": next_offset, "seen": seen[-COMMENTARY_SEEN_LIMIT:]})
+        return captured
+    except Exception as exc:  # noqa: BLE001 - logging must not interrupt Codex.
+        print(f"codex-session-logging commentary capture failed: {exc}", file=sys.stderr)
+        return []
 
 
 def message_from_payload(hook_event: str, payload: JsonDict) -> tuple[str | None, str | None]:
