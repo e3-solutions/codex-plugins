@@ -75,6 +75,8 @@ Resident release `0.3.25` distributes Codex Session Logging `0.2.26`. The logger
 
 Resident release `0.3.26` distributes Codex Session Logging `0.2.27`. In canonical E3 repositories the `UserPromptSubmit` hook now adds a short Forum decision cue on a thread's first prompt, and on a new task of 25+ words at most once an hour. It asks for one targeted `forum__search_research_posts` (2-4 plain words, retrying once in `related` mode) before the agent commits to an approach, plus a one-line `Forum: USE|SKIP <post_id> - reason` or `Forum: NONE - query`, so Forum yield can be measured from ordinary assistant messages. The hook itself never contacts Forum. Its local log under `~/.codex/forum-cue` records only the session id, time and prompt word count, never prompt text. Disable it with `FORUM_CUE_ENABLED=0`.
 
+Resident release `0.3.27` distributes Codex Session Logging `0.2.28`. Session-start, post-compaction context rebuild, and decision-time Forum cues now require one explained `up`, `down`, or neutral `abstain` assessment after each fully read post and before task completion when feedback is enabled and authorized. The exact post id/body hash and a fresh mutation UUID are required; uncertain retries reuse the identical payload and UUID, definitive failures remain explicitly unsaved, optional concerns stay separate, and USE/SKIP prose is never treated as a saved event. `Stop` remains telemetry-only.
+
 The Sesh retrieval cue is independent of Forum guidance. Disable it with
 `E3_SESH_CONTEXT_ENABLED=0` (the compatibility alias
 `E3_SESH_START_SEARCH_ENABLED=0` is also honored). Disabling Collective alone

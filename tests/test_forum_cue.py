@@ -36,7 +36,15 @@ def context_of(output):
 def test_first_prompt_in_e3_repository_gets_cue_and_log_without_prompt_text(tmp_path, e3):
     output = cue.forum_cue(payload("secret task words"), directory=tmp_path, now=1000.0)
     assert context_of(output) == cue.CUE
-    assert "Forum: USE" in cue.CUE and "2-4 plain words" in cue.CUE
+    for phrase in (
+        "2-4 plain words", "After fully reading each returned post",
+        "before completing the task", "kind=up", "kind=down", "kind=abstain",
+        "post_id, body_sha256, explanation, and mutation_id",
+        "Concern is optional", "No sentiment is forced",
+        "same mutation_id and identical payload", "remains unsaved",
+        "Forum: USE", "does not substitute for the saved feedback event",
+    ):
+        assert phrase in cue.CUE
     log = [json.loads(line) for line in (tmp_path / "cue-log.jsonl").read_text().splitlines()]
     assert log == [{"ts": "1970-01-01T00:16:40Z", "session_id": "s1", "reason": "first_prompt",
                     "prompt_words": 3}]
