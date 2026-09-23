@@ -1399,3 +1399,66 @@ def test_commentary_is_not_captured_outside_e3_repositories(tmp_path, monkeypatc
 
     assert _stop(session_logging, repo, transcript, "turn-1", "final") is None
     assert not (tmp_path / "state" / "events.jsonl").exists()
+
+
+EXCLUDED_ROOT = "01a082c4-ba30-75c1-b0c6-2745822d654f"
+CHILD = "01a082c8-2e4e-7f00-9a50-77f4671fdd48"
+GRANDCHILD = "01a082c8-46a0-7fd2-bb13-82a0884a3a8b"
+UNRELATED = "01a0a395-2d57-7f43-8118-9f24da86d3cd"
+
+
+def _write_session(codex_home: Path, session_id: str, parent: str | None) -> Path:
+    path = codex_home / "sessions" / "2026" / "09" / "22" / f"rollout-2026-09-22T00-00-00-{session_id}.jsonl"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    meta = {"id": session_id}
+    if parent:
+        meta["parent_thread_id"] = parent
+    path.write_text(json.dumps({"type": "session_meta", "payload": meta}) + "\n", encoding="utf-8")
+    return path
+
+
+def _exclusion_home(tmp_path, monkeypatch, *, sherlock: bool):
+    home = tmp_path / "home"
+    codex_home = tmp_path / "codex-home"
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    target = (home / ".sherlock" / "session-exclusions.json" if sherlock
+              else codex_home / "session-logging" / "excluded_sessions.json")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(json.dumps({"version": 1, "excluded_session_ids": [EXCLUDED_ROOT]}), encoding="utf-8")
+    for session_id, parent in ((EXCLUDED_ROOT, None), (CHILD, EXCLUDED_ROOT),
+                               (GRANDCHILD, CHILD), (UNRELATED, None)):
+        _write_session(codex_home, session_id, parent)
+    return codex_home
+
+
+@pytest.mark.parametrize("sherlock", [True, False])
+def test_excluded_session_and_its_subagents_are_never_captured(tmp_path, monkeypatch, sherlock):
+    monkeypatch.setenv("CODEX_SESSION_LOG_STATE_DIR", str(tmp_path / "state"))
+    codex_home = _exclusion_home(tmp_path, monkeypatch, sherlock=sherlock)
+    session_logging = load_session_logging()
+    repo = init_git_repo(tmp_path / "repo", "git@github.com:e3-solutions/codex-plugins.git")
+
+    assert session_logging.session_excluded(EXCLUDED_ROOT)
+    assert session_logging.session_excluded(CHILD)
+    assert session_logging.session_excluded(GRANDCHILD)
+    assert not session_logging.session_excluded(UNRELATED)
+
+    grandchild_path = next((codex_home / "sessions").glob(f"**/*{GRANDCHILD}.jsonl"))
+    assert session_logging.capture_hook_event({
+        "hook_event_name": "UserPromptSubmit", "session_id": GRANDCHILD, "cwd": str(repo),
+        "prompt": "private", "transcript_path": str(grandchild_path),
+    }) is None
+    kept = session_logging.capture_hook_event({
+        "hook_event_name": "UserPromptSubmit", "session_id": UNRELATED, "cwd": str(repo), "prompt": "ok",
+    })
+    assert kept is not None
+    events = read_jsonl(tmp_path / "state" / "events.jsonl")
+    assert [event["session_id"] for event in events] == [UNRELATED]
+
+
+def test_no_exclusion_file_captures_normally(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path / "empty-home"))
+    monkeypatch.setenv("CODEX_SESSION_LOG_STATE_DIR", str(tmp_path / "state"))
+    session_logging = load_session_logging()
+    assert not session_logging.session_excluded(EXCLUDED_ROOT)

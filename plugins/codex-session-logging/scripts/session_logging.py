@@ -943,7 +943,74 @@ def codex_connections(config: JsonDict) -> list[JsonDict]:
 def should_capture_payload(payload: JsonDict) -> bool:
     cwd = first_string(payload, "cwd") or os.getcwd()
     remote = git_origin_remote(cwd)
-    return remote_belongs_to_org(remote, ALLOWED_GITHUB_ORG)
+    if not remote_belongs_to_org(remote, ALLOWED_GITHUB_ORG):
+        return False
+    return not session_excluded(
+        first_string(payload, "session_id", "sessionId"),
+        first_string(payload, "transcript_path", "transcriptPath"),
+    )
+
+
+EXCLUSION_ANCESTOR_DEPTH = 8
+
+
+def excluded_session_ids() -> set[str]:
+    """Session ids the user excluded from capture, including their subagents.
+
+    Read from the logger's own list and from the Sherlock exclusion file, so a
+    session excluded once stays excluded from both collectors.
+    """
+    home = Path.home()
+    codex_home = Path(os.environ.get("CODEX_HOME") or home / ".codex").expanduser()
+    ids: set[str] = set()
+    for path in (codex_home / "session-logging" / "excluded_sessions.json",
+                 home / ".sherlock" / "session-exclusions.json"):
+        try:
+            loaded = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        values = loaded.get("excluded_session_ids") if isinstance(loaded, dict) else None
+        if isinstance(values, list):
+            ids.update(str(value).strip().lower() for value in values if isinstance(value, str))
+    return ids
+
+
+def transcript_parent_id(path: Path) -> str | None:
+    try:
+        with path.open("rb") as handle:
+            record = json.loads(handle.readline())
+    except (OSError, ValueError):
+        return None
+    payload = record.get("payload") if isinstance(record, dict) else None
+    parent = payload.get("parent_thread_id") if isinstance(payload, dict) else None
+    return str(parent).lower() if isinstance(parent, str) and parent else None
+
+
+def transcript_path_for_session(session_id: str) -> Path | None:
+    codex_home = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex").expanduser()
+    for root in (codex_home / "sessions", codex_home / "archived_sessions"):
+        matches = sorted(root.glob(f"**/*{session_id}.jsonl")) if root.is_dir() else []
+        if matches:
+            return matches[0]
+    return None
+
+
+def session_excluded(session_id: str | None, transcript_path: str | None = None) -> bool:
+    excluded = excluded_session_ids()
+    if not excluded:
+        return False
+    current = (session_id or "").strip().lower()
+    path = Path(transcript_path).expanduser() if transcript_path else None
+    for _ in range(EXCLUSION_ANCESTOR_DEPTH):
+        if current and current in excluded:
+            return True
+        if path is None and current:
+            path = transcript_path_for_session(current)
+        parent = transcript_parent_id(path) if path is not None else None
+        if not parent:
+            return False
+        current, path = parent, None
+    return False
 
 
 def should_prompt_collective(payload: JsonDict) -> bool:
