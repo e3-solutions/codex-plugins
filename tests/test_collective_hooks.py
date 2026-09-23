@@ -322,7 +322,7 @@ def test_user_prompt_submit_process_in_e3_emits_only_the_forum_decision_cue(tmp_
     output = json.loads(result.stdout)
     context = output["hookSpecificOutput"]["additionalContext"]
     assert output["hookSpecificOutput"]["hookEventName"] == "UserPromptSubmit"
-    assert context.startswith("Forum check (E3 Collective)") and "Forum: USE" in context
+    assert context.startswith("Forum check (E3 Collective)") and "give_collective_feedback" in context
     assert "E3 Collective / Forum:" not in context and "share_with_collective" not in context
     # A short follow-up in the same thread stays silent.
     again = run_hook(scripts, "user_prompt_submit", {**prompt, "prompt": "go ahead"}, env=env)
