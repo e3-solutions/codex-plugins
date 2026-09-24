@@ -1,5 +1,8 @@
 """Decision-time Forum cue for E3 repositories; never searches or stores prompt text.
 
+Claude Code copy of plugins/codex-session-logging/scripts/forum_cue.py. Only state_dir()
+differs; tests keep the cue text and gating identical.
+
 Agents that received relevant Forum lessons mostly read past them, and searches
 ran after the approach was already chosen. On the first prompt of a thread (and
 on a long new task at most once an hour) this asks for one targeted Forum search
@@ -45,7 +48,10 @@ _E3_REMOTE = re.compile(
 
 
 def state_dir() -> Path:
-    return Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex") / "forum-cue"
+    # Same location rule as session_logging.state_dir(): ~/.claude/session-logging by default.
+    override = os.environ.get("CLAUDE_SESSION_LOG_STATE_DIR")
+    base = Path(override).expanduser() if override else Path.home() / ".claude" / "session-logging"
+    return base / "forum-cue"
 
 
 def _enabled() -> bool:
