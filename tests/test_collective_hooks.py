@@ -315,10 +315,7 @@ def test_user_prompt_submit_process_in_e3_emits_only_the_forum_decision_cue(tmp_
     result = run_hook(scripts, "user_prompt_submit", prompt, env=env)
 
     assert result.returncode == 0
-    if agent == "claude":
-        assert result.stdout == ""
-        return
-    # Codex: one hook JSON object carrying only the decision-time Forum cue.
+    # Codex and Claude Code: one hook JSON object carrying only the decision-time Forum cue.
     output = json.loads(result.stdout)
     context = output["hookSpecificOutput"]["additionalContext"]
     assert output["hookSpecificOutput"]["hookEventName"] == "UserPromptSubmit"
@@ -330,6 +327,18 @@ def test_user_prompt_submit_process_in_e3_emits_only_the_forum_decision_cue(tmp_
     env["FORUM_CUE_ENABLED"] = "0"
     optout = run_hook(scripts, "user_prompt_submit", {**prompt, "session_id": "other"}, env=env)
     assert optout.returncode == 0 and optout.stdout == ""
+    # The cue log stays under each agent's own state location and never holds prompt text.
+    cue_log = (
+        tmp_path / "codex-home" / "forum-cue" / "cue-log.jsonl"
+        if agent == "codex"
+        else tmp_path / "claude-state" / "forum-cue" / "cue-log.jsonl"
+    )
+    assert [json.loads(line)["reason"] for line in cue_log.read_text().splitlines()] == ["first_prompt"]
+    assert "ordinary request" not in cue_log.read_text()
+    # Prompt capture still runs alongside the cue.
+    if agent == "claude":
+        events = (tmp_path / "claude-state" / "events.jsonl").read_text(encoding="utf-8")
+        assert "UserPromptSubmit" in events
 
 
 @pytest.mark.parametrize(

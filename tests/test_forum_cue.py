@@ -37,14 +37,19 @@ def test_first_prompt_in_e3_repository_gets_cue_and_log_without_prompt_text(tmp_
     output = cue.forum_cue(payload("secret task words"), directory=tmp_path, now=1000.0)
     assert context_of(output) == cue.CUE
     for phrase in (
-        "2-4 plain words", "For each post you fully read",
+        "2-4 words naming the system, tool or component plus the failure or decision",
+        "OCR ensemble evaluation", "release branch ancestry",
+        "do not include ticket IDs, file paths, function names, or a post title you already know",
+        "internal lessons, not vendor capability facts", "For each post you fully read",
         "before completing the task", "kind=up", "kind=down", "kind=abstain",
-        "post_id and body_sha256 from the result", "Concern is optional", "No sentiment is forced",
+        "post_id and body_sha256 from the result", "the search_id from that search",
+        "Concern is optional", "No sentiment is forced",
         "only for an exact retry", "remains unsaved", "name the Forum posts you used",
     ):
         assert phrase in cue.CUE
     # Two calls per useful interaction: no re-read, guide/status call, retry step, or USE/SKIP line.
-    for phrase in ("related", "Forum: USE", "get_research_post"):
+    # Abstract mechanism-only queries mostly returned not-applicable posts, so they are no longer asked for.
+    for phrase in ("related", "Forum: USE", "get_research_post", "plain words", "repo names"):
         assert phrase not in cue.CUE
     log = [json.loads(line) for line in (tmp_path / "cue-log.jsonl").read_text().splitlines()]
     assert log == [{"ts": "1970-01-01T00:16:40Z", "session_id": "s1", "reason": "first_prompt",
