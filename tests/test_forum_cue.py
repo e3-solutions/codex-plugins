@@ -95,18 +95,22 @@ def test_git_failure(tmp_path, monkeypatch, failure):
 
 
 @pytest.mark.parametrize("cue_fails", [False, True])
-def test_user_prompt_submit_emits_cue_and_preserves_capture(monkeypatch, capsys, cue_fails):
+def test_user_prompt_submit_emits_cue_and_preserves_capture(monkeypatch, capsys, tmp_path, cue_fails):
     calls = []
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path))  # Sesh gate state stays in the test dir.
     monkeypatch.setitem(sys.modules, "rollout_sync", types.SimpleNamespace(
         sync_after_hook=lambda *a, **kw: calls.append("sync")))
     monkeypatch.setitem(sys.modules, "session_logging", types.SimpleNamespace(
         read_stdin_json=lambda: payload(), capture_hook_event=lambda *a, **kw: calls.append("capture")))
+    emitted = json.dumps({"hookSpecificOutput": {"hookEventName": "UserPromptSubmit",
+                                                 "additionalContext": "Forum cue"}})
     monkeypatch.setattr(cue, "forum_cue", Mock(side_effect=RuntimeError() if cue_fails else None,
-                                               return_value='{"hookSpecificOutput": {}}'))
+                                               return_value=emitted))
     spec = importlib.util.spec_from_file_location("candidate_prompt", SCRIPTS / "user_prompt_submit.py")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     module.main()
     output = capsys.readouterr().out
     assert calls == ["capture", "sync"]
-    assert output == ("" if cue_fails else '{"hookSpecificOutput": {}}\n')
+    # No Sesh cue here (no SessionStart), so the Forum cue is emitted unchanged.
+    assert output == ("" if cue_fails else emitted + "\n")

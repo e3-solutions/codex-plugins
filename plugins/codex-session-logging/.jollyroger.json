@@ -13,6 +13,7 @@
     "scripts/collective.py",
     "scripts/collective_feedback.py",
     "scripts/sesh_context.py",
+    "scripts/sesh_gate.py",
     "scripts/session_start.py",
     "scripts/user_prompt_submit.py",
     "scripts/pre_tool_use.py",
