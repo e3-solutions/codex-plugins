@@ -1152,6 +1152,7 @@ def setup_plan(
             "Default setup is user-level: plugin marketplace, plugin install, legacy global hook cleanup, GitHub auth check, and Linear MCP registration.",
             "GitHub auth is a manual prerequisite: run gh auth login when needed.",
             "Linear auth is manual after setup registers the MCP server: run codex mcp login linear after setup when needed.",
+            "The resident updater registers E3 Cosmos (e3-cosmos) when no Cosmos MCP server exists; run codex mcp login e3-cosmos once if Codex asks. Opt out with update_plugin.py --disable-cosmos-mcp.",
             "If Codex asks to review hooks, trust the Linear Progress Sync and Codex Session Logging hooks once so kickoff and session capture can run.",
             "First use lists Linear users, asks which user to save, and stores it in ~/.codex/linear-sync/user.json for all repos.",
             "First use in a repo lists Linear teams/projects, asks which project to save, and stores it in ~/.codex/linear-sync/repos.json.",

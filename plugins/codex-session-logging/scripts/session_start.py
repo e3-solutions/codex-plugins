@@ -39,6 +39,12 @@ def main() -> None:
     except Exception as exc:  # noqa: BLE001 - logging must not interrupt Codex.
         print(f"codex-session-logging capture failed: {exc}", file=sys.stderr)
     try:
+        from cosmos_health import report_cosmos_health
+
+        report_cosmos_health(payload)
+    except Exception:  # noqa: BLE001 - the health signal must not interrupt Codex.
+        pass
+    try:
         context = None if preview else session_context(eligible=should_prompt_collective(payload))
         if context:
             print(context)

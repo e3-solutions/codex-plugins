@@ -324,6 +324,232 @@ def configured_marketplace_source(config_path: str | Path) -> str | None:
     return None
 
 
+# E3 Cosmos serves Sesh coding-session search and Forum. Codex exposes its tools as
+# mcp__e3_cosmos__*. Every resident activation makes sure an entry exists (COR-4683).
+COSMOS_MCP_NAME = "e3-cosmos"
+# One Cosmos gateway, one sign-in door per Google Workspace org. Either door counts.
+COSMOS_MCP_URLS = {
+    "e3": "https://cosmos.e3g.ai/e3/mcp",
+    "coreedge": "https://cosmos.e3g.ai/coreedge/mcp",
+}
+COSMOS_MCP_URL = COSMOS_MCP_URLS["e3"]
+# The gateway's current host and its earlier Railway host.
+COSMOS_GATEWAY_HOSTS = frozenset({"cosmos.e3g.ai", "e3-mcp-production.up.railway.app"})
+COSMOS_ORG_EMAIL_DOMAINS = {"coreedgesolution.com": "coreedge", "e3group.ai": "e3"}
+COSMOS_MCP_OPT_OUT_ENV = "E3_COSMOS_MCP_AUTO_REGISTER"
+COSMOS_MCP_PREFERENCE_FILE = "cosmos-mcp.json"
+_OFF_VALUES = {"0", "false", "no", "off"}
+_TOML_HEADER = re.compile(r"^\s*\[\s*([^\[\]]+?)\s*\]\s*(?:#.*)?$")
+_TOML_STRING_VALUE = r"""\s*=\s*(?:"([^"\\]*)"|'([^']*)')\s*(?:#.*)?$"""
+
+
+def _normalized_url(value: Any) -> str | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    return value.strip().rstrip("/").lower()
+
+
+def _is_cosmos_url(value: Any) -> bool:
+    """Any URL on a Cosmos gateway host, whatever the entry is called (e3, cosmos, cosmos-e3...)."""
+    normalized = _normalized_url(value)
+    if normalized is None:
+        return False
+    from urllib.parse import urlsplit
+
+    try:
+        host = urlsplit(normalized).hostname
+    except ValueError:
+        return False
+    return host in COSMOS_GATEWAY_HOSTS
+
+
+def _header_parts(header: str) -> list[str]:
+    parts: list[str] = []
+    for match in re.finditer(r'\s*(?:"([^"]*)"|\'([^\']*)\'|([A-Za-z0-9_-]+))\s*(?:\.|$)', header):
+        parts.append(next(group for group in match.groups() if group is not None))
+    return parts
+
+
+def _scan_mcp_servers(raw: str) -> dict[str, JsonDict] | None:
+    """Line-based fallback when tomllib is unavailable (Python < 3.11).
+
+    Returns None when the file uses shapes this scanner cannot read safely.
+    """
+    servers: dict[str, JsonDict] = {}
+    current: str | None = None
+    for line in raw.splitlines():
+        header = _TOML_HEADER.match(line)
+        if header and not line.lstrip().startswith("[["):
+            parts = _header_parts(header.group(1))
+            current = parts[1] if len(parts) == 2 and parts[0] == "mcp_servers" else None
+            if current is not None:
+                servers.setdefault(current, {})
+            continue
+        if line.lstrip().startswith("[["):
+            current = None
+            continue
+        if re.match(r"^\s*mcp_servers\s*[.=]", line) or (
+            current is None and re.match(r'^\s*"?e3-cosmos"?\s*=', line)
+        ):
+            return None
+        if current is None:
+            continue
+        url = re.match(r"^\s*url" + _TOML_STRING_VALUE, line)
+        if url:
+            servers[current]["url"] = url.group(1) if url.group(1) is not None else url.group(2)
+        elif re.match(r"^\s*command\s*=", line):
+            servers[current]["command"] = "?"
+        elif re.match(r"^\s*enabled\s*=\s*false\s*(?:#.*)?$", line):
+            servers[current]["enabled"] = False
+    if any(host in raw for host in COSMOS_GATEWAY_HOSTS) and not any(
+        _is_cosmos_url(item.get("url")) for item in servers.values()
+    ):
+        return None  # Cosmos is referenced in a shape this scanner cannot read; leave it alone.
+    return servers
+
+
+def read_mcp_servers(raw: str) -> dict[str, JsonDict] | None:
+    """Return configured MCP servers, or None when config.toml cannot be read safely."""
+    try:
+        import tomllib  # type: ignore[import-not-found]
+    except ModuleNotFoundError:
+        return _scan_mcp_servers(raw)
+    try:
+        data = tomllib.loads(raw)
+    except Exception:  # noqa: BLE001 - any parse error means "do not touch".
+        return None
+    servers = data.get("mcp_servers", {})
+    if not isinstance(servers, dict):
+        return None
+    return {str(name): value for name, value in servers.items() if isinstance(value, dict)}
+
+
+def cosmos_mcp_status(raw: str) -> str:
+    """Classify the Cosmos MCP entry in a config.toml text.
+
+    ok: an enabled server (any name) points at the Cosmos URL.
+    disabled: the only Cosmos server has enabled = false (a user choice).
+    custom: an e3-cosmos entry points somewhere else (a user choice).
+    missing: no Cosmos server at all.
+    unreadable: the config cannot be parsed safely.
+    """
+    servers = read_mcp_servers(raw)
+    if servers is None:
+        return "unreadable"
+    disabled = False
+    for value in servers.values():
+        if _is_cosmos_url(value.get("url")):
+            if value.get("enabled", True) is False:
+                disabled = True
+            else:
+                return "ok"
+    if disabled:
+        return "disabled"
+    if COSMOS_MCP_NAME in servers:
+        return "custom"
+    return "missing"
+
+
+def cosmos_preference_path(resident_root: str | Path | None = None) -> Path:
+    return Path(resident_root or default_resident_root()).expanduser().resolve() / COSMOS_MCP_PREFERENCE_FILE
+
+
+def cosmos_auto_register_enabled(resident_root: str | Path | None = None, *, persist: bool = True) -> bool:
+    """Opt-out: E3_COSMOS_MCP_AUTO_REGISTER=0 (persisted once seen) or update_plugin.py --disable-cosmos-mcp."""
+    path = cosmos_preference_path(resident_root)
+    if os.environ.get(COSMOS_MCP_OPT_OUT_ENV, "").strip().lower() in _OFF_VALUES:
+        if persist:
+            try:
+                set_cosmos_auto_register(False, resident_root=resident_root)
+            except OSError:
+                pass
+        return False
+    try:
+        state = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return True
+    return not (isinstance(state, dict) and state.get("auto_register") is False)
+
+
+def set_cosmos_auto_register(enabled: bool, *, resident_root: str | Path | None = None) -> JsonDict:
+    path = cosmos_preference_path(resident_root)
+    payload = {"auto_register": bool(enabled)}
+    write_if_changed(path, (json.dumps(payload, indent=2, sort_keys=True) + "\n").encode("utf-8"), mode=0o600)
+    return payload
+
+
+def cosmos_mcp_url(email: str | None = None) -> str:
+    """Pick the sign-in door from the git email domain; E3 when unknown."""
+    if email is None:
+        try:
+            completed = subprocess.run(
+                ["git", "config", "--global", "user.email"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                check=False,
+                timeout=5,
+            )
+            email = completed.stdout.strip()
+        except (OSError, subprocess.SubprocessError):
+            email = ""
+    domain = email.rsplit("@", 1)[-1].strip().lower() if "@" in email else ""
+    return COSMOS_MCP_URLS[COSMOS_ORG_EMAIL_DOMAINS.get(domain, "e3")]
+
+
+def cosmos_mcp_section(url: str | None = None) -> str:
+    return f"[mcp_servers.{COSMOS_MCP_NAME}]\nurl = {toml_string(url or cosmos_mcp_url())}\n"
+
+
+def ensure_cosmos_mcp(
+    config_path: str | Path,
+    *,
+    resident_root: str | Path | None = None,
+    email: str | None = None,
+) -> JsonDict:
+    """Add the Cosmos MCP server to Codex config.toml when it is missing.
+
+    Idempotent. Never edits an existing entry (custom URL, disabled, other name),
+    never rewrites other sections, writes only when the file is unchanged since it
+    was read, and reports a status word only (no config content, no secrets).
+    """
+    if not cosmos_auto_register_enabled(resident_root):
+        return {"status": "opted_out", "changed": False}
+    path = Path(config_path).expanduser()
+    try:
+        old = path.read_bytes() if path.exists() else b""
+        raw = old.decode("utf-8")
+    except (OSError, UnicodeDecodeError):
+        return {"status": "unreadable", "changed": False}
+    status = cosmos_mcp_status(raw)
+    if status != "missing":
+        return {"status": status, "changed": False}
+    prefix = raw
+    if prefix and not prefix.endswith("\n"):
+        prefix += "\n"
+    if prefix and not prefix.endswith("\n\n"):
+        prefix += "\n"
+    new = prefix + cosmos_mcp_section(cosmos_mcp_url(email))
+    if cosmos_mcp_status(new) != "ok":
+        return {"status": "unsafe", "changed": False}
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        temporary.write_text(new, encoding="utf-8")
+        if path.exists():
+            os.chmod(temporary, stat.S_IMODE(path.stat().st_mode))
+        else:
+            os.chmod(temporary, 0o600)
+        current = path.read_bytes() if path.exists() else b""
+        if current != old:
+            return {"status": "busy", "changed": False}
+        os.replace(temporary, path)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+    return {"status": "registered", "changed": True}
+
+
 def restore_file(path: Path, existed: bool, content: bytes, *, mode: int | None = None) -> None:
     if not existed:
         try:
@@ -337,6 +563,30 @@ def restore_file(path: Path, existed: bool, content: bytes, *, mode: int | None 
     if mode is not None:
         os.chmod(temporary, mode)
     os.replace(temporary, path)
+
+
+def restore_config_if_unchanged(
+    path: Path,
+    written: bytes | None,
+    existed: bool,
+    content: bytes,
+    *,
+    mode: int | None = None,
+) -> None:
+    """Undo only this activation's own config write.
+
+    Restoring the whole pre-activation snapshot unconditionally would also erase
+    anything Codex or the user wrote meanwhile (for example an MCP server entry).
+    """
+    if written is None:
+        return
+    try:
+        current = path.read_bytes()
+    except FileNotFoundError:
+        current = None
+    if current != written:
+        return
+    restore_file(path, existed, content, mode=mode)
 
 
 def remove_path(path: Path) -> None:
@@ -1407,6 +1657,7 @@ def activate_release(
     moved: list[tuple[Path, Path]] = []
     pointer_changed = False
     config_changed = False
+    config_written: bytes | None = None
     release: JsonDict | None = None
     staged_root: Path | None = None
     previous_release: Path | None = None
@@ -1433,6 +1684,8 @@ def activate_release(
                 )
         pointer_changed = atomic_symlink(staged_root, current)
         config_changed = update_marketplace_config(config_path, current)
+        if config_changed:
+            config_written = config_path.read_bytes()
         moved = activate_plugin_caches(
             plugins,
             cache_root=cache,
@@ -1466,7 +1719,9 @@ def activate_release(
             ("installed caches", lambda: rollback_plugin_cache_installs(replacements)),
             (
                 "marketplace config",
-                lambda: restore_file(config_path, config_existed, config_content, mode=config_mode),
+                lambda: restore_config_if_unchanged(
+                    config_path, config_written, config_existed, config_content, mode=config_mode
+                ),
             ),
             ("marketplace pointer", lambda: restore_symlink(current, previous_target)),
             ("runtime pointer", lambda: restore_symlink(runtime_pointer, previous_runtime_target)),
@@ -1516,8 +1771,20 @@ def activate_release(
             }
         service["presence"] = presence
         service["changed"] = bool(service.get("changed") or presence.get("changed"))
+    try:
+        cosmos = ensure_cosmos_mcp(config_path, resident_root=resident)
+    except Exception as exc:  # noqa: BLE001 - activation is committed; retry next cycle.
+        cosmos = {"status": "error", "error": type(exc).__name__, "changed": False}
     assert release is not None and staged_root is not None
-    changed = bool(release["changed"] or pointer_changed or config_changed or moved or runtime["changed"] or service["changed"])
+    changed = bool(
+        release["changed"]
+        or pointer_changed
+        or config_changed
+        or moved
+        or runtime["changed"]
+        or service["changed"]
+        or cosmos["changed"]
+    )
     return {
         "changed": changed,
         "version": release["version"],
@@ -1527,6 +1794,7 @@ def activate_release(
         "pruned": [{"name": original.parent.name, "version": original.name} for original, _ in moved],
         "runtime": runtime,
         "service": service,
+        "cosmos_mcp": cosmos,
     }
 
 
@@ -1563,6 +1831,11 @@ def doctor(
             issues.append(f"managed marketplace is invalid: {exc}")
     configured_source = configured_marketplace_source(codex / "config.toml")
     result["configured_source"] = configured_source
+    try:
+        result["cosmos_mcp"] = cosmos_mcp_status((codex / "config.toml").read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError):
+        result["cosmos_mcp"] = "unreadable"
+    result["cosmos_mcp_auto_register"] = cosmos_auto_register_enabled(resident, persist=False)
     if configured_source != str(current):
         issues.append("marketplace config does not point at the managed current release")
     if not runtime.is_symlink() or not runtime.exists():

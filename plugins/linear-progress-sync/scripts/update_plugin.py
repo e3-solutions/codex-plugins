@@ -805,8 +805,30 @@ def main() -> None:
         action="store_true",
         help="Re-enable automatic network update checks.",
     )
+    cosmos = parser.add_mutually_exclusive_group()
+    cosmos.add_argument(
+        "--disable-cosmos-mcp",
+        action="store_true",
+        help="Stop resident updates from adding the E3 Cosmos MCP server to Codex config.",
+    )
+    cosmos.add_argument(
+        "--enable-cosmos-mcp",
+        action="store_true",
+        help="Let resident updates add the E3 Cosmos MCP server when it is missing (default).",
+    )
     parser.add_argument("--json", action="store_true", help="Print machine-readable output.")
     args = parser.parse_args()
+
+    if args.disable_cosmos_mcp or args.enable_cosmos_mcp:
+        from resident_updater import set_cosmos_auto_register
+
+        result = set_cosmos_auto_register(not args.disable_cosmos_mcp)
+        if args.json:
+            print(json.dumps(result, indent=2, sort_keys=True))
+        else:
+            status = "enabled" if result["auto_register"] else "disabled"
+            print(f"Automatic E3 Cosmos MCP registration is {status}.")
+        return
 
     if args.disable_auto_update or args.enable_auto_update:
         result = set_auto_update_enabled(not args.disable_auto_update, state_path=args.state_path)

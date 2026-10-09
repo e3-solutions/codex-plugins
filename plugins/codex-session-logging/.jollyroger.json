@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "id": "codex-session-logging",
-  "version": "0.2.28",
+  "version": "0.2.34",
   "owner": "Core Edge",
   "providers": ["codex", "claude"],
   "include": [
@@ -14,6 +14,7 @@
     "scripts/collective_feedback.py",
     "scripts/sesh_context.py",
     "scripts/session_start.py",
+    "scripts/cosmos_health.py",
     "scripts/user_prompt_submit.py",
     "scripts/pre_tool_use.py",
     "scripts/post_tool_use.py",
