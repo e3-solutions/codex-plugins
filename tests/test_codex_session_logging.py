@@ -21,6 +21,8 @@ SESH_SEARCH_ALIASES = [
     SESH_SEARCH_TOOL, "mcp__e3__sesh__search_coding_sessions",
     "mcp__cosmos__sesh__search_coding_sessions",
     "mcp__cosmos_e3__sesh__search_coding_sessions",
+    "mcp__codex_apps__cosmos__sesh__search_coding_sessions",
+    "mcp__e3_mcp__sesh__search_coding_sessions",
 ]
 SESH_REQUEST_ID = "11111111-1111-4111-8111-111111111111"
 OTHER_SESH_REQUEST_ID = "22222222-2222-4222-8222-222222222222"
@@ -113,6 +115,7 @@ def test_sesh_request_id_accepts_supported_consistent_response_envelopes(tool_re
         "tool_name": tool_name,
         "tool_phase": "finished",
         "sesh_request_id": SESH_REQUEST_ID,
+        "sesh_request_ids": [SESH_REQUEST_ID],
     }
 
 
@@ -171,7 +174,9 @@ def test_sesh_request_id_omits_ambiguous_malformed_or_noncanonical_values(tool_r
     [
         ("PreToolUse", {"tool_name": SESH_SEARCH_TOOL}),
         ("PostToolUse", {"tool_name": SESH_SEARCH_TOOL + "_other"}),
-        ("PostToolUse", {"tool_name": "mcp__other__sesh__search_coding_sessions"}),
+        ("PostToolUse", {"tool_name": "mcp__other__sesh__search_coding_sessions_v2"}),
+        ("PostToolUse", {"tool_name": "other_search_coding_sessions"}),
+        ("PostToolUse", {"tool_name": "mcp__e3__sesh__search_coding_sessions\n"}),
         ("PostToolUse", {"tool_name": "mcp__e3__sesh__search_coding_sessions_extra"}),
         ("PreToolUse", {"tool_name": "mcp__e3__sesh__search_coding_sessions"}),
         ("PostToolUse", {"tool_name": "mcp__cosmos__sesh__search_coding_sessions_extra"}),
@@ -549,6 +554,7 @@ def test_sesh_post_tool_use_queues_request_and_host_call_ids_without_raw_content
         "tool_phase": "finished",
         "tool_call_id": "call_sesh_host",
         "sesh_request_id": SESH_REQUEST_ID,
+        "sesh_request_ids": [SESH_REQUEST_ID],
     }
     assert queued[0]["metadata"] == detail["metadata"]
     serialized = json.dumps({"detail": detail, "queued": queued}, sort_keys=True)

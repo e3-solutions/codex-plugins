@@ -9,7 +9,9 @@ function assertEquals(actual: unknown, expected: unknown): void {
 for (const toolName of ["mcp__e3__sesh__search_coding_sessions",
   "mcp__e3_cosmos__sesh__search_coding_sessions",
   "mcp__cosmos__sesh__search_coding_sessions",
-  "mcp__cosmos_e3__sesh__search_coding_sessions"]) {
+  "mcp__cosmos_e3__sesh__search_coding_sessions",
+  "mcp__codex_apps__cosmos__sesh__search_coding_sessions",
+  "mcp__e3_mcp__sesh__search_coding_sessions"]) {
 Deno.test(`origin linkage is bounded client-attested finished-search metadata: ${toolName}`, () => {
   const context = "11111111-1111-4111-8111-111111111111";
   const origin = "22222222-2222-4222-8222-222222222222";

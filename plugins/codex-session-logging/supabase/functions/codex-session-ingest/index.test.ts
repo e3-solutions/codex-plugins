@@ -1687,7 +1687,7 @@ Deno.test("sanitizeEventPayload keeps only allowlisted tool event fields", () =>
   assertNotIncludes(serialized, "arbitrary_secret");
 });
 
-for (const seshToolName of ["mcp__e3_cosmos__sesh__search_coding_sessions", "mcp__e3__sesh__search_coding_sessions", "mcp__cosmos__sesh__search_coding_sessions", "mcp__cosmos_e3__sesh__search_coding_sessions"]) {
+for (const seshToolName of ["mcp__e3_cosmos__sesh__search_coding_sessions", "mcp__e3__sesh__search_coding_sessions", "mcp__cosmos__sesh__search_coding_sessions", "mcp__cosmos_e3__sesh__search_coding_sessions", "mcp__codex_apps__cosmos__sesh__search_coding_sessions", "mcp__e3_mcp__sesh__search_coding_sessions", "mcp__e3_mcp__search_coding_sessions", "search_coding_sessions"]) {
 Deno.test(`Sesh request correlation keeps only a canonical UUID on ${seshToolName}`, () => {
   const requestId = "aaaaaaaa-1111-4111-8111-111111111111";
   const record = {
@@ -1754,7 +1754,9 @@ Deno.test(`Sesh request correlation keeps only a canonical UUID on ${seshToolNam
   for (
     const override of [
       { tool_name: "other" },
-      { tool_name: "mcp__other__sesh__search_coding_sessions" },
+      { tool_name: "mcp__other__sesh__search_coding_sessions_v2" },
+      { tool_name: "other_search_coding_sessions" },
+      { tool_name: "mcp__e3__sesh__search_coding_sessions\n" },
       { tool_name: `${seshToolName}_extra` },
       { tool_name: " " + record.metadata.tool_name },
       { tool_phase: "started" },
@@ -1779,6 +1781,60 @@ Deno.test(`Sesh request correlation keeps only a canonical UUID on ${seshToolNam
 });
 
 }
+
+Deno.test("Sesh multi-question request ids stay canonical, primary-first, and copy-agreed", () => {
+  const first = "aaaaaaaa-1111-4111-8111-111111111111";
+  const second = "bbbbbbbb-2222-4222-8222-222222222222";
+  const third = "cccccccc-3333-4333-9333-333333333333";
+  const metadata = {
+    tool_name: "mcp__codex_apps__cosmos__sesh__search_coding_sessions",
+    tool_phase: "finished",
+    sesh_request_id: first,
+    sesh_request_ids: [first, second, third],
+    tool_input: { queries: ["PRIVATE QUESTION"] },
+  };
+  const record = {
+    id: "904fd832-7779-4665-9bec-2f10462c721b",
+    session_id: "session-sesh-multi",
+    seq: 9,
+    event_type: "tool_call_finished",
+    hook_event_name: "PostToolUse",
+    created_at: "2026-10-08T00:00:00.000Z",
+    metadata,
+  };
+  const clean = sanitizeEventPayload(record, { metadata: { ...metadata } });
+  assertEquals((clean.metadata as JsonObject).sesh_request_id, first);
+  assertEquals((clean.metadata as JsonObject).sesh_request_ids, [first, second, third]);
+  assertNotIncludes(JSON.stringify(clean), "PRIVATE");
+
+  for (const invalid of [
+    [],
+    [second, first],
+    [first, first],
+    [first, "invalid"],
+    [first, second.toUpperCase()],
+    "not-a-list",
+    Array.from({ length: 33 }, () => first),
+  ]) {
+    const result = sanitizeEventPayload({
+      ...record, metadata: { ...metadata, sesh_request_ids: invalid },
+    }, {});
+    assertEquals((result.metadata as JsonObject).sesh_request_ids, undefined);
+    assertEquals((result.metadata as JsonObject).sesh_request_id, first);
+  }
+
+  const conflict = sanitizeEventPayload(record, { metadata: {
+    ...metadata, sesh_request_ids: [first, third],
+  } });
+  assertEquals((conflict.metadata as JsonObject).sesh_request_ids, undefined);
+  assertEquals((conflict.metadata as JsonObject).sesh_request_id, first);
+
+  const otherTool = sanitizeEventPayload({
+    ...record, metadata: { ...metadata, tool_name: "functions.exec_command" },
+  }, {});
+  assertEquals((otherTool.metadata as JsonObject).sesh_request_ids, undefined);
+  assertEquals((otherTool.metadata as JsonObject).sesh_request_id, undefined);
+});
 
 Deno.test("Sesh delivery digests stay bounded, canonical, and copy-agreed", () => {
   const digestA = "a".repeat(64);

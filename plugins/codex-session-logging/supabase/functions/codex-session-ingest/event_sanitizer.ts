@@ -106,6 +106,18 @@ function sanitizeEventMetadata(
         metadata.sesh_context_session_id = context;
         metadata.sesh_origin_basis = "client_transcript_header_v1";
       }
+      // Every request id of a multi-question call, primary first. Both copies must agree.
+      const idsKey = "sesh_request_ids";
+      const ids = canonicalRequestIdArray(recordMetadata[idsKey], 32);
+      const eventHasIds = idsKey in eventMetadata;
+      const idsCopiesAgree = !eventHasIds ||
+        sameStringArray(ids, canonicalRequestIdArray(eventMetadata[idsKey], 32));
+      if (ids !== null && ids[0] === requestId && idsCopiesAgree &&
+          recordMetadata.tool_name === source.tool_name &&
+          recordMetadata.tool_phase === "finished" &&
+          recordMetadata.sesh_request_id === requestId) {
+        metadata[idsKey] = ids;
+      }
       const deliveredKey = "sesh_delivered_source_handle_sha256_v1";
       const delivered = canonicalDigestArray(recordMetadata[deliveredKey], 75);
       const eventHasDelivered = deliveredKey in eventMetadata;
@@ -166,11 +178,32 @@ function sanitizeEventMetadata(
   return metadata;
 }
 
+// Any namespace serving Sesh search (mcp__codex_apps__cosmos__sesh__..., mcp__e3_mcp__sesh__...),
+// mcp__<ns>__search_coding_sessions, or the bare name. Same rule as the client hook.
+const SESH_SEARCH_TOOL = /^(?:[A-Za-z0-9_-]+__)?(?:sesh__)?search_coding_sessions$/;
+
 function isSeshSearchTool(value: unknown): boolean {
-  return value === "mcp__e3_cosmos__sesh__search_coding_sessions" ||
-    value === "mcp__e3__sesh__search_coding_sessions" ||
-    value === "mcp__cosmos__sesh__search_coding_sessions" ||
-    value === "mcp__cosmos_e3__sesh__search_coding_sessions";
+  return typeof value === "string" && value.length <= 256 && SESH_SEARCH_TOOL.test(value);
+}
+
+const CANONICAL_REQUEST_ID =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+
+function canonicalRequestIdArray(value: unknown, maximum: number): string[] | null {
+  if (!Array.isArray(value) || value.length === 0 || value.length > maximum) {
+    return null;
+  }
+  const result: string[] = [];
+  const seen = new Set<string>();
+  for (const item of value) {
+    if (typeof item !== "string" || item.length !== 36 ||
+        !CANONICAL_REQUEST_ID.test(item) || seen.has(item)) {
+      return null;
+    }
+    seen.add(item);
+    result.push(item);
+  }
+  return result;
 }
 
 function isSeshSourceOpenTool(value: unknown): boolean {
