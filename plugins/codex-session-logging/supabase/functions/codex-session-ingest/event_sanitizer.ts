@@ -51,6 +51,10 @@ function sanitizeEventMetadata(
     if (Object.keys(codexSetup).length > 0) {
       metadata.codex_setup = codexSetup;
     }
+    Object.assign(
+      metadata,
+      sanitizeSeshCueExperiment(recordMetadata, eventMetadata),
+    );
     return metadata;
   }
 
@@ -176,6 +180,38 @@ function sanitizeEventMetadata(
   }
 
   return metadata;
+}
+
+// COR-4681 startup-cue experiment arm. All three keys must be valid and both copies
+// must agree, or none is kept. The values are labels only, never content.
+const SESH_CUE_EXPERIMENT_KEYS = [
+  "sesh_cue_experiment",
+  "sesh_cue_arm",
+  "sesh_cue_salt",
+] as const;
+const SESH_CUE_ARMS = ["cue", "no_cue", "optout", "bot", "disabled", "unassigned"];
+const SESH_CUE_SALT = /^[0-9]{4}-W(?:0[1-9]|[1-4][0-9]|5[0-3])$/;
+
+function sanitizeSeshCueExperiment(
+  recordMetadata: JsonObject,
+  eventMetadata: JsonObject,
+): JsonObject {
+  const experiment = recordMetadata.sesh_cue_experiment;
+  const arm = recordMetadata.sesh_cue_arm;
+  const salt = recordMetadata.sesh_cue_salt;
+  const eventHasExperiment = SESH_CUE_EXPERIMENT_KEYS.some((key) => key in eventMetadata);
+  const copiesAgree = !eventHasExperiment || SESH_CUE_EXPERIMENT_KEYS.every(
+    (key) => recordMetadata[key] === eventMetadata[key],
+  );
+  if (
+    copiesAgree &&
+    experiment === "sesh_cue_v1" &&
+    typeof arm === "string" && SESH_CUE_ARMS.includes(arm) &&
+    typeof salt === "string" && SESH_CUE_SALT.test(salt)
+  ) {
+    return { sesh_cue_experiment: experiment, sesh_cue_arm: arm, sesh_cue_salt: salt };
+  }
+  return {};
 }
 
 // Any namespace serving Sesh search (mcp__codex_apps__cosmos__sesh__..., mcp__e3_mcp__sesh__...),

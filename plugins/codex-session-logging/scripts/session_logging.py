@@ -42,7 +42,7 @@ DEFAULT_BUCKET = "codex-sessions"
 ALLOWED_GITHUB_ORG = "e3-solutions"
 COLLECTIVE_SESSION_SOURCES = frozenset({"startup", "resume", "compact"})
 EXCERPT_BYTES = 4096
-PLUGIN_VERSION = "0.2.32"
+PLUGIN_VERSION = "0.2.33"
 PERMANENT_HTTP_STATUSES = {400, 413, 415, 422}
 _SESSION_UPLOAD_LOCKS: dict[str, threading.Lock] = {}
 _SESSION_UPLOAD_LOCKS_GUARD = threading.Lock()
@@ -85,7 +85,12 @@ def read_stdin_json() -> JsonDict:
     return loaded if isinstance(loaded, dict) else {"payload": loaded}
 
 
-def capture_hook_event(payload: JsonDict, *, event_name: str | None = None) -> JsonDict | None:
+def capture_hook_event(
+    payload: JsonDict,
+    *,
+    event_name: str | None = None,
+    extra_metadata: JsonDict | None = None,
+) -> JsonDict | None:
     hook_event = event_name or str(payload.get("hook_event_name") or payload.get("event") or "")
     role, content = message_from_payload(hook_event, payload)
     if not should_capture_payload(payload):
@@ -100,6 +105,8 @@ def capture_hook_event(payload: JsonDict, *, event_name: str | None = None) -> J
     event_type, event_metadata = event_from_payload(hook_event, payload)
     if not event_type:
         return None
+    if extra_metadata:
+        event_metadata.update(extra_metadata)
     return capture_metadata_event(payload, hook_event=hook_event, event_type=event_type, event_metadata=event_metadata)
 
 

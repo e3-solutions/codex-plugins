@@ -1,7 +1,12 @@
 """Local-only Sesh boundary guidance; never performs a search or stores a query."""
+import hashlib
+import json
 import os
 import re
+import stat
 import subprocess
+import uuid
+from datetime import datetime, timezone
 
 CONTEXT = (
     "Sesh prior-work context: At chat start and after compaction, use the current "
@@ -22,31 +27,173 @@ CONTEXT = (
     "Never send Slack messages as part of this workflow."
 )
 
+# COR-4681: startup-cue on/off experiment. Off unless E3_SESH_CUE_EXPERIMENT is 1/true/on.
+EXPERIMENT_ID = "sesh_cue_v1"
+EXPERIMENT_ENV = "E3_SESH_CUE_EXPERIMENT"
+EXPERIMENT_SALT_ENV = "E3_SESH_CUE_EXPERIMENT_SALT"
+EXPERIMENT_OPTOUT_ENV = "E3_SESH_EXPERIMENT_OPTOUT"
+DISABLE_ENVS = ("E3_SESH_CONTEXT_ENABLED", "E3_SESH_START_SEARCH_ENABLED")
+# cue/no_cue are the randomized arms; the rest always keep today's behaviour.
+EXPERIMENT_ARMS = ("cue", "no_cue", "optout", "bot", "disabled", "unassigned")
+WEEK_SALT_PATTERN = re.compile(r"[0-9]{4}-W(?:0[1-9]|[1-4][0-9]|5[0-3])")
+# Native Codex thread sources a person drives; anything else is an automated thread
+# (agent_created_thread, guardian_review, subagent, ...). Same split as publish_presence.
+HUMAN_THREAD_SOURCES = frozenset({"user"})
+HEADER_MAX_BYTES = 524288
+_UUID7_MIN_MS = 1577836800000  # 2020-01-01
+_UUID7_MAX_MS = 4102444800000  # 2100-01-01
 
-def sesh_context(payload):
-    if any(os.environ.get(name, "1").strip().lower() in {
-        "0", "false", "no", "off"
-    } for name in ("E3_SESH_CONTEXT_ENABLED", "E3_SESH_START_SEARCH_ENABLED")):
+
+def _falsy(value):
+    return value is not None and value.strip().lower() in {"0", "false", "no", "off"}
+
+
+def opted_out(env):
+    value = env.get(EXPERIMENT_OPTOUT_ENV)
+    return value is not None and bool(value.strip()) and not _falsy(value)
+
+
+def experiment_enabled(env=None):
+    env = os.environ if env is None else env
+    return env.get(EXPERIMENT_ENV, "").strip().lower() in {"1", "true", "on"}
+
+
+def uuid7_datetime(session_id):
+    """Creation time embedded in a UUIDv7 session id (first 48 bits are unix ms), else None."""
+    try:
+        parsed = uuid.UUID(str(session_id).strip())
+    except (ValueError, AttributeError, TypeError):
         return None
-    if not isinstance(payload, dict):
+    if parsed.version != 7:
         return None
-    if payload.get("hook_event_name", "SessionStart") != "SessionStart":
+    millis = parsed.int >> 80
+    if not _UUID7_MIN_MS <= millis < _UUID7_MAX_MS:
         return None
-    if payload.get("source") not in {"startup", "compact"}:
+    return datetime.fromtimestamp(millis / 1000, tz=timezone.utc)
+
+
+def iso_week_salt(moment):
+    year, week, _ = moment.isocalendar()
+    return f"{year:04d}-W{week:02d}"
+
+
+def week_salt(session_id, now=None, override=None):
+    """ISO week of the session's creation, so compaction never re-randomizes a session."""
+    if override is not None and WEEK_SALT_PATTERN.fullmatch(override.strip()):
+        return override.strip()
+    moment = uuid7_datetime(session_id) or now or datetime.now(timezone.utc)
+    return iso_week_salt(moment)
+
+
+def assign_arm(salt, session_id):
+    """Pure 50/50 split on sha256(salt + ":" + session id)."""
+    digest = hashlib.sha256(f"{salt}:{session_id}".encode("utf-8")).digest()
+    return "cue" if digest[0] & 1 == 0 else "no_cue"
+
+
+def _session_id(payload):
+    for key in ("session_id", "sessionId"):
+        value = payload.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip().lower()
+    return None
+
+
+def transcript_header(payload):
+    """Bounded read of the rollout's session_meta header; never reads turns."""
+    path = payload.get("transcript_path") or payload.get("transcriptPath")
+    if not isinstance(path, str) or not os.path.isabs(path):
         return None
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+        with os.fdopen(fd, "rb") as stream:
+            if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
+                return None
+            raw = stream.readline(HEADER_MAX_BYTES + 1)
+        if len(raw) > HEADER_MAX_BYTES:
+            return None
+        record = json.loads(raw)
+    except (OSError, ValueError, UnicodeError, RecursionError):
+        return None
+    if not isinstance(record, dict) or record.get("type") != "session_meta":
+        return None
+    meta = record.get("payload")
+    return meta if isinstance(meta, dict) else None
+
+
+def automated_thread(header):
+    """True for threads no person started: agent-created, guardian, subagent, codex exec."""
+    thread_source = header.get("thread_source")
+    if isinstance(thread_source, str) and thread_source and thread_source not in HUMAN_THREAD_SOURCES:
+        return True
+    source = header.get("source")
+    if isinstance(source, dict):  # {"subagent": ...}
+        return True
+    if source == "exec" or header.get("originator") == "codex_exec":
+        return True
+    return False
+
+
+def _boundary(payload):
+    return (
+        isinstance(payload, dict)
+        and payload.get("hook_event_name", "SessionStart") == "SessionStart"
+        and payload.get("source") in {"startup", "compact"}
+    )
+
+
+def _e3_repository(payload):
     cwd = payload.get("cwd")
     if not isinstance(cwd, str) or not cwd:
-        return None
+        return False
     try:
         result = subprocess.run(
             ["git", "-C", cwd, "remote", "get-url", "origin"],
             capture_output=True, text=True, check=False, timeout=0.5,
         )
     except (OSError, subprocess.TimeoutExpired):
-        return None
-    if result.returncode != 0 or not re.fullmatch(
+        return False
+    return result.returncode == 0 and bool(re.fullmatch(
         r"(?:https://github\.com/|git@github\.com:|ssh://git@github\.com/)"
         r"e3-solutions/[A-Za-z0-9_.-]+", result.stdout.strip(), re.IGNORECASE
-    ):
-        return None
-    return CONTEXT
+    ))
+
+
+def _experiment_metadata(arm, salt):
+    return {"sesh_cue_experiment": EXPERIMENT_ID, "sesh_cue_arm": arm, "sesh_cue_salt": salt}
+
+
+def sesh_cue_decision(payload, env=None, now=None):
+    """Return (cue text or None, experiment metadata or None).
+
+    With the experiment off the result is exactly today's: (CONTEXT or None, None).
+    """
+    env = os.environ if env is None else env
+    enabled = experiment_enabled(env)
+    disabled = any(_falsy(env.get(name)) for name in DISABLE_ENVS)
+    if disabled and not enabled:
+        return None, None
+    if not _boundary(payload):
+        return None, None
+    session_id = _session_id(payload)
+    salt = week_salt(session_id, now=now, override=env.get(EXPERIMENT_SALT_ENV)) if enabled else None
+    if disabled:  # The existing kill switch always wins: no cue, nothing randomized.
+        return None, _experiment_metadata("disabled", salt)
+    if not _e3_repository(payload):
+        return None, None
+    if not enabled:
+        return CONTEXT, None
+    if opted_out(env):
+        return CONTEXT, _experiment_metadata("optout", salt)
+    header = transcript_header(payload)
+    if header is not None and automated_thread(header):
+        return CONTEXT, _experiment_metadata("bot", salt)  # Bots always keep Sesh.
+    if session_id is None or header is None:
+        return CONTEXT, _experiment_metadata("unassigned", salt)
+    arm = assign_arm(salt, session_id)
+    return (CONTEXT if arm == "cue" else None), _experiment_metadata(arm, salt)
+
+
+def sesh_context(payload):
+    context, _ = sesh_cue_decision(payload)
+    return context

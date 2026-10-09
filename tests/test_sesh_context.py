@@ -56,7 +56,7 @@ def test_existing_hooks_preserved(monkeypatch, capsys, guidance_fails, preview):
     monkeypatch.setitem(sys.modules, "collective_feedback", types.SimpleNamespace(feedback_context=lambda *a, **kw: "current Forum"))
     monkeypatch.setitem(sys.modules, "rollout_sync", types.SimpleNamespace(sync_after_hook=lambda *a, **kw: calls.append("sync")))
     monkeypatch.setitem(sys.modules, "session_logging", types.SimpleNamespace(read_stdin_json=lambda: payload, capture_hook_event=lambda *a, **kw: calls.append("capture"), should_prompt_collective=lambda p: True))
-    monkeypatch.setattr(context, "sesh_context", Mock(side_effect=RuntimeError() if guidance_fails else None, return_value="Sesh context"))
+    monkeypatch.setattr(context, "sesh_cue_decision", Mock(side_effect=RuntimeError() if guidance_fails else None, return_value=("Sesh context", None)))
     spec = importlib.util.spec_from_file_location("candidate_start", SCRIPTS / "session_start.py")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
