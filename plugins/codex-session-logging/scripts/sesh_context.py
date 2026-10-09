@@ -9,6 +9,27 @@ import uuid
 from datetime import datetime, timezone
 
 CONTEXT = (
+    "Sesh prior-work context: Once the user's actual task is known, make one Sesh "
+    "coding-session search for that task when the tool is available; with no task "
+    "yet, wait for it. Before your first edit, open the top result using the exact "
+    "source arguments the search returned. Respect an explicit opt-out. Do not "
+    "repeat a query or retry a failed search unless the user asks. If the tool is "
+    "missing or search fails, say so briefly and continue the task with available "
+    "evidence; do not block work or change access. Read the search-coding-sessions "
+    "skill and judge the actual returned passages, not titles or similarity. "
+    "Repository filters require exact indexed values, not guessed folder names "
+    "or remote aliases; preserve explicitly requested scope and do not silently "
+    "drop a filter after no matches. Distinguish supported, partial, and unsupported "
+    "results. Do not claim a saved receipt without verification. This hook does "
+    "not capture question text or grant access; existing privacy controls remain. "
+    "Never send Slack messages as part of this workflow."
+)
+
+# COR-4688: the cue after compaction is off for everyone (bots included). It drove 29% of
+# Codex Sesh searches with ~13% opened and ~2.7% yield (COR-4681). E3_SESH_CUE_AFTER_COMPACTION
+# set to 1/true/on brings back the exact pre-0.2.35 cue at compaction.
+AFTER_COMPACTION_ENV = "E3_SESH_CUE_AFTER_COMPACTION"
+COMPACTION_CONTEXT = (
     "Sesh prior-work context: At chat start and after compaction, use the current "
     "coding task to make one relevant Sesh coding-session search when the tool is "
     "available. At startup with no task yet, wait for the user's task. Respect an "
@@ -53,9 +74,18 @@ def opted_out(env):
     return value is not None and bool(value.strip()) and not _falsy(value)
 
 
+def _truthy(env, name):
+    return env.get(name, "").strip().lower() in {"1", "true", "on"}
+
+
 def experiment_enabled(env=None):
     env = os.environ if env is None else env
-    return env.get(EXPERIMENT_ENV, "").strip().lower() in {"1", "true", "on"}
+    return _truthy(env, EXPERIMENT_ENV)
+
+
+def cue_after_compaction(env=None):
+    env = os.environ if env is None else env
+    return _truthy(env, AFTER_COMPACTION_ENV)
 
 
 def uuid7_datetime(session_id):
@@ -166,9 +196,20 @@ def _experiment_metadata(arm, salt):
 def sesh_cue_decision(payload, env=None, now=None):
     """Return (cue text or None, experiment metadata or None).
 
-    With the experiment off the result is exactly today's: (CONTEXT or None, None).
+    The cue is shown at startup only. After compaction it is withheld unless
+    E3_SESH_CUE_AFTER_COMPACTION is on; the experiment arm is still logged there.
     """
     env = os.environ if env is None else env
+    compact = isinstance(payload, dict) and payload.get("source") == "compact"
+    if compact and not cue_after_compaction(env) and not experiment_enabled(env):
+        return None, None  # Nothing to show or log; skip the git lookup.
+    cue, metadata = _boundary_cue_decision(payload, env, now)
+    if cue is not None and compact:
+        cue = COMPACTION_CONTEXT if cue_after_compaction(env) else None
+    return cue, metadata
+
+
+def _boundary_cue_decision(payload, env, now):
     enabled = experiment_enabled(env)
     disabled = any(_falsy(env.get(name)) for name in DISABLE_ENVS)
     if disabled and not enabled:

@@ -33,3 +33,11 @@ Validation: focused context tests cover startup/compact, opt-outs, non-E3 scope,
 bounded git failures and unchanged Forum/capture/sync execution when cue creation
 fails. Upstream updater/Forum tests also run before publication. These are not
 live fleet adoption tests.
+
+## Update: startup only (COR-4688, Codex Session Logging 0.2.35)
+
+The cue is no longer emitted for source compact, for any thread including bots.
+E3_SESH_CUE_AFTER_COMPACTION=1 (true/on) restores the previous cue text at
+compaction. The startup cue now asks for one search using the user's actual task
+and opening the top result with the exact returned source arguments before the
+first edit. Rollback: set the variable, or publish a release reverting COR-4688.

@@ -121,7 +121,11 @@ def test_flag_off_is_unchanged(e3_git, tmp_path, flag, source):
     env = {} if flag is None else {"E3_SESH_CUE_EXPERIMENT": flag}
     no_cue_session = session_with_arm("no_cue", MONDAY)
     item = payload(no_cue_session, header(tmp_path / "r.jsonl", thread_source="user"), source)
-    assert context.sesh_cue_decision(item, env=env) == (context.CONTEXT, None)
+    # COR-4688: startup keeps the cue; compaction has none unless re-enabled.
+    expected = context.CONTEXT if source == "startup" else None
+    assert context.sesh_cue_decision(item, env=env) == (expected, None)
+    assert context.sesh_cue_decision(item, env={**env, "E3_SESH_CUE_AFTER_COMPACTION": "1"}) == (
+        context.CONTEXT if source == "startup" else context.COMPACTION_CONTEXT, None)
     # Non-boundary or foreign payloads stay silent exactly as before.
     assert context.sesh_cue_decision({**item, "source": "resume"}, env=env) == (None, None)
 
@@ -151,9 +155,29 @@ def test_compaction_keeps_the_startup_arm_across_a_week_boundary(e3_git, tmp_pat
     start = context.sesh_cue_decision(payload(session_id, transcript, "startup"), env=ON, now=sunday_night)
     later = sunday_night + timedelta(days=3)
     compact = context.sesh_cue_decision(payload(session_id, transcript, "compact"), env=ON, now=later)
-    assert start == compact
+    assert start[1] == compact[1]
+    assert start[0] == (context.CONTEXT if arm == "cue" else None)
+    assert compact[0] is None  # COR-4688: no cue after compaction, arm still logged.
     assert compact[1]["sesh_cue_arm"] == arm
     assert compact[1]["sesh_cue_salt"] == "2026-W41"
+    again = context.sesh_cue_decision(payload(session_id, transcript, "compact"),
+                                      env={**ON, "E3_SESH_CUE_AFTER_COMPACTION": "1"}, now=later)
+    assert again == ((context.COMPACTION_CONTEXT if arm == "cue" else None), compact[1])
+
+
+@pytest.mark.parametrize("meta", [{"thread_source": "agent_created_thread"}, {"source": "exec"},
+                                  {"source": {"subagent": "review"}}, {"originator": "codex_exec"}])
+def test_bots_keep_startup_cue_but_not_the_compaction_cue(e3_git, tmp_path, meta):
+    transcript = header(tmp_path / "r.jsonl", **meta)
+    session_id = session_with_arm("no_cue", MONDAY)
+    for env in ({}, ON):
+        start = context.sesh_cue_decision(payload(session_id, transcript, "startup"), env=env)
+        compact = context.sesh_cue_decision(payload(session_id, transcript, "compact"), env=env)
+        assert start[0] == context.CONTEXT
+        assert compact[0] is None
+        assert start[1] == compact[1] == (None if env == {} else
+                                          {"sesh_cue_experiment": "sesh_cue_v1", "sesh_cue_arm": "bot",
+                                           "sesh_cue_salt": "2026-W42"})
 
 
 @pytest.mark.parametrize("value", ["1", "true", "yes", "on"])
@@ -259,7 +283,11 @@ def run_session_start(tmp_path: Path, session_id: str, env_extra: dict[str, str]
                         source="vscode", originator="Codex Desktop")
     env = {key: value for key, value in os.environ.items()
            if not key.startswith(("E3_SESH", "CODEX_SESSION_LOG", "E3_COLLECTIVE"))}
+    # The hook allows git 0.5 s. On macOS /usr/bin/git is an xcrun shim that can take ~0.45 s
+    # under load, so call the real binary from git's exec path to keep these tests stable.
+    exec_path = subprocess.run(["git", "--exec-path"], capture_output=True, text=True, check=True).stdout.strip()
     env.update({
+        "PATH": os.pathsep.join([exec_path, env.get("PATH", "")]),
         "HOME": str(tmp_path / "home"),
         "CODEX_HOME": str(tmp_path / "codex-home"),
         "CODEX_SESSION_LOG_AUTO_UPLOAD": "0",
@@ -288,12 +316,22 @@ def test_hook_flag_off_prints_cue_and_logs_no_arm(tmp_path):
     assert event["event_type"] == "environment_snapshot"
 
 
+def test_hook_prints_no_sesh_cue_after_compaction_unless_turned_back_on(tmp_path):
+    session_id = session_with_arm("cue", MONDAY)
+    stdout, event = run_session_start(tmp_path, session_id, {}, source="compact")
+    assert "Sesh prior-work context" not in stdout
+    assert EXPERIMENT_KEYS.isdisjoint(event["metadata"])
+    stdout, _ = run_session_start(tmp_path, session_id, {"E3_SESH_CUE_AFTER_COMPACTION": "1"}, source="compact")
+    assert context.COMPACTION_CONTEXT in stdout
+
+
 @pytest.mark.parametrize("arm", ["cue", "no_cue"])
 def test_hook_flag_on_logs_arm_on_session_start_and_compaction(tmp_path, arm):
     session_id = session_with_arm(arm, MONDAY)
     for source in ("startup", "compact"):
         stdout, event = run_session_start(tmp_path, session_id, ON, source=source)
-        assert (context.CONTEXT in stdout) is (arm == "cue")
+        assert (context.CONTEXT in stdout) is (arm == "cue" and source == "startup")
+        assert "Sesh prior-work context" not in stdout or source == "startup"
         assert {key: event["metadata"][key] for key in EXPERIMENT_KEYS} == {
             "sesh_cue_experiment": "sesh_cue_v1", "sesh_cue_arm": arm, "sesh_cue_salt": "2026-W42"}
         # The queued upload record carries the same metadata as the local log.

@@ -2112,7 +2112,7 @@ def test_current_marketplace_upgrades_previous_release_and_activates_prompt(tmp_
     manifest.write_text(
         json.dumps(
             {
-                "version": "0.3.34",
+                "version": "0.3.35",
                 "archive_url": archive.as_uri(),
                 "sha256": digest,
                 "plugin_subdir": "plugins/linear-progress-sync",
@@ -2129,7 +2129,7 @@ def test_current_marketplace_upgrades_previous_release_and_activates_prompt(tmp_
         force=True,
         install_hooks=False,
     )
-    new_linear = cache_parent / "0.3.34"
+    new_linear = cache_parent / "0.3.35"
     second = update_plugin.run_update(
         current_plugin_root=new_linear,
         cache_parent=cache_parent,
@@ -2152,22 +2152,22 @@ def test_current_marketplace_upgrades_previous_release_and_activates_prompt(tmp_
     )
 
     installed_prompt = (
-        cache_root / "codex-session-logging/0.2.34/scripts/collective_feedback.py"
+        cache_root / "codex-session-logging/0.2.35/scripts/collective_feedback.py"
     )
     assert first["updated"] is True
     assert second["updated"] is False
     assert second["skipped"] == "current"
-    assert sorted(path.name for path in cache_parent.iterdir() if not path.name.startswith(".")) == ["0.3.34"]
+    assert sorted(path.name for path in cache_parent.iterdir() if not path.name.startswith(".")) == ["0.3.35"]
     codex_versions = cache_root / "codex-session-logging"
-    assert sorted(path.name for path in codex_versions.iterdir() if not path.name.startswith(".")) == ["0.2.34"]
+    assert sorted(path.name for path in codex_versions.iterdir() if not path.name.startswith(".")) == ["0.2.35"]
     assert installed_prompt.read_bytes() == (
         ROOT / "plugins/codex-session-logging/scripts/collective_feedback.py"
     ).read_bytes()
-    installed_skill = cache_root / "codex-session-logging/0.2.34/skills/search-coding-sessions/SKILL.md"
+    installed_skill = cache_root / "codex-session-logging/0.2.35/skills/search-coding-sessions/SKILL.md"
     assert installed_skill.read_bytes() == (
         ROOT / "plugins/codex-session-logging/skills/search-coding-sessions/SKILL.md"
     ).read_bytes()
-    installed_manifest = json.loads((cache_root / "codex-session-logging/0.2.34/.codex-plugin/plugin.json").read_text())
+    installed_manifest = json.loads((cache_root / "codex-session-logging/0.2.35/.codex-plugin/plugin.json").read_text())
     assert installed_manifest["skills"] == "./skills/"
     repo = init_git_repo(tmp_path / "e3-repo")
     hook_env = {
@@ -2209,8 +2209,16 @@ def test_current_marketplace_upgrades_previous_release_and_activates_prompt(tmp_
         text=True, capture_output=True, check=False, env=hook_env,
     )
     assert compact.returncode == 0
-    assert "Sesh prior-work context:" in compact.stdout
+    assert "Sesh prior-work context:" not in compact.stdout  # COR-4688: startup only.
     assert "E3 Collective / Forum:" in compact.stdout
+    recompact = subprocess.run(
+        [sys.executable, str(hook_script)],
+        input=json.dumps({"cwd": str(repo), "session_id": "recompact", "source": "compact"}),
+        text=True, capture_output=True, check=False,
+        env={**hook_env, "E3_SESH_CUE_AFTER_COMPACTION": "1"},
+    )
+    assert recompact.returncode == 0
+    assert "Sesh prior-work context: At chat start and after compaction" in recompact.stdout
     assert health["healthy"] is True
     assert health["issues"] == []
 
@@ -2318,7 +2326,7 @@ def test_legacy_upgrade_keeps_presence_scheduler_decommissioned(tmp_path, monkey
     manifest.write_text(
         json.dumps(
             {
-                "version": "0.3.34",
+                "version": "0.3.35",
                 "archive_url": archive.as_uri(),
                 "sha256": hashlib.sha256(archive.read_bytes()).hexdigest(),
                 "plugin_subdir": "plugins/linear-progress-sync",
@@ -2374,8 +2382,8 @@ def test_legacy_upgrade_keeps_presence_scheduler_decommissioned(tmp_path, monkey
     resident_root = codex_home / "coreedge"
 
     assert first_cycle.returncode == 0, first_cycle.stderr
-    assert json.loads(first_cycle.stdout)["resident"]["version"] == "0.3.34"
-    assert (resident_root / "runtime" / "current").resolve().name == "0.3.34"
+    assert json.loads(first_cycle.stdout)["resident"]["version"] == "0.3.35"
+    assert (resident_root / "runtime" / "current").resolve().name == "0.3.35"
     assert not (home / "Library" / "LaunchAgents" / "com.coreedge.codex-session-presence.plist").exists()
 
     second_cycle = subprocess.run(
@@ -3215,12 +3223,12 @@ def test_real_marketplace_activates_in_isolated_codex_home_and_passes_doctor(tmp
         platform="unsupported",
     )
 
-    assert activation["version"] == "0.3.34"
+    assert activation["version"] == "0.3.35"
     assert health["healthy"] is True
     assert health["issues"] == []
     assert health["cache_versions"] == {
-        "codex-session-logging": ["0.2.34"],
-        "linear-progress-sync": ["0.3.34"],
+        "codex-session-logging": ["0.2.35"],
+        "linear-progress-sync": ["0.3.35"],
     }
     assert subprocess.run(["sh", "-n", str(resident_root / "run.sh")], check=False).returncode == 0
 
@@ -3237,7 +3245,7 @@ def test_resident_hook_repairs_matching_cache_and_runtime_corruption_from_manage
         platform="unsupported",
     )
     managed = resident_root / "marketplace/current/plugins/linear-progress-sync"
-    cache = codex_home / "plugins/cache/coreedge-local/linear-progress-sync/0.3.34"
+    cache = codex_home / "plugins/cache/coreedge-local/linear-progress-sync/0.3.35"
     runtime = resident_root / "runtime/current"
     corrupt_content = (managed / "scripts/linear_sync.py").read_bytes()
     (cache / "scripts/update_plugin.py").write_bytes(corrupt_content)
@@ -4526,7 +4534,7 @@ def test_resident_doctor_reports_content_corruption_and_unloaded_service(tmp_pat
     broken_cache_script = (
         cache_root
         / "linear-progress-sync"
-        / "0.3.34"
+        / "0.3.35"
         / "scripts"
         / "update_plugin.py"
     )
