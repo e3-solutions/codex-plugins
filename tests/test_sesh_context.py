@@ -10,12 +10,55 @@ sys.path.insert(0, str(SCRIPTS))
 import sesh_context as context
 
 
-@pytest.mark.parametrize("source", ["startup", "compact"])
-def test_boundary(monkeypatch, source):
+def test_boundary(monkeypatch):
     run = Mock(return_value=types.SimpleNamespace(returncode=0, stdout="git@github.com:e3-solutions/sesh.git\n"))
     monkeypatch.setattr(context.subprocess, "run", run)
-    assert context.sesh_context({"source": source, "cwd": "/repo"}) == context.CONTEXT
+    assert context.sesh_context({"source": "startup", "cwd": "/repo"}) == context.CONTEXT
     assert run.call_args.kwargs["timeout"] == 0.5
+
+
+# COR-4688: no cue after compaction by default, for every thread (bots included).
+@pytest.mark.parametrize("value", [None, "", "0", "false", "off", "no", "yes", "enabled"])
+def test_no_cue_after_compaction_by_default(monkeypatch, value):
+    if value is not None:
+        monkeypatch.setenv("E3_SESH_CUE_AFTER_COMPACTION", value)
+    run = Mock(side_effect=AssertionError("must not spawn"))
+    monkeypatch.setattr(context.subprocess, "run", run)
+    assert context.sesh_context({"source": "compact", "cwd": "/repo"}) is None
+    run.assert_not_called()
+
+
+@pytest.mark.parametrize("value", ["1", "true", "on", " ON "])
+def test_compaction_cue_can_be_turned_back_on(monkeypatch, value):
+    monkeypatch.setenv("E3_SESH_CUE_AFTER_COMPACTION", value)
+    monkeypatch.setattr(context.subprocess, "run", Mock(return_value=types.SimpleNamespace(
+        returncode=0, stdout="git@github.com:e3-solutions/sesh.git\n")))
+    assert context.sesh_context({"source": "compact", "cwd": "/repo"}) == context.COMPACTION_CONTEXT
+    # The startup cue is the same either way.
+    assert context.sesh_context({"source": "startup", "cwd": "/repo"}) == context.CONTEXT
+
+
+def test_compaction_cue_still_respects_scope_and_kill_switch(monkeypatch):
+    monkeypatch.setenv("E3_SESH_CUE_AFTER_COMPACTION", "1")
+    monkeypatch.setattr(context.subprocess, "run", Mock(return_value=types.SimpleNamespace(
+        returncode=0, stdout="https://github.com/other/sesh\n")))
+    assert context.sesh_context({"source": "compact", "cwd": "/repo"}) is None
+    monkeypatch.setenv("E3_SESH_CONTEXT_ENABLED", "0")
+    monkeypatch.setattr(context.subprocess, "run", Mock(side_effect=AssertionError()))
+    assert context.sesh_context({"source": "compact", "cwd": "/repo"}) is None
+
+
+def test_startup_cue_asks_for_one_task_search_then_top_result_before_first_edit():
+    text = context.CONTEXT
+    assert text.startswith("Sesh prior-work context:")
+    assert "user's actual task" in text and "one Sesh" in text
+    assert "Before your first edit, open the top result" in text
+    assert "exact source arguments" in text
+    assert "after compaction" not in text
+    assert len(text) < len(context.COMPACTION_CONTEXT)
+    # Safety lines kept from the previous cue.
+    for kept in ("explicit opt-out", "Never send Slack", "do not block work", "search-coding-sessions"):
+        assert kept in text
 
 
 @pytest.mark.parametrize("payload", [None, {}, {"source": "resume"}, {"source": "clear"}, {"source": "compact", "cwd": 5}, {"source": "startup", "cwd": "/repo", "hook_event_name": "Stop"}])

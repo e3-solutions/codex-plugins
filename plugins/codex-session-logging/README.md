@@ -33,15 +33,24 @@ envelopes omit the optional metadata without changing tool behavior.
 Deploy the compatible sanitizer before distributing this logging release. Rollback of
 either side safely omits the optional field; no schema migration is required.
 
+## Sesh cue: startup only (COR-4688)
+
+The `SessionStart` hook prints the "Sesh prior-work context" cue at `startup` in
+e3-solutions repositories. It asks for one Sesh search using the user's actual task,
+then opening the top result with the exact returned source arguments before the first
+edit. Since 0.2.35 the cue is **not** shown after compaction, for any thread (bots
+included): in COR-4681 the post-compaction cue drove 29% of Codex Sesh searches, only
+13% were opened, and about 2.7% helped. Set `E3_SESH_CUE_AFTER_COMPACTION=1` (also
+`true` or `on`) to bring back the previous cue at compaction. `E3_SESH_CONTEXT_ENABLED=0`
+still turns the cue off everywhere.
+
 ## Sesh startup-cue experiment (COR-4681, off by default)
 
-The `SessionStart` hook prints the "Sesh prior-work context" cue at `startup` and
-`compact` in e3-solutions repositories. This release adds an on/off experiment for
-that cue. **It ships off and stays off until it is announced to the team.** With the
+This release adds an on/off experiment for the startup cue. **It ships off and stays off until it is announced to the team.** With the
 flag unset the hook output and the logged event are exactly as before.
 
 - `E3_SESH_CUE_EXPERIMENT=1` (also `true` or `on`; anything else is off) turns it on.
-- Arms: each session gets `cue` (cue shown as today) or `no_cue` (cue not shown),
+- Arms: each session gets `cue` (startup cue shown) or `no_cue` (cue not shown),
   50/50 by `sha256(<ISO week> + ":" + <session id>)`. The week (for example
   `2026-W42`) comes from the time inside the Codex UUIDv7 session id, so a session
   keeps its arm after compaction even across a week boundary; non-UUIDv7 ids use the
@@ -57,7 +66,8 @@ flag unset the hook output and the logged event are exactly as before.
 
 While the flag is on, the `SessionStart` `environment_snapshot` event carries
 `metadata.sesh_cue_experiment = "sesh_cue_v1"`, `metadata.sesh_cue_arm` (one of the
-arms above) and `metadata.sesh_cue_salt` (the week). Nothing else is added; no
+arms above) and `metadata.sesh_cue_salt` (the week), at startup and after compaction
+(after compaction no cue is shown in either arm unless `E3_SESH_CUE_AFTER_COMPACTION` is on). Nothing else is added; no
 question, prompt or chat text is read or logged. The local copy is in
 `events.jsonl` and the queued event file under the logger state directory. The ingest
 sanitizer keeps the three keys only when all are valid and both copies agree. **Deploy
