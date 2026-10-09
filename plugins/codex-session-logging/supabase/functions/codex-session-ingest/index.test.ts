@@ -2423,3 +2423,63 @@ function restoreEnv(name: string, previous: string | undefined): void {
   }
   Deno.env.set(name, previous);
 }
+
+Deno.test("sanitizeEventPayload keeps only a valid, agreeing Sesh cue experiment arm", () => {
+  const experiment = {
+    sesh_cue_experiment: "sesh_cue_v1",
+    sesh_cue_arm: "no_cue",
+    sesh_cue_salt: "2026-W41",
+  };
+  const snapshot = (metadata: JsonObject, eventMetadata: JsonObject = metadata) =>
+    sanitizeEventPayload(
+      {
+        id: "0d7a3f40-55c5-4a0e-9d55-0a7f2f8c9b11",
+        session_id: "01a0c524-f3aa-7bbb-8ccc-0123456789ab",
+        seq: 1,
+        event_type: "environment_snapshot",
+        hook_event_name: "SessionStart",
+        created_at: "2026-10-09T00:00:00.000Z",
+        metadata,
+      },
+      { metadata: eventMetadata },
+    ).metadata as JsonObject;
+
+  for (const arm of ["cue", "no_cue", "optout", "bot", "disabled", "unassigned"]) {
+    const kept = snapshot({ source: "startup", ...experiment, sesh_cue_arm: arm });
+    assertEquals(kept, { source: "startup", ...experiment, sesh_cue_arm: arm });
+  }
+  // Older loggers and the flag-off path send no experiment keys.
+  assertEquals(snapshot({ source: "compact" }), { source: "compact" });
+
+  const rejected: JsonObject[] = [
+    { ...experiment, sesh_cue_arm: "treatment" },
+    { ...experiment, sesh_cue_arm: "CUE" },
+    { ...experiment, sesh_cue_arm: ["cue"] },
+    { ...experiment, sesh_cue_experiment: "sesh_cue_v2" },
+    { ...experiment, sesh_cue_salt: "2026-W54" },
+    { ...experiment, sesh_cue_salt: "2026-W41 question text" },
+    { ...experiment, sesh_cue_salt: undefined },
+    { sesh_cue_arm: "cue" },
+  ];
+  for (const metadata of rejected) {
+    assertEquals(snapshot({ source: "startup", ...metadata }), { source: "startup" });
+  }
+  // Both copies must agree.
+  assertEquals(
+    snapshot({ source: "startup", ...experiment }, { ...experiment, sesh_cue_arm: "cue" }),
+    { source: "startup" },
+  );
+  // Never kept on other event types.
+  const tool = sanitizeEventPayload(
+    {
+      id: "e2f0c3a1-1111-4222-8333-944455556666",
+      session_id: "session-tool",
+      seq: 2,
+      event_type: "tool_call_finished",
+      created_at: "2026-10-09T00:00:00.000Z",
+      metadata: { tool_name: "shell", tool_phase: "finished", ...experiment },
+    },
+    {},
+  );
+  assertEquals(tool.metadata, { tool_name: "shell", tool_phase: "finished" });
+});

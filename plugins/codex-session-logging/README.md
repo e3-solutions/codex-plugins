@@ -33,6 +33,37 @@ envelopes omit the optional metadata without changing tool behavior.
 Deploy the compatible sanitizer before distributing this logging release. Rollback of
 either side safely omits the optional field; no schema migration is required.
 
+## Sesh startup-cue experiment (COR-4681, off by default)
+
+The `SessionStart` hook prints the "Sesh prior-work context" cue at `startup` and
+`compact` in e3-solutions repositories. This release adds an on/off experiment for
+that cue. **It ships off and stays off until it is announced to the team.** With the
+flag unset the hook output and the logged event are exactly as before.
+
+- `E3_SESH_CUE_EXPERIMENT=1` (also `true` or `on`; anything else is off) turns it on.
+- Arms: each session gets `cue` (cue shown as today) or `no_cue` (cue not shown),
+  50/50 by `sha256(<ISO week> + ":" + <session id>)`. The week (for example
+  `2026-W42`) comes from the time inside the Codex UUIDv7 session id, so a session
+  keeps its arm after compaction even across a week boundary; non-UUIDv7 ids use the
+  current week. `E3_SESH_CUE_EXPERIMENT_SALT=YYYY-Www` overrides the week (testing only).
+- Opt-out: `E3_SESH_EXPERIMENT_OPTOUT=1` always shows the cue; arm `optout`.
+- Bots keep Sesh: automated threads always get the cue; arm `bot`. A thread is
+  automated when its rollout header `thread_source` is anything other than `user`
+  (`agent_created_thread`, `guardian_review`, `subagent`, ...), its `source` is a
+  subagent or `exec`, or its originator is `codex_exec`.
+- If the thread or session id cannot be read, the cue is shown; arm `unassigned`.
+- The existing kill switch still wins: with `E3_SESH_CONTEXT_ENABLED=0` (or
+  `E3_SESH_START_SEARCH_ENABLED=0`) there is no cue; arm `disabled`.
+
+While the flag is on, the `SessionStart` `environment_snapshot` event carries
+`metadata.sesh_cue_experiment = "sesh_cue_v1"`, `metadata.sesh_cue_arm` (one of the
+arms above) and `metadata.sesh_cue_salt` (the week). Nothing else is added; no
+question, prompt or chat text is read or logged. The local copy is in
+`events.jsonl` and the queued event file under the logger state directory. The ingest
+sanitizer keeps the three keys only when all are valid and both copies agree. **Deploy
+the updated `codex-session-ingest` function before turning the flag on**, or the
+arms are dropped and never reach `public.codex_session_events`.
+
 ## Collective prompt contract
 
 The full contribution must lead with a reusable lesson, method, failure mechanism, or qualified hypothesis—not merely a general title above an operational report. Customer, repository, flag, and incident details belong in a dated `Evidence/example` section with authorized provenance. The lesson should remain useful without that example; query authoritative systems for current state. Search and read relevant prior Forum work before asserting a correction, and link it as supporting, challenging, or superseding evidence. Submissions stay private pending approval; no useful learning is a valid outcome. After fully reading a post, record one explained `up`, `down`, or neutral `abstain` assessment before task completion when feedback is enabled and authorized. Use the exact post id and body hash, preserve the mutation UUID and identical payload for uncertain retries, and report definitive failures as unsaved. Optional specific concerns and USE/SKIP prose do not replace that saved assessment.
