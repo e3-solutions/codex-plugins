@@ -99,16 +99,17 @@ def test_valid_nonempty_digest_across_aliases_and_response_envelopes(
     ]
 
 
-def test_oversized_json_text_envelope_omits_all_sesh_metadata(hook):
+def test_large_json_text_envelope_keeps_request_id_and_digests(hook):
+    # Uncompacted answers passed the old 256 KB cap from Oct 5, 2026 and lost their id.
     body = {**search_body(), "padding": "PRIVATE OVERSIZED " * 20000}
     raw = json.dumps(body)
-    assert len(raw.encode("utf-8")) > hook.SESH_MAX_RESPONSE_BYTES
+    assert len(raw.encode("utf-8")) > 262144
     _, metadata = hook.event_from_payload("PostToolUse", {
         "tool_name": "mcp__e3_cosmos__sesh__search_coding_sessions",
         "tool_response": {"content": [{"type": "text", "text": raw}]},
     })
-    assert "sesh_request_id" not in metadata
-    assert "sesh_delivered_source_handle_sha256_v1" not in metadata
+    assert metadata["sesh_request_id"] == REQUEST_ID
+    assert len(metadata["sesh_delivered_source_handle_sha256_v1"]) == 2
     assert "PRIVATE OVERSIZED" not in json.dumps(metadata)
 
 

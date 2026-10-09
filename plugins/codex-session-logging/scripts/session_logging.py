@@ -42,7 +42,7 @@ DEFAULT_BUCKET = "codex-sessions"
 ALLOWED_GITHUB_ORG = "e3-solutions"
 COLLECTIVE_SESSION_SOURCES = frozenset({"startup", "resume", "compact"})
 EXCERPT_BYTES = 4096
-PLUGIN_VERSION = "0.2.31"
+PLUGIN_VERSION = "0.2.32"
 PERMANENT_HTTP_STATUSES = {400, 413, 415, 422}
 _SESSION_UPLOAD_LOCKS: dict[str, threading.Lock] = {}
 _SESSION_UPLOAD_LOCKS_GUARD = threading.Lock()
@@ -344,7 +344,19 @@ SESH_SEARCH_TOOLS = (
     'mcp__cosmos__sesh__search_coding_sessions',
     'mcp__cosmos_e3__sesh__search_coding_sessions',
 )
-SESH_MAX_RESPONSE_BYTES = 262144
+# Any MCP namespace that serves Sesh search: mcp__<ns>__sesh__search_coding_sessions
+# (including mcp__codex_apps__cosmos__... and mcp__e3_mcp__...), mcp__<ns>__search_coding_sessions,
+# or the bare tool name. Nothing before or after the name.
+SESH_SEARCH_TOOL_PATTERN = re.compile(r'(?:[A-Za-z0-9_-]+__)?(?:sesh__)?search_coding_sessions')
+# Full JSON parse of a text envelope up to this size. Uncompacted answers with many evidence
+# passages pass 256 KB (Oct 5, 2026), and the request id sits at the end of the text.
+SESH_MAX_RESPONSE_BYTES = 16 * 1024 * 1024
+# Larger texts are not parsed; only structural (unescaped) search_request_id keys are read.
+SESH_MAX_SCAN_BYTES = 64 * 1024 * 1024
+SESH_MAX_REQUEST_IDS = 32
+SESH_REQUEST_ID_KEY_PATTERN = re.compile(
+    r'(?<!\\)"search_request_id"\s*:\s*"([^"\\]{0,64})"'
+)
 SESH_MAX_DELIVERED_SOURCE_HANDLES = 75
 SESH_MAX_SOURCE_HANDLE_OCCURRENCES = 80
 SESH_UUID_PATTERN = re.compile(
@@ -387,11 +399,16 @@ def _sesh_response_bodies(response):
         if not isinstance(item, dict) or item.get('type') != 'text':
             return None
         raw = item.get('text')
-        if not isinstance(raw, str) or len(raw) > SESH_MAX_RESPONSE_BYTES:
+        if not isinstance(raw, str):
             return None
-        try:
-            if len(raw.encode('utf-8')) > SESH_MAX_RESPONSE_BYTES:
+        if len(raw) > SESH_MAX_RESPONSE_BYTES:
+            # Too big to parse: keep only the request ids, never the content.
+            scanned = _sesh_scanned_request_body(raw)
+            if scanned is None:
                 return None
+            bodies.append(scanned)
+            return bodies
+        try:
             decoded = json.loads(raw, object_pairs_hook=_sesh_unique_object)
         except (ValueError, UnicodeError, RecursionError):
             return None
@@ -399,6 +416,25 @@ def _sesh_response_bodies(response):
             return None
         bodies.append(decoded)
     return bodies
+
+
+def _sesh_scanned_request_body(raw):
+    """Request ids of an oversized JSON text envelope, read without parsing it.
+
+    Only keys whose opening quote is not escaped are structural, so ids quoted inside
+    passages (always escaped in JSON text) are never read. The first id is the answer's own
+    search_request_id when it is the last key, as Sesh writes it; per-question ids precede it.
+    """
+    if len(raw) > SESH_MAX_SCAN_BYTES or not raw.lstrip().startswith('{'):
+        return None
+    found = SESH_REQUEST_ID_KEY_PATTERN.findall(raw)
+    if not found or len(found) > SESH_MAX_REQUEST_IDS + 1:
+        return None
+    if any(SESH_UUID_PATTERN.fullmatch(value) is None for value in found):
+        return None
+    # Sesh appends the top-level id last; earlier ones are per_query entries.
+    return {'search_request_id': found[-1],
+            'per_query': [{'search_request_id': value} for value in found[:-1]]}
 
 
 def _canonical_uuid(value):
@@ -492,8 +528,25 @@ def _delivered_source_handle_digests(body):
     return digests
 
 
+def is_sesh_search_tool(name):
+    return isinstance(name, str) and SESH_SEARCH_TOOL_PATTERN.fullmatch(name) is not None
+
+
+def _per_query_request_ids(body):
+    """Ids of a multi-question answer (per_query[i].search_request_id), in question order."""
+    per_query = body.get('per_query')
+    if not isinstance(per_query, list):
+        return []
+    found = []
+    for entry in per_query[:SESH_MAX_REQUEST_IDS]:
+        value = entry.get('search_request_id') if isinstance(entry, dict) else None
+        if isinstance(value, str) and SESH_UUID_PATTERN.fullmatch(value) is not None:
+            found.append(value)
+    return found
+
+
 def search_receipt_metadata(payload):
-    if not isinstance(payload, dict) or payload.get('tool_name') not in SESH_SEARCH_TOOLS:
+    if not isinstance(payload, dict) or not is_sesh_search_tool(payload.get('tool_name')):
         return {}
     response = payload.get('tool_response')
     if not isinstance(response, dict):
@@ -503,15 +556,23 @@ def search_receipt_metadata(payload):
     if bodies is None:
         return {}
     ids = set()
+    all_ids = []
     delivered_sets = []
     delivered_invalid = False
     for body in bodies:
         value = body.get('search_request_id')
+        per_query = _per_query_request_ids(body)
+        if value is None and not per_query:
+            continue
+        if value is not None:
+            if not isinstance(value, str) or SESH_UUID_PATTERN.fullmatch(value) is None:
+                return {}
+            ids.add(value)
+        for item in ([value] if value is not None else []) + per_query:
+            if item not in all_ids:
+                all_ids.append(item)
         if value is None:
             continue
-        if not isinstance(value, str) or SESH_UUID_PATTERN.fullmatch(value) is None:
-            return {}
-        ids.add(value)
         try:
             delivered = _delivered_source_handle_digests(body)
             if delivered is not None:
@@ -519,9 +580,12 @@ def search_receipt_metadata(payload):
         except (ValueError, TypeError, UnicodeError, RecursionError):
             delivered_invalid = True
     # Conflicting envelopes are ambiguous, never choose whichever appears first.
-    if len(ids) != 1:
+    if len(ids) > 1 or not all_ids:
         return {}
-    metadata = {'sesh_request_id': ids.pop()}
+    primary = ids.pop() if ids else all_ids[0]
+    ordered = [primary] + [item for item in all_ids if item != primary]
+    metadata = {'sesh_request_id': primary,
+                'sesh_request_ids': ordered[:SESH_MAX_REQUEST_IDS]}
     if (not delivered_invalid and delivered_sets and
             all(item == delivered_sets[0] for item in delivered_sets[1:])):
         metadata['sesh_delivered_source_handle_sha256_v1'] = delivered_sets[0]
