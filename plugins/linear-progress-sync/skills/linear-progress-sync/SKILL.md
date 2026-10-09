@@ -73,6 +73,7 @@ cd codex-plugins
 gh auth login
 python3 plugins/linear-progress-sync/scripts/setup.py
 codex mcp login linear
+codex mcp login e3-cosmos
 ```
 
 This repository is a Codex plugin marketplace, not a single plugin source. Do not tell teammates or agents to run `codex plugin add` with the GitHub URL or repository root directly; that can skip marketplace registration, default plugin installation, legacy hook cleanup, and Linear MCP registration.

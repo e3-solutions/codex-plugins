@@ -276,7 +276,8 @@ def run_session_start(tmp_path: Path, session_id: str, env_extra: dict[str, str]
     )
     assert result.returncode == 0, result.stderr
     events = [json.loads(line) for line in (tmp_path / "state/events.jsonl").read_text().splitlines()]
-    starts = [event for event in events if event["hook_event_name"] == "SessionStart"]
+    starts = [event for event in events if event["hook_event_name"] == "SessionStart"
+              and event["event_type"] == "environment_snapshot"]
     return result.stdout, starts[-1]
 
 
