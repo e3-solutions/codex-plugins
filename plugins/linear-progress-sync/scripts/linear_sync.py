@@ -1108,12 +1108,13 @@ def setup_plan(
     target_repo_root: str | Path | None = None,
     with_git_hook: bool = False,
 ) -> JsonDict:
+    if with_git_hook:
+        raise ValueError("Linear Progress Sync Git hook installation is retired")
     plugin_root = Path(plugin_repo_root).expanduser().resolve()
     target_root = Path(target_repo_root or os.getcwd()).expanduser().resolve()
     commands = [
         shlex.join(["gh", "auth", "status"]),
         shlex.join(["codex", "plugin", "marketplace", "add", str(plugin_root)]),
-        shlex.join(["codex", "plugin", "add", "linear-progress-sync@coreedge-local"]),
         shlex.join(["codex", "plugin", "add", "codex-session-logging@coreedge-local"]),
         shlex.join(
             [
@@ -1139,9 +1140,6 @@ def setup_plan(
         ),
         shlex.join(["codex", "mcp", "add", "linear", "--url", LINEAR_MCP_URL]),
     ]
-    if with_git_hook:
-        hook_script = plugin_root / "plugins" / "linear-progress-sync" / "scripts" / "install_git_hook.py"
-        commands.append(shlex.join([sys.executable, str(hook_script), "--root", str(target_root)]))
     return {
         "commands": commands,
         "plugin_repo_root": str(plugin_root),
@@ -1153,16 +1151,15 @@ def setup_plan(
             "GitHub auth is a manual prerequisite: run gh auth login when needed.",
             "Linear auth is manual after setup registers the MCP server: run codex mcp login linear after setup when needed.",
             "The resident updater registers E3 Cosmos (e3-cosmos) when no Cosmos MCP server exists; run codex mcp login e3-cosmos once if Codex asks. Opt out with update_plugin.py --disable-cosmos-mcp.",
-            "If Codex asks to review hooks, trust the Linear Progress Sync and Codex Session Logging hooks once so kickoff and session capture can run.",
-            "First use lists Linear users, asks which user to save, and stores it in ~/.codex/linear-sync/user.json for all repos.",
-            "First use in a repo lists Linear teams/projects, asks which project to save, and stores it in ~/.codex/linear-sync/repos.json.",
-            "Repos that should not use Linear sync can be opted out with linear_start.py configure-repo --disable-linear-sync.",
+            "If Codex asks to review hooks, trust the Codex Session Logging hooks once so session capture can run.",
+            "Linear MCP stays available after sign-in; setup and resident updates no longer install Linear Progress Sync.",
+            "Existing Linear Progress Sync installations remain until a separate removal update.",
             "Resident updates run at login and every 30 minutes through macOS LaunchAgents or Linux systemd user timers; complete parent and subagent session capture advances through Codex hooks without a minute poller; teammates need no renewal thread or update command.",
             "Headless Linux VMs need loginctl lingering enabled for the teammate account if resident timers must continue after logout.",
-            "SessionStart remains a self-healing fallback; use update_plugin.py --disable-auto-update for a persistent opt-out.",
+            "The scheduled resident updater continues without the Linear Progress Sync plugin hook; use update_plugin.py --disable-auto-update for a persistent opt-out.",
             "LINEAR_SYNC_AUTO_UPDATE=0 is also persisted when setup or a self-healing hook observes it.",
-            "Before kickoff, file edits, write-like Bash commands, and branch creation wait for active Linear state.",
-            "Per-repo Git hook setup is optional and only needed to sync commits made outside Codex.",
+            "Linear MCP registration and existing Linear state are preserved.",
+            "New Linear Progress Sync Git hooks are no longer installed.",
             "Start a new Codex thread after the first installation; routine updates need no deliberate restart.",
         ],
     }

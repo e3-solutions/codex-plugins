@@ -18,7 +18,7 @@ def main() -> None:
     parser.add_argument(
         "--with-git-hook",
         action="store_true",
-        help="Also install the optional repo post-commit hook for non-Codex commits.",
+        help="Retired; new Linear Progress Sync Git hooks are not installed.",
     )
     parser.add_argument("--dry-run", action="store_true", help="Print the setup plan without running commands.")
     parser.add_argument("--json", action="store_true", help="Print machine-readable setup output.")
@@ -109,21 +109,21 @@ def print_summary(result: dict) -> None:
         print("Next steps:")
         print("1. Run: codex mcp login linear")
         print("2. Run: codex mcp login e3-cosmos (Sesh search and Forum; skip if you already use Cosmos under another name)")
-        print("3. If Codex asks to review hooks, trust the Linear Progress Sync and Codex Session Logging hooks once.")
+        print("3. If Codex asks to review hooks, trust the Codex Session Logging hooks once.")
         print("4. Start a new Codex thread so hooks and skills reload.")
-        print("5. On first use, Codex will list Linear users/projects and ask what to save.")
+        print("5. Linear MCP is available after sign-in; setup and resident updates no longer install Linear Progress Sync.")
         print("")
         print("Notes:")
         print("- GitHub auth is checked by setup; run gh auth login if that step failed.")
         print("- Linear auth is manual; setup registers the MCP server but does not log you in.")
         print("- E3 Cosmos is registered by every resident update when missing; opt out with update_plugin.py --disable-cosmos-mcp.")
-        print("- Repos can opt out with linear_start.py configure-repo --disable-linear-sync.")
+        print("- Existing Linear Progress Sync installations remain until a separate removal update.")
         print("- Codex Session Logging is installed during setup and maintained by the resident updater.")
         print("- The resident updater checks at login and every 30 minutes through macOS LaunchAgents or Linux systemd user timers.")
         print("- On a headless Linux VM, enable loginctl lingering for this account if timers must continue after logout.")
-        print("- SessionStart remains a self-healing fallback; use update_plugin.py --disable-auto-update for a persistent opt-out.")
+        print("- The scheduled resident updater continues without the Linear Progress Sync plugin hook.")
         print("- LINEAR_SYNC_AUTO_UPDATE=0 is also persisted when setup or a self-healing hook observes it.")
-        print("- Before Linear kickoff, file edits, write-like Bash commands, and branch creation wait for active Linear state.")
+        print("- Linear MCP registration and existing Linear state are preserved.")
         print("- No per-repo setup is needed unless you want the optional outside-Codex Git commit hook.")
 
 

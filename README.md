@@ -6,7 +6,7 @@ Local Codex plugin for Linear-first development in `e3-solutions` repos. Codex s
 
 This repository is a Codex plugin marketplace, not a single plugin source. Do not install the GitHub URL or repository root directly with `codex plugin add`.
 
-Agents installing this for a teammate must clone the repo and run `setup.py`, because setup registers the marketplace, installs both required plugins, removes legacy duplicate global hooks, and registers Linear MCP.
+Agents installing this for a teammate must clone the repo and run `setup.py`, because setup registers the marketplace, installs Codex Session Logging, removes legacy duplicate global hooks, and registers Linear MCP.
 
 Current behavior:
 
@@ -29,9 +29,9 @@ codex mcp login linear
 codex mcp login e3-cosmos
 ```
 
-Then restart Codex or start a new Codex thread. If Codex asks to review hooks, trust the Linear Progress Sync and Codex Session Logging hooks once.
+Then restart Codex or start a new Codex thread. If Codex asks to review hooks, trust the Codex Session Logging hooks once.
 
-`setup.py` checks GitHub CLI auth, installs Linear Progress Sync and Codex Session Logging, removes legacy Core Edge hook copies from `~/.codex/hooks.json`, and registers Linear MCP and E3 Cosmos (`e3-cosmos`, unless a Cosmos server already exists under any name). It does not log you in to either, so `codex mcp login linear` and `codex mcp login e3-cosmos` are still required.
+`setup.py` checks GitHub CLI auth, installs Codex Session Logging, removes legacy Core Edge hook copies from `~/.codex/hooks.json`, and registers Linear MCP and E3 Cosmos (`e3-cosmos`, unless a Cosmos server already exists under any name). It does not log you in to either, so `codex mcp login linear` and `codex mcp login e3-cosmos` are still required. The Linear source stays in the private marketplace as the resident updater runtime, but setup and new resident updates do not install it as a Codex plugin. The marketplace policy remains compatible with older updaters; `retirement.json` is the retirement signal understood by this release.
 
 Linux requires a systemd-based distribution with a working user service manager. Setup writes the updater units under `$XDG_CONFIG_HOME/systemd/user` when that variable is set and `~/.config/systemd/user` otherwise, then enables the updater timer without requiring root. On a headless VM where updates must continue after logout, an administrator should enable lingering for the teammate account before setup:
 
@@ -73,6 +73,8 @@ Setup installs a resident updater under `~/.codex/coreedge`. It runs independent
 Existing installations download and activate `0.3.17` during one ordinary resident check. This release adds bounded Sesh retrieval cues at startup and after compaction, alongside the optional evidence-first Sesh search skill in Codex Session Logging `0.2.18` and preserves the existing Forum guidance with optional explained account feedback and manual librarian guidance, while continuing to require a reusable lesson in the full contribution, with applicability and limits, dated examples, and inspected prior work linked as supports, challenges, or supersedes. Agents query authoritative systems for current state, and useful learning is required before proposing a private candidate for approval. Guidance remains limited to startup, resume, clear/reset and post-compaction context rebuilds; ordinary prompt, tool, and completion hooks remain silent. The guidance hook never contacts Forum or submits automatically, skips non-E3 repositories, requires canonical GitHub HTTPS/SSH origins for new guidance, and honors `E3_COLLECTIVE_HOOK_ENABLED=0`. The release preserves the `0.3.10` repository synchronization guard, historical-backfill protections, Linux systemd support, commit-only Linear progress comments, complete hook-triggered parent and subagent rollout capture, and the monotonic usage RPC migration. Installations from older releases self-heal without rerunning setup; fresh setup installs and schedules the current plugins immediately.
 
 Resident release `0.3.25` distributes Codex Session Logging `0.2.26`. The logger adds content-free Sesh yield linkage: ordered SHA-256 digests for bounded delivered source handles and strict `verified`, `failed`, or `unknown` source-open witnesses. It never retains the query, passage, source body, raw handle, or arbitrary tool input/output in queryable event metadata. Deploy the compatible ingest sanitizer before distributing the logger, then verify one excluded real-hook preflight before enrolling any yield cohort.
+
+Resident release `0.3.36` prepares Linear Progress Sync retirement. Its source stays in the private marketplace as the resident updater runtime, while this version stops restoring its Codex plugin cache. Codex Session Logging keeps updating. An older updater may install Linear once while crossing to this release; the new runtime will not restore it after a separate Jolly Roger removal. Existing Linear registrations, queues, Linear MCP, and per-repo Git hooks stay in place until their respective migrations.
 
 Resident release `0.3.35` distributes Codex Session Logging `0.2.35` (COR-4688). The Sesh "prior-work context" cue is no longer shown after compaction, for every thread including bots; it is still shown at startup. In COR-4681 the post-compaction cue drove 29% of Codex Sesh searches (516 of 1,756, Sep 24 to Oct 9, 2026) but only 13% were opened and about 2.7% helped, while startup searches helped about 11.7%. `E3_SESH_CUE_AFTER_COMPACTION=1` (also `true` or `on`) brings back the exact previous cue at compaction. The startup cue is shorter and now asks for one search using the user's actual task, then opening the top result with the exact returned source arguments before the first edit. The COR-4681 cue experiment (`E3_SESH_CUE_EXPERIMENT`) is unchanged and still off; while on, compaction events still log the session's arm. No ingest or schema change.
 
@@ -139,11 +141,8 @@ After the one-time setup, releases are staged and activated by the resident serv
 
 ## Optional
 
-Only install the repo Git hook if you also want commits made outside Codex to sync to Linear:
-
-```bash
-python3 plugins/linear-progress-sync/scripts/setup.py --with-git-hook --root /path/to/repo
-```
+New Linear Progress Sync Git hooks are no longer installed. Existing per-repo
+hooks are left in place for a separately reviewed cleanup.
 
 Inspect local sync state in a project:
 

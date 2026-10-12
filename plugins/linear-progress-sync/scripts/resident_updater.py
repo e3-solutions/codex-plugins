@@ -113,7 +113,13 @@ def marketplace_plugins(repo_root: str | Path) -> list[JsonDict]:
         if not isinstance(entry, dict):
             continue
         policy = entry.get("policy")
-        if not isinstance(policy, dict) or policy.get("installation") != DEFAULT_INSTALL_POLICY:
+        installation = policy.get("installation") if isinstance(policy, dict) else None
+        # Keep the old marketplace policy for compatibility with earlier
+        # resident updaters that must be able to stage this release. The new
+        # retirement marker tells this runtime not to restore the Codex plugin.
+        if installation != DEFAULT_INSTALL_POLICY and not (
+            entry.get("name") == "linear-progress-sync" and installation == "AVAILABLE"
+        ):
             continue
         source = entry.get("source")
         if not isinstance(source, dict) or source.get("source") != "local":
@@ -129,16 +135,21 @@ def marketplace_plugins(repo_root: str | Path) -> list[JsonDict]:
         if name in seen:
             raise ValueError(f"duplicate default marketplace plugin: {name}")
         seen.add(name)
+        retired = (name == "linear-progress-sync" and
+                   (plugin_root / "retirement.json").is_file() and
+                   json.loads((plugin_root / "retirement.json").read_text(encoding="utf-8")) ==
+                   {"schema": 1, "codex_plugin": "retired", "resident_runtime": "retain"})
         plugins.append(
             {
                 "name": name,
                 "version": str(metadata["version"]),
                 "source": plugin_root,
                 "relative_source": str(Path(source_value)),
+                "installed_by_default": installation == DEFAULT_INSTALL_POLICY and not retired,
             }
         )
     if "linear-progress-sync" not in seen:
-        raise ValueError("linear-progress-sync must be installed by default")
+        raise ValueError("linear-progress-sync runtime source is required")
     linear_root = next(Path(item["source"]) for item in plugins if item["name"] == "linear-progress-sync")
     for script_name in RUNTIME_SCRIPTS:
         script = linear_root / "scripts" / script_name
@@ -1352,6 +1363,8 @@ def ensure_resident_updater(
         try:
             cache_root = codex / "plugins" / "cache" / MARKETPLACE_NAME
             for plugin in managed_plugins:
+                if not plugin["installed_by_default"]:
+                    continue
                 target = cache_root / str(plugin["name"]) / str(plugin["version"])
                 installed, replacement = install_plugin_cache(Path(plugin["source"]), target)
                 if replacement is not None:
@@ -1670,6 +1683,8 @@ def activate_release(
             previous_release = Path(release["previous"])
         plugins = marketplace_plugins(staged_root)
         for plugin in plugins:
+            if not plugin["installed_by_default"]:
+                continue
             target = cache / str(plugin["name"]) / str(plugin["version"])
             installed, replacement = install_plugin_cache(Path(plugin["source"]), target)
             if replacement is not None:
@@ -1687,7 +1702,7 @@ def activate_release(
         if config_changed:
             config_written = config_path.read_bytes()
         moved = activate_plugin_caches(
-            plugins,
+            [plugin for plugin in plugins if plugin["installed_by_default"]],
             cache_root=cache,
             rollback_root=resident / "rollback" / "cache",
         )
@@ -1852,6 +1867,8 @@ def doctor(
     cache_versions: dict[str, list[str]] = {}
     cache_root = codex / "plugins" / "cache" / MARKETPLACE_NAME
     for plugin in plugins:
+        if not plugin["installed_by_default"]:
+            continue
         parent = cache_root / str(plugin["name"])
         visible = sorted(
             path.name

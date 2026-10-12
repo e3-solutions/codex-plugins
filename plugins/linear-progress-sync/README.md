@@ -6,7 +6,7 @@ Local Codex plugin for Linear-first development in `e3-solutions` repos. Codex s
 
 This repository is a Codex plugin marketplace, not a single plugin source. Do not install the GitHub URL or repository root directly with `codex plugin add`.
 
-Agents installing this for a teammate must clone the repo and run `setup.py`, because setup registers the marketplace, installs both required plugins, removes legacy duplicate global hooks, and registers Linear MCP.
+Agents installing this marketplace for a teammate must clone the repo and run `setup.py`, because setup registers the marketplace, installs Codex Session Logging, removes legacy duplicate global hooks, and registers Linear MCP. Linear Progress Sync remains in the private marketplace as the resident updater runtime, but setup and new resident updates no longer install it as a Codex plugin.
 
 Current behavior:
 
@@ -29,9 +29,9 @@ codex mcp login linear
 codex mcp login e3-cosmos
 ```
 
-Then restart Codex or start a new Codex thread. If Codex asks to review hooks, trust the Linear Progress Sync and Codex Session Logging hooks once.
+Then restart Codex or start a new Codex thread. If Codex asks to review hooks, trust the Codex Session Logging hooks once.
 
-`setup.py` checks GitHub CLI auth, installs Linear Progress Sync and Codex Session Logging, removes legacy Core Edge hook copies from `~/.codex/hooks.json`, and registers Linear MCP and E3 Cosmos (`e3-cosmos`, unless a Cosmos server already exists under any name). It does not log you in to either, so `codex mcp login linear` and `codex mcp login e3-cosmos` are still required.
+`setup.py` checks GitHub CLI auth, installs Codex Session Logging, removes legacy Core Edge hook copies from `~/.codex/hooks.json`, and registers Linear MCP and E3 Cosmos (`e3-cosmos`, unless a Cosmos server already exists under any name). It does not log you in to either, so `codex mcp login linear` and `codex mcp login e3-cosmos` are still required.
 
 Linux requires a systemd-based distribution with a working user service manager. Setup writes the updater units under `$XDG_CONFIG_HOME/systemd/user` when that variable is set and `~/.config/systemd/user` otherwise, then enables the updater timer without requiring root. On a headless VM where updates must continue after logout, an administrator should enable lingering for the teammate account before setup:
 
@@ -139,11 +139,8 @@ After the one-time setup, releases are staged and activated by the resident serv
 
 ## Optional
 
-Only install the repo Git hook if you also want commits made outside Codex to sync to Linear:
-
-```bash
-python3 plugins/linear-progress-sync/scripts/setup.py --with-git-hook --root /path/to/repo
-```
+New Linear Progress Sync Git hooks are no longer installed. Existing per-repo
+hooks are left in place for a separately reviewed cleanup.
 
 Inspect local sync state in a project:
 

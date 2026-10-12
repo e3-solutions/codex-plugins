@@ -1984,7 +1984,7 @@ def test_setup_plan_is_global_by_default_and_does_not_install_repo_hook(tmp_path
 
     assert "gh auth status" in commands
     assert "codex plugin marketplace add" in commands
-    assert "codex plugin add linear-progress-sync@coreedge-local" in commands
+    assert "codex plugin add linear-progress-sync@coreedge-local" not in commands
     assert "codex plugin add codex-session-logging@coreedge-local" in commands
     assert "install_codex_hooks.py" in commands
     assert "codex mcp add linear --url https://mcp.linear.app/mcp" in commands
@@ -1992,29 +1992,19 @@ def test_setup_plan_is_global_by_default_and_does_not_install_repo_hook(tmp_path
     assert "codex mcp login linear after setup" in notes
     assert "review hooks" in notes
     assert "Codex Session Logging hooks" in notes
-    assert "First use lists Linear users" in notes
-    assert "First use in a repo lists Linear teams/projects" in notes
-    assert "--disable-linear-sync" in notes
-    assert "SessionStart" in notes
+    assert "setup and resident updates no longer install Linear Progress Sync" in notes
+    assert "Existing Linear Progress Sync installations remain" in notes
     assert "Linux systemd user timers" in notes
     assert "loginctl lingering" in notes
     assert "LINEAR_SYNC_AUTO_UPDATE=0" in notes
-    assert "write-like Bash commands" in notes
-    assert "branch creation wait for active Linear state" in notes
+    assert "Linear MCP registration and existing Linear state are preserved" in notes
     assert "install_git_hook.py" not in commands
     assert plan["per_repo_setup_required"] is False
 
 
-def test_setup_plan_can_include_optional_repo_git_hook(tmp_path):
-    plan = linear_sync.setup_plan(
-        plugin_repo_root=ROOT,
-        target_repo_root=tmp_path,
-        with_git_hook=True,
-    )
-    commands = "\n".join(plan["commands"])
-
-    assert "install_git_hook.py" in commands
-    assert str(tmp_path) in commands
+def test_setup_plan_rejects_retired_repo_git_hook(tmp_path):
+    with pytest.raises(ValueError, match="Git hook installation is retired"):
+        linear_sync.setup_plan(plugin_repo_root=ROOT, target_repo_root=tmp_path, with_git_hook=True)
 
 
 def test_setup_script_exists_and_exposes_dry_run():
@@ -2028,7 +2018,7 @@ def test_setup_script_exists_and_exposes_dry_run():
     assert "codex mcp login linear" in text
     assert "Linux systemd user timers" in text
     assert "loginctl lingering" in text
-    assert "Before Linear kickoff, file edits, write-like Bash commands, and branch creation wait" in text
+    assert "setup and resident updates no longer install Linear Progress Sync" in text
     assert "No per-repo setup is needed" in text
 
 
@@ -2044,11 +2034,10 @@ def test_setup_summary_prints_team_next_steps(capsys):
     output = capsys.readouterr().out
 
     assert "Run: codex mcp login linear" in output
-    assert "trust the Linear Progress Sync and Codex Session Logging hooks once" in output
-    assert "list Linear users/projects" in output
-    assert "--disable-linear-sync" in output
+    assert "trust the Codex Session Logging hooks once" in output
+    assert "setup and resident updates no longer install Linear Progress Sync" in output
     assert "LINEAR_SYNC_AUTO_UPDATE=0" in output
-    assert "Before Linear kickoff, file edits, write-like Bash commands, and branch creation wait" in output
+    assert "Linear MCP registration and existing Linear state are preserved" in output
     assert "No per-repo setup is needed" in output
 
 
@@ -2112,7 +2101,7 @@ def test_current_marketplace_upgrades_previous_release_and_activates_prompt(tmp_
     manifest.write_text(
         json.dumps(
             {
-                "version": "0.3.35",
+                "version": "0.3.36",
                 "archive_url": archive.as_uri(),
                 "sha256": digest,
                 "plugin_subdir": "plugins/linear-progress-sync",
@@ -2129,7 +2118,7 @@ def test_current_marketplace_upgrades_previous_release_and_activates_prompt(tmp_
         force=True,
         install_hooks=False,
     )
-    new_linear = cache_parent / "0.3.35"
+    new_linear = codex_home / "coreedge/marketplace/current/plugins/linear-progress-sync"
     second = update_plugin.run_update(
         current_plugin_root=new_linear,
         cache_parent=cache_parent,
@@ -2157,7 +2146,7 @@ def test_current_marketplace_upgrades_previous_release_and_activates_prompt(tmp_
     assert first["updated"] is True
     assert second["updated"] is False
     assert second["skipped"] == "current"
-    assert sorted(path.name for path in cache_parent.iterdir() if not path.name.startswith(".")) == ["0.3.35"]
+    assert sorted(path.name for path in cache_parent.iterdir() if not path.name.startswith(".")) == ["0.3.13"]
     codex_versions = cache_root / "codex-session-logging"
     assert sorted(path.name for path in codex_versions.iterdir() if not path.name.startswith(".")) == ["0.2.35"]
     assert installed_prompt.read_bytes() == (
@@ -2326,7 +2315,7 @@ def test_legacy_upgrade_keeps_presence_scheduler_decommissioned(tmp_path, monkey
     manifest.write_text(
         json.dumps(
             {
-                "version": "0.3.35",
+                "version": "0.3.36",
                 "archive_url": archive.as_uri(),
                 "sha256": hashlib.sha256(archive.read_bytes()).hexdigest(),
                 "plugin_subdir": "plugins/linear-progress-sync",
@@ -2382,8 +2371,8 @@ def test_legacy_upgrade_keeps_presence_scheduler_decommissioned(tmp_path, monkey
     resident_root = codex_home / "coreedge"
 
     assert first_cycle.returncode == 0, first_cycle.stderr
-    assert json.loads(first_cycle.stdout)["resident"]["version"] == "0.3.35"
-    assert (resident_root / "runtime" / "current").resolve().name == "0.3.35"
+    assert json.loads(first_cycle.stdout)["resident"]["version"] == "0.3.36"
+    assert (resident_root / "runtime" / "current").resolve().name == "0.3.36"
     assert not (home / "Library" / "LaunchAgents" / "com.coreedge.codex-session-presence.plist").exists()
 
     second_cycle = subprocess.run(
@@ -3205,6 +3194,8 @@ def test_real_marketplace_activates_in_isolated_codex_home_and_passes_doctor(tmp
     codex_home = tmp_path / "isolated codex home"
     cache_root = codex_home / "plugins" / "cache" / "coreedge-local"
     for plugin in resident.marketplace_plugins(ROOT):
+        if not plugin["installed_by_default"]:
+            continue
         destination = cache_root / str(plugin["name"]) / str(plugin["version"])
         destination.parent.mkdir(parents=True, exist_ok=True)
         shutil.copytree(Path(plugin["source"]), destination)
@@ -3223,17 +3214,15 @@ def test_real_marketplace_activates_in_isolated_codex_home_and_passes_doctor(tmp
         platform="unsupported",
     )
 
-    assert activation["version"] == "0.3.35"
+    assert activation["version"] == "0.3.36"
     assert health["healthy"] is True
     assert health["issues"] == []
-    assert health["cache_versions"] == {
-        "codex-session-logging": ["0.2.35"],
-        "linear-progress-sync": ["0.3.35"],
-    }
+    assert health["cache_versions"] == {"codex-session-logging": ["0.2.35"]}
+    assert not (cache_root / "linear-progress-sync").exists()
     assert subprocess.run(["sh", "-n", str(resident_root / "run.sh")], check=False).returncode == 0
 
 
-def test_resident_hook_repairs_matching_cache_and_runtime_corruption_from_managed_release(tmp_path):
+def test_resident_repair_keeps_linear_runtime_without_restoring_retired_plugin_cache(tmp_path):
     resident = load_resident_updater()
     codex_home = tmp_path / "codex"
     resident_root = tmp_path / "resident"
@@ -3245,14 +3234,14 @@ def test_resident_hook_repairs_matching_cache_and_runtime_corruption_from_manage
         platform="unsupported",
     )
     managed = resident_root / "marketplace/current/plugins/linear-progress-sync"
-    cache = codex_home / "plugins/cache/coreedge-local/linear-progress-sync/0.3.35"
+    cache = codex_home / "plugins/cache/coreedge-local/linear-progress-sync/0.3.36"
     runtime = resident_root / "runtime/current"
+    assert not cache.exists()
     corrupt_content = (managed / "scripts/linear_sync.py").read_bytes()
-    (cache / "scripts/update_plugin.py").write_bytes(corrupt_content)
     (runtime / "update_plugin.py").write_bytes(corrupt_content)
 
     result = resident.ensure_resident_updater(
-        cache,
+        managed,
         codex_home=codex_home,
         resident_root=resident_root,
         platform="unsupported",
@@ -3264,9 +3253,9 @@ def test_resident_hook_repairs_matching_cache_and_runtime_corruption_from_manage
     )
 
     assert result["changed"] is True
-    assert [item["name"] for item in result["repaired_caches"]] == ["linear-progress-sync"]
+    assert result["repaired_caches"] == []
     assert (runtime / "update_plugin.py").read_bytes() == (managed / "scripts/update_plugin.py").read_bytes()
-    assert (cache / "scripts/update_plugin.py").read_bytes() == (managed / "scripts/update_plugin.py").read_bytes()
+    assert not cache.exists()
     assert health["healthy"] is True
 
 
@@ -4512,6 +4501,8 @@ def test_resident_doctor_reports_content_corruption_and_unloaded_service(tmp_pat
     resident_root = tmp_path / "resident"
     cache_root = codex_home / "plugins" / "cache" / "coreedge-local"
     for plugin in resident.marketplace_plugins(ROOT):
+        if not plugin["installed_by_default"]:
+            continue
         destination = cache_root / str(plugin["name"]) / str(plugin["version"])
         destination.parent.mkdir(parents=True, exist_ok=True)
         shutil.copytree(Path(plugin["source"]), destination)
@@ -4533,10 +4524,10 @@ def test_resident_doctor_reports_content_corruption_and_unloaded_service(tmp_pat
     )
     broken_cache_script = (
         cache_root
-        / "linear-progress-sync"
-        / "0.3.35"
+        / "codex-session-logging"
+        / "0.2.35"
         / "scripts"
-        / "update_plugin.py"
+        / "session_logging.py"
     )
     broken_cache_script.write_text("VERSION = 'corrupt but valid'\n", encoding="utf-8")
 
@@ -4554,7 +4545,7 @@ def test_resident_doctor_reports_content_corruption_and_unloaded_service(tmp_pat
     )
 
     assert result["healthy"] is False
-    assert "linear-progress-sync cache content is incomplete or corrupt" in result["issues"]
+    assert "codex-session-logging cache content is incomplete or corrupt" in result["issues"]
     assert "resident updater LaunchAgent is installed but not loaded" in result["issues"]
 
 
@@ -4779,7 +4770,7 @@ def test_readmes_register_linear_mcp_before_linear_login():
             "codex mcp login linear"
         )
         assert "Run this once per teammate, not once per repo" in text
-        assert "trust the Linear Progress Sync and Codex Session Logging hooks once" in text
+        assert "trust the Codex Session Logging hooks once" in text
         assert "saves it in `~/.codex/linear-sync/repos.json`" in text
         assert "update_plugin.py --force" in text
         assert "update_plugin.py --doctor" in text

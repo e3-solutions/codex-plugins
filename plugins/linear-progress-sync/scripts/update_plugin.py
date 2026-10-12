@@ -321,6 +321,14 @@ def read_default_marketplace_plugins(marketplace_path: Path) -> list[Path]:
         plugin_dir = safe_relative_path(repo_root, source_path)
         if not has_plugin_manifest(plugin_dir):
             raise ValueError(f"default marketplace plugin missing manifest: {plugin_dir}")
+        retirement = plugin_dir / "retirement.json"
+        if retirement.is_file():
+            if entry.get("name") != PLUGIN_NAME:
+                raise ValueError(f"unsupported native plugin retirement marker: {retirement}")
+            marker = json.loads(retirement.read_text(encoding="utf-8"))
+            if marker != {"schema": 1, "codex_plugin": "retired", "resident_runtime": "retain"}:
+                raise ValueError(f"invalid native plugin retirement marker: {retirement}")
+            continue
         expected_name = entry.get("name")
         if isinstance(expected_name, str) and expected_name.strip() and plugin_name(plugin_dir) != expected_name.strip():
             raise ValueError(f"default marketplace plugin name mismatch: {plugin_dir}")
@@ -664,6 +672,8 @@ def run_update(
                     )
                 installed_plugins.extend(resident_result.get("installed_plugins", []))
                 for item in resident_result.get("plugins", []):
+                    if not item.get("installed_by_default", True):
+                        continue
                     plugin_path = cache_root / str(item["name"]) / str(item["version"])
                     if item["name"] == PLUGIN_NAME:
                         bootstrap_path = plugin_path
