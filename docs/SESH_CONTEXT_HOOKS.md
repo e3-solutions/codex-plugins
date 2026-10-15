@@ -41,3 +41,13 @@ E3_SESH_CUE_AFTER_COMPACTION=1 (true/on) restores the previous cue text at
 compaction. The startup cue now asks for one search using the user's actual task
 and opening the top result with the exact returned source arguments before the
 first edit. Rollback: set the variable, or publish a release reverting COR-4688.
+
+## Update: exclude the caller's own session (COR-4786, Codex Session Logging 0.2.36, Claude Session Logging 0.2.19)
+
+The PreToolUse hook adds exclude_session_id (the hook payload session_id) to Sesh
+search_coding_sessions and ask_sesh calls, unless the input already has a non-null
+exclude_session_id or include_own_session, the id is missing/over 256 characters/has
+control characters, or tool_input is not an object. It emits permissionDecision "allow"
+with updatedInput, which auto-approves that read-only Sesh call. Disable with
+E3_SESH_EXCLUDE_SELF=0 (false/no/off). Rollback: set the variable, or publish a release
+reverting COR-4786. The Sesh server must honor exclude_session_id; no SQL change.

@@ -52,6 +52,22 @@ For eligible E3 sessions, `SessionStart` adds a compact reminder about the E3 Co
 
 Since `0.2.18`, in canonical E3 repositories (`origin` is an `e3-solutions` GitHub HTTPS/SSH remote) `UserPromptSubmit` adds a short Forum decision cue as `hookSpecificOutput.additionalContext`, the same text Codex Session Logging uses (`scripts/forum_cue.py`, kept in parity by tests). It fires on a session's first prompt and on a new task of 25+ words at most once an hour. It asks for one `forum__search_research_posts` with 2-4 words naming the system, tool or component plus the failure or decision before committing to an approach, then one explained `give_collective_feedback` (up/down/abstain) per fully read post using the `post_id`, `body_sha256` and `search_id` from the search result, and to name the Forum posts used in the final answer. The hook never contacts Forum. It logs only the session id, time, reason and prompt word count under `~/.claude/session-logging/forum-cue` (or `$CLAUDE_SESSION_LOG_STATE_DIR/forum-cue`), never prompt text. Prompt capture runs as before, and a cue failure never blocks it. Disable the cue with `FORUM_CUE_ENABLED=0`.
 
+## Sesh: exclude the caller's own session (COR-4786)
+
+Since 0.2.19 the `PreToolUse` hook rewrites Sesh `search_coding_sessions` and `ask_sesh` calls (any
+`mcp__<ns>__sesh__...`, `mcp__<ns>__...` or bare tool name) to add `exclude_session_id` set to the hook
+payload's `session_id`, so Sesh never returns the agent's own live session. It prints
+`{"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "allow", "updatedInput": {...original input..., "exclude_session_id": "<session id>"}}}`.
+
+- The input is left untouched if it already has a non-null `exclude_session_id` or `include_own_session`
+  (the Sesh server's opt-out), if `session_id` is missing, longer than 256 characters or has control
+  characters, or if `tool_input` is not an object. Any failure prints nothing; the tool call is never blocked.
+- **Trade-off:** `updatedInput` is only honored together with `permissionDecision: "allow"`, so this auto-approves
+  the Sesh call in permission prompts. Sesh search is read-only and scoped by the server's per-caller access.
+  Claude Code supports `updatedInput` on `PreToolUse`.
+- Opt out with `E3_SESH_EXCLUDE_SELF=0` (also `false`, `no`, `off`). Event logging is unchanged and still
+  never records tool input.
+
 For local development from a checkout:
 
 ```bash

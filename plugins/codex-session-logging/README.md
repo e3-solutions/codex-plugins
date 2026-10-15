@@ -33,6 +33,22 @@ envelopes omit the optional metadata without changing tool behavior.
 Deploy the compatible sanitizer before distributing this logging release. Rollback of
 either side safely omits the optional field; no schema migration is required.
 
+## Sesh: exclude the caller's own session (COR-4786)
+
+Since 0.2.36 the `PreToolUse` hook rewrites Sesh `search_coding_sessions` and `ask_sesh` calls (any
+`mcp__<ns>__sesh__...`, `mcp__<ns>__...` or bare tool name) to add `exclude_session_id` set to the hook
+payload's `session_id`, so Sesh never returns the agent's own live session. It prints
+`{"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "allow", "updatedInput": {...original input..., "exclude_session_id": "<session id>"}}}`.
+
+- The input is left untouched if it already has a non-null `exclude_session_id` or `include_own_session`
+  (the Sesh server's opt-out), if `session_id` is missing, longer than 256 characters or has control
+  characters, or if `tool_input` is not an object. Any failure prints nothing; the tool call is never blocked.
+- **Trade-off:** `updatedInput` is only honored together with `permissionDecision: "allow"`, so this auto-approves
+  the Sesh call in permission prompts. Sesh search is read-only and scoped by the server's per-caller access.
+  Older Codex versions that reject `updatedInput` treat the hook as failed and run the call unchanged.
+- Opt out with `E3_SESH_EXCLUDE_SELF=0` (also `false`, `no`, `off`). Event logging is unchanged and still
+  never records tool input.
+
 ## Sesh cue: startup only (COR-4688)
 
 The `SessionStart` hook prints the "Sesh prior-work context" cue at `startup` in
