@@ -13,14 +13,24 @@ def main() -> None:
     except Exception as exc:  # noqa: BLE001 - logging must not interrupt Codex.
         print(f"codex-session-logging capture failed: {exc}", file=sys.stderr)
         return
+    cue = None
     try:
         from forum_cue import forum_cue
 
         cue = forum_cue(payload)
+    except Exception:
+        pass  # Forum guidance must not interrupt logging or the user's prompt.
+    try:
+        from sesh_need import with_past_work_cue
+
+        cue = with_past_work_cue(cue, payload)  # COR-4811, only while E3_SESH_PAST_WORK_CUE is on.
+    except Exception:
+        pass  # Sesh guidance must not interrupt logging or the user's prompt.
+    try:
         if cue:
             print(cue, flush=True)
     except Exception:
-        pass  # Forum guidance must not interrupt logging or the user's prompt.
+        pass
     try:
         capture_hook_event(payload, event_name="UserPromptSubmit")
         sync_after_hook(payload, event_name="UserPromptSubmit")

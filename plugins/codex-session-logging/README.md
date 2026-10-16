@@ -103,6 +103,34 @@ hook output and logged events are then exactly the same as before.**
 - With the COR-4681 experiment also on, a session sees the cue only when both arms
   allow it, and the COR-4681 log shows only its own arm. Run one at a time.
 
+## Sesh fires on need (COR-4811, both off by default)
+
+An Oct 16, 2026 study labelled the moment before 107 Codex Sesh searches. Searches right
+after a person asked about earlier work helped about 55% of the time; a second search in
+the same turn helped 0 of 51 times. Two switches act on that. With neither set, hook output and logged
+events are exactly those of 0.2.36.
+
+- `E3_SESH_ONE_PER_TURN=1` (also `true` or `on`), PreToolUse: the first Sesh
+  coding-session search in a turn goes ahead; the next one in the same turn (same
+  session and `turn_id`) is denied with a short note to use the results it has or open
+  one. The next turn resets it. `open_session_passages`, `find_similar_sessions`,
+  `ask_sesh` and every other tool are never blocked. Automated threads (bots keep Sesh),
+  `E3_SESH_EXPERIMENT_OPTOUT=1`, unreadable threads and calls without a turn id are
+  never limited, and any error allows the call. State is one empty marker file per
+  session under `$CODEX_HOME/sesh-turn-guard` (hashed session and turn ids, no text). A
+  denied call's existing `tool_call_started` event carries `sesh_turn_guard: denied`.
+- `E3_SESH_PAST_WORK_CUE=1` (also `true` or `on`), UserPromptSubmit: when a person's own
+  message (thread source `user`, under 2,500 characters) in an e3-solutions repository
+  asks about earlier work, the hook adds one line asking for one Sesh search before
+  answering. The pattern is the study's tight one (phrases like "we used to", "which
+  change", "what testing did we", "before we switched", "a teammate's sessions"), with
+  receipts, relays and pasted instructions excluded. It was about 73% precise on the
+  prompts it was built from, against 26% for a plain past-work regex; expect less on new
+  prompts. Bots, `E3_SESH_EXPERIMENT_OPTOUT=1`, `E3_SESH_CONTEXT_ENABLED=0` and
+  `E3_SESH_START_SEARCH_ENABLED=0` get no cue. It shares one hook output with the Forum
+  cue. Nothing new is logged or stored.
+- Both work alongside the COR-4808 A/B in either arm: they are need-based, not routine.
+
 ## Collective prompt contract
 
 The full contribution must lead with a reusable lesson, method, failure mechanism, or qualified hypothesis—not merely a general title above an operational report. Customer, repository, flag, and incident details belong in a dated `Evidence/example` section with authorized provenance. The lesson should remain useful without that example; query authoritative systems for current state. Search and read relevant prior Forum work before asserting a correction, and link it as supporting, challenging, or superseding evidence. Submissions stay private pending approval; no useful learning is a valid outcome. After fully reading a post, record one explained `up`, `down`, or neutral `abstain` assessment before task completion when feedback is enabled and authorized. Use the exact post id and body hash, preserve the mutation UUID and identical payload for uncertain retries, and report definitive failures as unsaved. Optional specific concerns and USE/SKIP prose do not replace that saved assessment.
