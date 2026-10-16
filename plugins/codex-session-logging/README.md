@@ -74,6 +74,35 @@ sanitizer keeps the three keys only when all are valid and both copies agree. **
 the updated `codex-session-ingest` function before turning the flag on**, or the
 arms are dropped and never reach `public.codex_session_events`.
 
+## Fewer routine Sesh searches A/B (COR-4808, off by default)
+
+An Oct 16, 2026 study of 58 searches where Sesh showed an answer that the agent ignored
+found 72% were redundant and 59% were routine (fired at task start, by habit, or because
+an instruction said to search). The only routine Sesh cue that E3 ships is the
+"Sesh prior-work context" cue above: the Sesh MCP tools, the Cosmos gateway and the
+search-coding-sessions skill do not ask for a search up front. This A/B turns that cue
+off for half of sessions. **It ships off; with the flag unset, the hook output and the
+logged events are exactly the same as before.**
+
+- `E3_SESH_ROUTINE_AB=1` (also `true` or `on`; anything else is off) turns it on.
+- Arms: `routine` (today's cues) or `need_only` (no routine Sesh cue: no startup cue,
+  and no compaction cue even with `E3_SESH_CUE_AFTER_COMPACTION=1`). The arm depends
+  only on the session id: the low bit of the first byte of
+  `sha256("sesh_routine_v1:" + lowercased session id)`, `0` = `routine`,
+  `1` = `need_only`. It has no time or week salt, so it never changes for a session.
+  In Postgres:
+  `get_byte(sha256(convert_to('sesh_routine_v1:' || lower(btrim(session_id)), 'UTF8')), 0) % 2`.
+- In `need_only`, Sesh is untouched: the Cosmos tools, the need-based
+  search-coding-sessions skill and all search logging (including `sesh_request_id`)
+  stay, so the agent still searches when it lacks something.
+- These keep today's cue in both arms, as in COR-4681: automated threads (bots keep
+  Sesh), `E3_SESH_EXPERIMENT_OPTOUT=1`, and threads whose rollout header or session id
+  cannot be read. `E3_SESH_CONTEXT_ENABLED=0` still removes the cue for everyone.
+- Nothing new is logged. The readout recomputes the arm from the Codex session id
+  that already carries each Sesh search's `sesh_request_id`.
+- With the COR-4681 experiment also on, a session sees the cue only when both arms
+  allow it, and the COR-4681 log shows only its own arm. Run one at a time.
+
 ## Collective prompt contract
 
 The full contribution must lead with a reusable lesson, method, failure mechanism, or qualified hypothesis—not merely a general title above an operational report. Customer, repository, flag, and incident details belong in a dated `Evidence/example` section with authorized provenance. The lesson should remain useful without that example; query authoritative systems for current state. Search and read relevant prior Forum work before asserting a correction, and link it as supporting, challenging, or superseding evidence. Submissions stay private pending approval; no useful learning is a valid outcome. After fully reading a post, record one explained `up`, `down`, or neutral `abstain` assessment before task completion when feedback is enabled and authorized. Use the exact post id and body hash, preserve the mutation UUID and identical payload for uncertain retries, and report definitive failures as unsaved. Optional specific concerns and USE/SKIP prose do not replace that saved assessment.

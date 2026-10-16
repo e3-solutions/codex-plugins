@@ -57,6 +57,18 @@ DISABLE_ENVS = ("E3_SESH_CONTEXT_ENABLED", "E3_SESH_START_SEARCH_ENABLED")
 # cue/no_cue are the randomized arms; the rest always keep today's behaviour.
 EXPERIMENT_ARMS = ("cue", "no_cue", "optout", "bot", "disabled", "unassigned")
 WEEK_SALT_PATTERN = re.compile(r"[0-9]{4}-W(?:0[1-9]|[1-4][0-9]|5[0-3])")
+
+# COR-4808: "fewer routine searches" A/B. Off unless E3_SESH_ROUTINE_AB is 1/true/on.
+# Arm need_only gets no routine Sesh cue (the startup cue, and the compaction cue when
+# it is turned back on); Sesh tools, the search-coding-sessions skill and all logging
+# stay, so the agent still searches when it lacks something. The arm is a function of
+# the session id alone, so analysis recomputes it from the caller session id:
+#   arm = ROUTINE_ARMS[sha256("sesh_routine_v1:" + lower(trim(id)))[0] & 1]
+#   SQL: get_byte(sha256(convert_to('sesh_routine_v1:' || lower(btrim(id)), 'UTF8')), 0) % 2
+#        (0 = routine, 1 = need_only)
+ROUTINE_AB_ID = "sesh_routine_v1"
+ROUTINE_AB_ENV = "E3_SESH_ROUTINE_AB"
+ROUTINE_ARMS = ("routine", "need_only")
 # Native Codex thread sources a person drives; anything else is an automated thread
 # (agent_created_thread, guardian_review, subagent, ...). Same split as publish_presence.
 HUMAN_THREAD_SOURCES = frozenset({"user"})
@@ -86,6 +98,18 @@ def experiment_enabled(env=None):
 def cue_after_compaction(env=None):
     env = os.environ if env is None else env
     return _truthy(env, AFTER_COMPACTION_ENV)
+
+
+def routine_ab_enabled(env=None):
+    env = os.environ if env is None else env
+    return _truthy(env, ROUTINE_AB_ENV)
+
+
+def routine_arm(session_id):
+    """COR-4808 arm from the session id alone: "routine" (today's cue) or "need_only" (none)."""
+    normalized = str(session_id).strip().lower()
+    digest = hashlib.sha256(f"{ROUTINE_AB_ID}:{normalized}".encode("utf-8")).digest()
+    return ROUTINE_ARMS[digest[0] & 1]
 
 
 def uuid7_datetime(session_id):
@@ -206,7 +230,27 @@ def sesh_cue_decision(payload, env=None, now=None):
     cue, metadata = _boundary_cue_decision(payload, env, now)
     if cue is not None and compact:
         cue = COMPACTION_CONTEXT if cue_after_compaction(env) else None
+    if cue is not None and routine_cue_withheld(payload, env):
+        cue = None  # COR-4808 need_only arm: no routine cue; Sesh itself is untouched.
     return cue, metadata
+
+
+def routine_cue_withheld(payload, env=None):
+    """True only while E3_SESH_ROUTINE_AB is on and this human session is in arm need_only.
+
+    Opt-outs, automated threads (bots keep Sesh) and unreadable threads or ids keep
+    today's cue, the same rules as COR-4681. Nothing is read when the flag is off.
+    """
+    env = os.environ if env is None else env
+    if not routine_ab_enabled(env) or opted_out(env) or not isinstance(payload, dict):
+        return False
+    session_id = _session_id(payload)
+    if session_id is None:
+        return False
+    header = transcript_header(payload)
+    if header is None or automated_thread(header):
+        return False
+    return routine_arm(session_id) == "need_only"
 
 
 def _boundary_cue_decision(payload, env, now):
