@@ -1,4 +1,5 @@
-"""COR-4811: fire Sesh on need. Two switches, both off unless set to 1/true/on.
+"""COR-4811: fire Sesh on need. Two switches, both on by default since Oct 16, 2026;
+setting either to 0/false/no/off turns that one off.
 
 E3_SESH_ONE_PER_TURN (PreToolUse): allow one Sesh coding-session search per turn and deny
 the next one in the same turn. In the Oct 16, 2026 study a second search in the same turn
@@ -18,7 +19,7 @@ import os
 import re
 from pathlib import Path
 
-from sesh_context import DISABLE_ENVS, _e3_repository, _falsy, _truthy, automated_thread, opted_out, transcript_header
+from sesh_context import DISABLE_ENVS, _e3_repository, _falsy, automated_thread, opted_out, transcript_header
 from session_logging import is_sesh_search_tool
 
 ONE_PER_TURN_ENV = "E3_SESH_ONE_PER_TURN"
@@ -53,6 +54,11 @@ _NOT_A_PERSON_ASKING = re.compile(
 )
 
 
+def switch_on(env, name) -> bool:
+    """On unless the variable is 0/false/no/off (Vansh turned both on for everyone, Oct 16, 2026)."""
+    return not _falsy(env.get(name))
+
+
 def state_dir() -> Path:
     return Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex") / "sesh-turn-guard"
 
@@ -77,7 +83,7 @@ def _human_thread(payload) -> bool:
 def one_per_turn_denial(payload, env=None, directory: Path | None = None) -> str | None:
     """PreToolUse JSON that denies a second Sesh search in this turn, else None (allow)."""
     env = os.environ if env is None else env
-    if not _truthy(env, ONE_PER_TURN_ENV):
+    if not switch_on(env, ONE_PER_TURN_ENV):
         return None
     try:
         return _denial(payload, env, directory or state_dir())
@@ -123,7 +129,7 @@ def asks_about_past_work(prompt) -> bool:
 def past_work_cue(payload, env=None) -> str | None:
     """The one-line cue for a person's past-work question in an E3 repository, else None."""
     env = os.environ if env is None else env
-    if not _truthy(env, PAST_WORK_CUE_ENV) or not isinstance(payload, dict):
+    if not switch_on(env, PAST_WORK_CUE_ENV) or not isinstance(payload, dict):
         return None
     if payload.get("hook_event_name", "UserPromptSubmit") != "UserPromptSubmit":
         return None

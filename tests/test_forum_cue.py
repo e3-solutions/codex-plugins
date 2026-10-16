@@ -96,6 +96,7 @@ def test_git_failure(tmp_path, monkeypatch, failure):
 
 @pytest.mark.parametrize("cue_fails", [False, True])
 def test_user_prompt_submit_emits_cue_and_preserves_capture(monkeypatch, capsys, cue_fails):
+    monkeypatch.setenv("E3_SESH_PAST_WORK_CUE", "0")  # COR-4811 cue is on by default; test the Forum cue alone
     calls = []
     monkeypatch.setitem(sys.modules, "rollout_sync", types.SimpleNamespace(
         sync_after_hook=lambda *a, **kw: calls.append("sync")))

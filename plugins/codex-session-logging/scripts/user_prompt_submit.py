@@ -23,7 +23,7 @@ def main() -> None:
     try:
         from sesh_need import with_past_work_cue
 
-        cue = with_past_work_cue(cue, payload)  # COR-4811, only while E3_SESH_PAST_WORK_CUE is on.
+        cue = with_past_work_cue(cue, payload)  # COR-4811, on unless E3_SESH_PAST_WORK_CUE=0/false/no/off.
     except Exception:
         pass  # Sesh guidance must not interrupt logging or the user's prompt.
     try:

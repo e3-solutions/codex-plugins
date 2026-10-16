@@ -10,7 +10,7 @@ def one_per_turn_denial(payload) -> str | None:
     try:
         from sesh_need import one_per_turn_denial as denial
 
-        return denial(payload)  # COR-4811, only while E3_SESH_ONE_PER_TURN is on.
+        return denial(payload)  # COR-4811, on unless E3_SESH_ONE_PER_TURN=0/false/no/off.
     except Exception:  # noqa: BLE001 - the guard fails open.
         return None
 

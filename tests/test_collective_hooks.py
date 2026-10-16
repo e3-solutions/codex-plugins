@@ -49,6 +49,9 @@ def base_env(tmp_path: Path, *, agent: str) -> dict[str, str]:
     env["E3_COLLECTIVE_FEEDBACK_HOOK_ENABLED"] = "0"  # Legacy rollback characterization.
     env["E3_COLLECTIVE_HOOK_ENABLED"] = "1"
     env["E3_SESH_CONTEXT_ENABLED"] = "0"  # Isolate exact legacy Forum output.
+    # COR-4811's switches are on by default since Oct 16, 2026; these tests cover the Forum hooks alone.
+    env["E3_SESH_ONE_PER_TURN"] = "0"
+    env["E3_SESH_PAST_WORK_CUE"] = "0"
     if agent == "codex":
         env.update(
             {
