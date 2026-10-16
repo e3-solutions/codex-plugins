@@ -74,7 +74,7 @@ sanitizer keeps the three keys only when all are valid and both copies agree. **
 the updated `codex-session-ingest` function before turning the flag on**, or the
 arms are dropped and never reach `public.codex_session_events`.
 
-## Fewer routine Sesh searches A/B (COR-4808, off by default)
+## Fewer routine Sesh searches A/B (COR-4808, on by default since Oct 16, 2026)
 
 An Oct 16, 2026 study of 58 searches where Sesh showed an answer that the agent ignored
 found 72% were redundant and 59% were routine (fired at task start, by habit, or because
