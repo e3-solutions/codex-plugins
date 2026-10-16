@@ -103,14 +103,15 @@ hook output and logged events are then exactly the same as before.**
 - With the COR-4681 experiment also on, a session sees the cue only when both arms
   allow it, and the COR-4681 log shows only its own arm. Run one at a time.
 
-## Sesh fires on need (COR-4811, both off by default)
+## Sesh fires on need (COR-4811, both on by default since Oct 16, 2026)
 
 An Oct 16, 2026 study labelled the moment before 107 Codex Sesh searches. Searches right
 after a person asked about earlier work helped about 55% of the time; a second search in
-the same turn helped 0 of 51 times. Two switches act on that. With neither set, hook output and logged
-events are exactly those of 0.2.36.
+the same turn helped 0 of 51 times. Two switches act on that. **Both ship on for everyone
+(0.2.38, Oct 16, 2026); setting a variable to `0`, `false`, `no` or `off` turns that one off.**
+With both off, hook output and logged events are exactly those of 0.2.36.
 
-- `E3_SESH_ONE_PER_TURN=1` (also `true` or `on`), PreToolUse: the first Sesh
+- `E3_SESH_ONE_PER_TURN` (on unless `0`, `false`, `no` or `off`), PreToolUse: the first Sesh
   coding-session search in a turn goes ahead; the next one in the same turn (same
   session and `turn_id`) is denied with a short note to use the results it has or open
   one. The next turn resets it. `open_session_passages`, `find_similar_sessions`,
@@ -119,7 +120,7 @@ events are exactly those of 0.2.36.
   never limited, and any error allows the call. State is one empty marker file per
   session under `$CODEX_HOME/sesh-turn-guard` (hashed session and turn ids, no text). A
   denied call's existing `tool_call_started` event carries `sesh_turn_guard: denied`.
-- `E3_SESH_PAST_WORK_CUE=1` (also `true` or `on`), UserPromptSubmit: when a person's own
+- `E3_SESH_PAST_WORK_CUE` (on unless `0`, `false`, `no` or `off`), UserPromptSubmit: when a person's own
   message (thread source `user`, under 2,500 characters) in an e3-solutions repository
   asks about earlier work, the hook adds one line asking for one Sesh search before
   answering. The pattern is the study's tight one (phrases like "we used to", "which

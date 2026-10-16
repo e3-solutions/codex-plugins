@@ -1,4 +1,5 @@
-"""COR-4811: Sesh fires on need. E3_SESH_ONE_PER_TURN and E3_SESH_PAST_WORK_CUE, both off by default."""
+"""COR-4811: Sesh fires on need. E3_SESH_ONE_PER_TURN and E3_SESH_PAST_WORK_CUE, both on by default
+since Oct 16, 2026; 0/false/no/off turns each one off."""
 from __future__ import annotations
 
 import json
@@ -24,7 +25,9 @@ BASE_COMMIT = "e0ba97d"  # origin/main before COR-4811
 SESH_SEARCH = "mcp__e3_cosmos__sesh__search_coding_sessions"
 GUARD_ON = {"E3_SESH_ONE_PER_TURN": "1"}
 CUE_ON = {"E3_SESH_PAST_WORK_CUE": "1"}
-OFF_VALUES = [None, "", "0", "false", "no", "off", "yes", "enabled"]
+# On unless set to 0/false/no/off (Vansh turned both on for everyone, Oct 16, 2026).
+OFF_VALUES = ["0", "false", "no", "off", " OFF ", "False"]
+ON_VALUES = [None, "", "1", "true", "on", "yes", "enabled"]
 
 # Paraphrased from the Oct 16, 2026 study's labels (outputs/sesh-when-to-fire/signal_check.json):
 # a person asking about earlier work that past sessions held.
@@ -98,10 +101,18 @@ def denied(output) -> bool:
 
 @pytest.mark.parametrize("flag", OFF_VALUES)
 def test_guard_off_allows_every_search_and_writes_nothing(tmp_path, human, flag):
-    env = {} if flag is None else {"E3_SESH_ONE_PER_TURN": flag}
+    env = {"E3_SESH_ONE_PER_TURN": flag}
     for _ in range(3):
         assert need.one_per_turn_denial(call(human), env=env, directory=tmp_path / "g") is None
     assert not (tmp_path / "g").exists()
+
+
+@pytest.mark.parametrize("flag", ON_VALUES)
+def test_guard_is_on_unless_turned_off(tmp_path, human, flag):
+    env = {} if flag is None else {"E3_SESH_ONE_PER_TURN": flag}
+    d = tmp_path / "g"
+    assert need.one_per_turn_denial(call(human), env=env, directory=d) is None
+    assert denied(need.one_per_turn_denial(call(human), env=env, directory=d))
 
 
 def test_guard_allows_first_search_denies_second_and_resets_next_turn(tmp_path, human):
@@ -222,12 +233,20 @@ def test_cue_is_one_line():
 
 @pytest.mark.parametrize("flag", OFF_VALUES)
 def test_cue_off_reads_nothing_and_returns_output_unchanged(e3_git, human, flag, monkeypatch):
-    env = {} if flag is None else {"E3_SESH_PAST_WORK_CUE": flag}
-    reads = Mock(side_effect=AssertionError("transcript read while off"))
+    env = {"E3_SESH_PAST_WORK_CUE": flag}
+    reads = Mock(return_value=None)
     monkeypatch.setattr(need, "transcript_header", reads)
     for output in (None, "", '{"hookSpecificOutput": {"hookEventName": "UserPromptSubmit", "additionalContext": "F"}}'):
         assert need.with_past_work_cue(output, prompt(human, POSITIVE[0]), env=env) is output
+    reads.assert_not_called()
     e3_git.assert_not_called()
+
+
+@pytest.mark.parametrize("flag", ON_VALUES)
+def test_cue_is_on_unless_turned_off(e3_git, human, flag):
+    env = {} if flag is None else {"E3_SESH_PAST_WORK_CUE": flag}
+    assert need.past_work_cue(prompt(human, POSITIVE[0]), env=env) == need.PAST_WORK_CUE
+    assert need.past_work_cue(prompt(human, NEGATIVE[0]), env=env) is None
 
 
 @pytest.mark.parametrize("meta", [{"thread_source": "agent_created_thread"}, {"source": "exec"},
@@ -306,13 +325,14 @@ def events(tmp_path: Path) -> list[dict]:
     return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
 
 
-def test_pre_tool_use_hook_denies_the_second_search_and_marks_it(tmp_path):
+@pytest.mark.parametrize("extra", [{}, GUARD_ON])  # unset = on since Oct 16, 2026
+def test_pre_tool_use_hook_denies_the_second_search_and_marks_it(tmp_path, extra):
     transcript = header(tmp_path / "r.jsonl", thread_source="user")
-    first = run_hook(tmp_path, "pre_tool_use.py", call(transcript), GUARD_ON)
-    second = run_hook(tmp_path, "pre_tool_use.py", call(transcript), GUARD_ON)
+    first = run_hook(tmp_path, "pre_tool_use.py", call(transcript), extra)
+    second = run_hook(tmp_path, "pre_tool_use.py", call(transcript), extra)
     opened = run_hook(tmp_path, "pre_tool_use.py",
-                      call(transcript, tool="mcp__e3_cosmos__sesh__open_session_passages"), GUARD_ON)
-    next_turn = run_hook(tmp_path, "pre_tool_use.py", call(transcript, turn="turn-2"), GUARD_ON)
+                      call(transcript, tool="mcp__e3_cosmos__sesh__open_session_passages"), extra)
+    next_turn = run_hook(tmp_path, "pre_tool_use.py", call(transcript, turn="turn-2"), extra)
     assert [r.returncode for r in (first, second, opened, next_turn)] == [0, 0, 0, 0]
     assert first.stdout == opened.stdout == next_turn.stdout == ""
     assert denied(second.stdout.strip())
@@ -320,18 +340,31 @@ def test_pre_tool_use_hook_denies_the_second_search_and_marks_it(tmp_path):
     assert [e["metadata"].get("sesh_turn_guard") for e in started] == [None, "denied", None, None]
 
 
-def test_user_prompt_submit_hook_adds_the_cue_only_when_on(tmp_path):
+@pytest.mark.parametrize("flag", ["0", "off"])
+def test_pre_tool_use_hook_turned_off_allows_every_search(tmp_path, flag):
+    transcript = header(tmp_path / "r.jsonl", thread_source="user")
+    results = [run_hook(tmp_path, "pre_tool_use.py", call(transcript), {"E3_SESH_ONE_PER_TURN": flag})
+               for _ in range(3)]
+    assert [(r.returncode, r.stdout) for r in results] == [(0, "")] * 3
+    started = [e for e in events(tmp_path) if e["hook_event_name"] == "PreToolUse"]
+    assert len(started) == 3 and all("sesh_turn_guard" not in e["metadata"] for e in started)
+    assert not (tmp_path / "codex-home/sesh-turn-guard").exists()
+
+
+def test_user_prompt_submit_hook_adds_the_cue_unless_turned_off(tmp_path):
     transcript = header(tmp_path / "r.jsonl", thread_source="user")
     body = prompt(transcript, POSITIVE[2])
     del body["cwd"]
-    off = run_hook(tmp_path / "off", "user_prompt_submit.py", body, {})
+    off = run_hook(tmp_path / "off", "user_prompt_submit.py", body, {"E3_SESH_PAST_WORK_CUE": "0"})
+    default = run_hook(tmp_path / "default", "user_prompt_submit.py", body, {})  # unset = on since Oct 16, 2026
     on = run_hook(tmp_path / "on", "user_prompt_submit.py", body, CUE_ON)
-    plain = run_hook(tmp_path / "plain", "user_prompt_submit.py", {**body, "prompt": NEGATIVE[2]}, CUE_ON)
-    assert off.returncode == on.returncode == plain.returncode == 0
+    plain = run_hook(tmp_path / "plain", "user_prompt_submit.py", {**body, "prompt": NEGATIVE[2]}, {})
+    assert off.returncode == default.returncode == on.returncode == plain.returncode == 0
     assert off.stdout == plain.stdout == ""
+    assert default.stdout == on.stdout
     assert json.loads(on.stdout)["hookSpecificOutput"]["additionalContext"] == need.PAST_WORK_CUE
     # Nothing new is logged: the prompt event carries the same metadata keys either way.
-    keys = [sorted(e["metadata"]) for path in ("off", "on") for e in events(tmp_path / path)
+    keys = [sorted(e["metadata"]) for path in ("off", "default", "on") for e in events(tmp_path / path)
             if e["hook_event_name"] == "UserPromptSubmit"]
     assert keys and all(k == keys[0] for k in keys)
 
@@ -372,12 +405,12 @@ def _comparable(items: list[dict]) -> list[dict]:
     return out
 
 
-@pytest.mark.parametrize("flag", [None, "0", "off"])
+@pytest.mark.parametrize("flag", ["0", "off", "false", "no"])
 def test_hooks_with_both_flags_off_match_the_previous_release(tmp_path, flag):
     base = _base_scripts(tmp_path)
     if base is None:
         pytest.skip(f"commit {BASE_COMMIT} is not available in this checkout")
-    extra = {} if flag is None else {"E3_SESH_ONE_PER_TURN": flag, "E3_SESH_PAST_WORK_CUE": flag}
+    extra = {"E3_SESH_ONE_PER_TURN": flag, "E3_SESH_PAST_WORK_CUE": flag}
     for name, scripts in (("new", SCRIPTS), ("old", base)):
         work = tmp_path / name
         work.mkdir()
