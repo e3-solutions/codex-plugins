@@ -81,10 +81,10 @@ found 72% were redundant and 59% were routine (fired at task start, by habit, or
 an instruction said to search). The only routine Sesh cue that E3 ships is the
 "Sesh prior-work context" cue above: the Sesh MCP tools, the Cosmos gateway and the
 search-coding-sessions skill do not ask for a search up front. This A/B turns that cue
-off for half of sessions. **It ships off; with the flag unset, the hook output and the
-logged events are exactly the same as before.**
+off for half of sessions. **It ships on (Oct 16, 2026); `E3_SESH_ROUTINE_AB=0` turns it off and the
+hook output and logged events are then exactly the same as before.**
 
-- `E3_SESH_ROUTINE_AB=1` (also `true` or `on`; anything else is off) turns it on.
+- On unless `E3_SESH_ROUTINE_AB` is `0`, `false`, `no` or `off`.
 - Arms: `routine` (today's cues) or `need_only` (no routine Sesh cue: no startup cue,
   and no compaction cue even with `E3_SESH_CUE_AFTER_COMPACTION=1`). The arm depends
   only on the session id: the low bit of the first byte of

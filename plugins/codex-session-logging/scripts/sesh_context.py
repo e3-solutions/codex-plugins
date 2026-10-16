@@ -58,7 +58,8 @@ DISABLE_ENVS = ("E3_SESH_CONTEXT_ENABLED", "E3_SESH_START_SEARCH_ENABLED")
 EXPERIMENT_ARMS = ("cue", "no_cue", "optout", "bot", "disabled", "unassigned")
 WEEK_SALT_PATTERN = re.compile(r"[0-9]{4}-W(?:0[1-9]|[1-4][0-9]|5[0-3])")
 
-# COR-4808: "fewer routine searches" A/B. Off unless E3_SESH_ROUTINE_AB is 1/true/on.
+# COR-4808: "fewer routine searches" A/B. On by default since Oct 16, 2026; E3_SESH_ROUTINE_AB=0/false/no/off
+# turns it off and restores today's cue.
 # Arm need_only gets no routine Sesh cue (the startup cue, and the compaction cue when
 # it is turned back on); Sesh tools, the search-coding-sessions skill and all logging
 # stay, so the agent still searches when it lacks something. The arm is a function of
@@ -101,8 +102,9 @@ def cue_after_compaction(env=None):
 
 
 def routine_ab_enabled(env=None):
+    """On by default (Vansh turned the live A/B on, Oct 16, 2026); E3_SESH_ROUTINE_AB=0/false/no/off turns it off."""
     env = os.environ if env is None else env
-    return _truthy(env, ROUTINE_AB_ENV)
+    return not _falsy(env.get(ROUTINE_AB_ENV))
 
 
 def routine_arm(session_id):

@@ -42,9 +42,9 @@ compaction. The startup cue now asks for one search using the user's actual task
 and opening the top result with the exact returned source arguments before the
 first edit. Rollback: set the variable, or publish a release reverting COR-4688.
 
-## Update: routine-cue A/B (COR-4808, Codex Session Logging 0.2.36, off)
+## Update: routine-cue A/B (COR-4808, Codex Session Logging 0.2.36, on by default)
 
-E3_SESH_ROUTINE_AB=1 (true/on) withholds the startup cue, and the compaction cue
+On by default (E3_SESH_ROUTINE_AB=0/false/no/off turns it off). It withholds the startup cue, and the compaction cue
 if it is turned back on, for the half of human sessions whose arm is need_only.
 Arm = low bit of sha256("sesh_routine_v1:" + lowercased session id), first byte;
 1 = need_only. Bots, opt-outs and unreadable threads keep the cue. Sesh tools,

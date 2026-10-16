@@ -46,6 +46,12 @@ def header(path: Path, **meta) -> str:
     return str(path)
 
 
+@pytest.fixture(autouse=True)
+def _routine_ab_off(monkeypatch):
+    """COR-4808's A/B is on by default since Oct 16, 2026; these tests cover the COR-4681 experiment on its own."""
+    monkeypatch.setattr(context, "routine_ab_enabled", lambda env=None: False)
+
+
 @pytest.fixture
 def e3_git(monkeypatch):
     run = Mock(return_value=types.SimpleNamespace(returncode=0, stdout=E3_REMOTE))
@@ -294,6 +300,7 @@ def run_session_start(tmp_path: Path, session_id: str, env_extra: dict[str, str]
         "CODEX_SESSION_LOG_STATE_DIR": str(tmp_path / "state"),
         "E3_COLLECTIVE_FEEDBACK_HOOK_ENABLED": "0",
         "E3_COLLECTIVE_HOOK_ENABLED": "0",
+        "E3_SESH_ROUTINE_AB": "0",  # COR-4808 A/B is on by default; these tests cover the COR-4681 experiment alone
         **env_extra,
     })
     result = subprocess.run(

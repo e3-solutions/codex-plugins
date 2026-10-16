@@ -1,4 +1,4 @@
-"""COR-4808: "fewer routine searches" A/B behind E3_SESH_ROUTINE_AB (off by default)."""
+"""COR-4808: "fewer routine searches" A/B behind E3_SESH_ROUTINE_AB (on by default; 0/false/no/off turns it off)."""
 from __future__ import annotations
 
 import hashlib
@@ -129,7 +129,7 @@ def test_arm_is_independent_of_the_cor4681_arm():
 
 # Flag off: byte-identical to today ----------------------------------------------------------------
 
-OFF_VALUES = [None, "", "0", "false", "off", "no", "yes", "enabled"]
+OFF_VALUES = ["0", "false", "off", "no", " OFF "]
 
 
 @pytest.mark.parametrize("flag", OFF_VALUES)
@@ -202,20 +202,25 @@ def test_flag_off_matches_the_previous_release_exactly(monkeypatch, tmp_path):
 
 # Flag on --------------------------------------------------------------------------------------------
 
-@pytest.mark.parametrize("value", ["1", "true", "on", " TRUE "])
+@pytest.mark.parametrize("value", [None, "", "1", "true", "on", " TRUE ", "yes", "enabled"])
 def test_values_that_turn_it_on(e3_git, tmp_path, value):
+    """Unset (the default since Oct 16, 2026) and anything but 0/false/no/off keep the A/B on."""
     item = payload(session_in("need_only"), header(tmp_path / "r.jsonl", thread_source="user"))
-    assert context.sesh_cue_decision(item, env={"E3_SESH_ROUTINE_AB": value}) == (None, None)
+    env = {} if value is None else {"E3_SESH_ROUTINE_AB": value}
+    assert context.sesh_cue_decision(item, env=env) == (None, None)
 
 
 @pytest.mark.parametrize("meta", [{"thread_source": "user", "source": "vscode", "originator": "Codex Desktop"},
                                   {"thread_source": "user", "source": "cli"}, {"source": "vscode"}, {}])
-def test_need_only_human_sessions_get_no_routine_cue(e3_git, tmp_path, meta):
+def test_need_only_human_sessions_get_no_routine_cue(e3_git, tmp_path, meta, monkeypatch):
     item = payload(session_in("need_only"), header(tmp_path / "r.jsonl", **meta))
     assert context.sesh_cue_decision(item, env=ON) == (None, None)
     assert context.sesh_cue_decision({**item, "source": "compact"},
                                      env={**ON, "E3_SESH_CUE_AFTER_COMPACTION": "1"}) == (None, None)
-    assert context.sesh_context(item) == context.CONTEXT  # process env has the flag off
+    monkeypatch.delenv("E3_SESH_ROUTINE_AB", raising=False)
+    assert context.sesh_context(item) is None  # unset = on since Oct 16, 2026
+    monkeypatch.setenv("E3_SESH_ROUTINE_AB", "0")
+    assert context.sesh_context(item) == context.CONTEXT  # explicit off restores today's cue
 
 
 def test_routine_sessions_keep_todays_cues(e3_git, tmp_path):
@@ -355,18 +360,19 @@ def start(tmp_path: Path, session_id: str, extra: dict[str, str]):
 
 
 @pytest.mark.parametrize("arm", ["routine", "need_only"])
-def test_hook_flag_off_is_identical_for_both_arms(tmp_path, arm):
-    default, _, default_event = start(tmp_path / "default", session_in(arm), {})
+def test_hook_explicit_off_restores_todays_cue_and_unset_means_on(tmp_path, arm):
     off, _, off_event = start(tmp_path / "off", session_in(arm), {"E3_SESH_ROUTINE_AB": "0"})
-    assert default == off
-    assert context.CONTEXT in default
+    default, _, default_event = start(tmp_path / "default", session_in(arm), {})
+    on, _, _ = start(tmp_path / "on", session_in(arm), ON)
+    assert context.CONTEXT in off
+    assert default == on  # unset = on since Oct 16, 2026
     assert set(default_event["metadata"]) == set(off_event["metadata"])
 
 
 @pytest.mark.parametrize("arm", ["routine", "need_only"])
 def test_hook_flag_on_withholds_only_the_need_only_cue_and_logs_nothing_new(tmp_path, arm):
     stdout, _, event = start(tmp_path / "on", session_in(arm), ON)
-    _, _, baseline = start(tmp_path / "off", session_in(arm), {})
+    _, _, baseline = start(tmp_path / "off", session_in(arm), {"E3_SESH_ROUTINE_AB": "0"})
     assert (context.CONTEXT in stdout) is (arm == "routine")
     assert "Sesh prior-work context" not in stdout or arm == "routine"
     assert set(event["metadata"]) == set(baseline["metadata"])
