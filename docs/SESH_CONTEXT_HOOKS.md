@@ -50,3 +50,12 @@ Arm = low bit of sha256("sesh_routine_v1:" + lowercased session id), first byte;
 1 = need_only. Bots, opt-outs and unreadable threads keep the cue. Sesh tools,
 the skill and search logging are unchanged, and nothing new is logged. With the
 flag unset the hook is identical to 0.2.35. Rollback: unset the variable.
+
+## Update: fire on need (COR-4811, Codex Session Logging 0.2.37, off by default)
+
+E3_SESH_ONE_PER_TURN=1 denies a second Sesh coding-session search in the same turn
+(PreToolUse, keyed on session and turn id); opening, find-similar and ask_sesh are never
+blocked, bots and opt-outs are never limited, and errors allow the call.
+E3_SESH_PAST_WORK_CUE=1 adds a one-line UserPromptSubmit cue to search Sesh once when a
+person's message in an E3 repository asks about earlier work (the study's tight pattern).
+With both unset the hooks are identical to 0.2.36. Rollback: unset the variables.
