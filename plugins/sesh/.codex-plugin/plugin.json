@@ -1,0 +1,31 @@
+{
+  "name": "sesh",
+  "version": "0.1.0",
+  "description": "Sesh prior-work cues, the one-search-per-turn guard and Sesh search linking for E3 Codex sessions.",
+  "author": {
+    "name": "Core Edge Solution"
+  },
+  "keywords": [
+    "codex",
+    "sesh",
+    "search",
+    "sessions"
+  ],
+  "skills": "./skills/",
+  "hooks": "./hooks/hooks.json",
+  "interface": {
+    "displayName": "Sesh",
+    "shortDescription": "Cue one Sesh search for prior work and link it to the session.",
+    "longDescription": "Sesh adds the agent-side Sesh hooks that used to ship inside Codex Session Logging: a startup cue to search prior coding sessions once for the task (with the routine-cue A/B), a cue when a message asks about earlier work, a guard that allows one Sesh search per turn, and metadata-only linking of Sesh searches and source opens to the session. It stores no prompts, queries or passages. When Codex Session Logging is installed it steps aside, so nothing runs twice.",
+    "developerName": "Core Edge Solution",
+    "category": "Productivity",
+    "capabilities": [
+      "Read",
+      "Write"
+    ],
+    "defaultPrompt": [
+      "Search prior E3 coding sessions for this task"
+    ],
+    "brandColor": "#0F766E"
+  }
+}
