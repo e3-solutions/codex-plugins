@@ -102,8 +102,8 @@ def test_user_prompt_submit_emits_cue_and_preserves_capture(monkeypatch, capsys,
         sync_after_hook=lambda *a, **kw: calls.append("sync")))
     monkeypatch.setitem(sys.modules, "session_logging", types.SimpleNamespace(
         read_stdin_json=lambda: payload(), capture_hook_event=lambda *a, **kw: calls.append("capture")))
-    monkeypatch.setattr(cue, "forum_cue", Mock(side_effect=RuntimeError() if cue_fails else None,
-                                               return_value='{"hookSpecificOutput": {}}'))
+    monkeypatch.setattr(cue, "forum_cue_decision", Mock(side_effect=RuntimeError() if cue_fails else None,
+                                                        return_value=('{"hookSpecificOutput": {}}', None)))
     spec = importlib.util.spec_from_file_location("candidate_prompt", SCRIPTS / "user_prompt_submit.py")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -111,3 +111,84 @@ def test_user_prompt_submit_emits_cue_and_preserves_capture(monkeypatch, capsys,
     output = capsys.readouterr().out
     assert calls == ["capture", "sync"]
     assert output == ("" if cue_fails else '{"hookSpecificOutput": {}}\n')
+
+
+# COR-4883 A/B: off unless FORUM_CUE_AB is on; arm is a pure function of the session id.
+
+def arm_of(session):
+    import hashlib
+    h = hashlib.sha256(f"forum_cue_v2:{session.strip().lower()}".encode()).digest()
+    return "v1" if not h[0] & 1 else ("v2_midtask" if h[1] & 1 else "v2")
+
+
+def sessions_in(arm, count=1):
+    found = [f"sess-{i}" for i in range(400) if arm_of(f"sess-{i}") == arm]
+    return found[:count]
+
+
+def test_ab_is_off_by_default_so_every_session_gets_v1_and_no_new_metadata(tmp_path, e3, monkeypatch):
+    monkeypatch.delenv(cue.AB_ENV, raising=False)
+    for session in sessions_in("v2", 3) + sessions_in("v2_midtask", 3):
+        output, meta = cue.forum_cue_decision(payload(session=session), directory=tmp_path, now=5.0)
+        assert context_of(output) == cue.CUE and meta is None
+    for line in (tmp_path / "cue-log.jsonl").read_text().splitlines():
+        assert set(json.loads(line)) == {"ts", "session_id", "reason", "prompt_words"}
+
+
+@pytest.mark.parametrize("value", ["0", "", "false", "nope"])
+def test_ab_needs_an_explicit_on_value(monkeypatch, value):
+    monkeypatch.setenv(cue.AB_ENV, value)
+    assert not cue.ab_enabled()
+
+
+@pytest.mark.parametrize("arm", ["v1", "v2", "v2_midtask"])
+def test_ab_on_gives_each_arm_its_cue_and_logs_the_arm(tmp_path, e3, monkeypatch, arm):
+    monkeypatch.setenv(cue.AB_ENV, "1")
+    session = sessions_in(arm)[0]
+    output, meta = cue.forum_cue_decision(payload(session=session), directory=tmp_path, now=5.0)
+    assert context_of(output) == cue.CUES[arm]
+    assert meta == {"forum_cue_experiment": "forum_cue_v2", "forum_cue_arm": arm,
+                    "forum_cue_reason": "first_prompt"}
+    log = json.loads((tmp_path / "cue-log.jsonl").read_text())
+    assert log["arm"] == arm and log["experiment"] == "forum_cue_v2"
+    # Gating is unchanged: a short follow-up in the same session gets nothing.
+    assert cue.forum_cue_decision(payload("ok", session=session), directory=tmp_path, now=6.0) == (None, None)
+
+
+def test_arm_is_stable_case_and_space_insensitive_and_roughly_half_control():
+    assert cue.cue_arm(" ABC-123 ") == cue.cue_arm("abc-123") == arm_of("abc-123")
+    arms = [cue.cue_arm(f"{i:08x}-0000-4000-8000-000000000000") for i in range(4000)]
+    assert 0.46 < arms.count("v1") / 4000 < 0.54
+    assert 0.21 < arms.count("v2") / 4000 < 0.29 and 0.21 < arms.count("v2_midtask") / 4000 < 0.29
+
+
+def test_v2_texts_lead_with_rating_and_dup_check_rules_and_name_the_cosmos_tool():
+    for text in (cue.CUE_V2, cue.CUE_V2_MIDTASK):
+        for phrase in ("forum__search_research_posts on the Cosmos MCP server",
+                       "no separate `forum` server", "Rate only posts you used or checked",
+                       "leave the rest unrated", "one parallel batch of give_collective_feedback",
+                       "search_id", "Off-topic for this query:", "at most 2 searches",
+                       "share_with_collective", "remains unsaved", "name the Forum posts you used"):
+            assert phrase in text
+        # Down keeps Forum's meaning: the latest vote per user counts, so an off-topic down
+        # would cancel that user's earlier up on a good post.
+        assert "kind=down if its evidence is incorrect or misleading" in text
+        assert "For each post you fully read" not in text
+    assert "before you commit to an approach" in cue.CUE_V2 and "Do not search yet" not in cue.CUE_V2
+    assert "Do not search yet" in cue.CUE_V2_MIDTASK and "Search again when" in cue.CUE_V2_MIDTASK
+
+
+def test_hook_passes_the_arm_to_the_session_log(monkeypatch, capsys):
+    monkeypatch.setenv("E3_SESH_PAST_WORK_CUE", "0")
+    seen = []
+    meta = {"forum_cue_experiment": "forum_cue_v2", "forum_cue_arm": "v2_midtask",
+            "forum_cue_reason": "first_prompt"}
+    monkeypatch.setitem(sys.modules, "rollout_sync", types.SimpleNamespace(sync_after_hook=lambda *a, **kw: None))
+    monkeypatch.setitem(sys.modules, "session_logging", types.SimpleNamespace(
+        read_stdin_json=lambda: payload(), capture_hook_event=lambda *a, **kw: seen.append(kw)))
+    monkeypatch.setattr(cue, "forum_cue_decision", Mock(return_value=('{"hookSpecificOutput": {}}', meta)))
+    spec = importlib.util.spec_from_file_location("candidate_prompt_ab", SCRIPTS / "user_prompt_submit.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    module.main()
+    assert seen == [{"event_name": "UserPromptSubmit", "extra_metadata": meta}]

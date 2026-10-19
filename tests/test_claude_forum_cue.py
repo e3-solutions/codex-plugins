@@ -41,10 +41,11 @@ def e3(monkeypatch):
 
 def test_claude_copy_matches_codex_cue_text_and_gating():
     assert cue.CUE == codex_cue.CUE
+    assert cue.CUES == codex_cue.CUES and cue.AB_ENV == codex_cue.AB_ENV and cue.AB_ID == codex_cue.AB_ID
     for name in ("ENABLED_ENV", "MIN_GAP_SECONDS", "NEW_TASK_MIN_WORDS"):
         assert getattr(cue, name) == getattr(codex_cue, name)
     assert cue._E3_REMOTE.pattern == codex_cue._E3_REMOTE.pattern
-    for name in ("forum_cue", "_enabled", "_e3_repository"):
+    for name in ("forum_cue", "forum_cue_decision", "_enabled", "_e3_repository", "ab_enabled", "cue_arm"):
         assert inspect.getsource(getattr(cue, name)) == inspect.getsource(getattr(codex_cue, name))
     assert "search_id" in cue.CUE and cue.ENABLED_ENV == "FORUM_CUE_ENABLED"
 
@@ -107,9 +108,9 @@ def test_claude_user_prompt_submit_prints_cue_first_and_keeps_capture(monkeypatc
         order.append("cue")
         if cue_fails:
             raise RuntimeError("boom")
-        return '{"hookSpecificOutput": {}}'
+        return '{"hookSpecificOutput": {}}', None
 
-    monkeypatch.setitem(sys.modules, "forum_cue", types.SimpleNamespace(forum_cue=fake_cue))
+    monkeypatch.setitem(sys.modules, "forum_cue", types.SimpleNamespace(forum_cue_decision=fake_cue))
     monkeypatch.setitem(sys.modules, "session_logging", types.SimpleNamespace(
         read_stdin_json=lambda: payload(),
         capture_hook_event=lambda p, **kw: order.append(("capture", kw["event_name"]))))
@@ -121,7 +122,8 @@ def test_claude_user_prompt_submit_prints_cue_first_and_keeps_capture(monkeypatc
 
 
 def test_claude_user_prompt_submit_swallows_capture_failure(monkeypatch, capsys):
-    monkeypatch.setitem(sys.modules, "forum_cue", types.SimpleNamespace(forum_cue=lambda p: '{"x": 1}'))
+    monkeypatch.setitem(sys.modules, "forum_cue", types.SimpleNamespace(
+        forum_cue_decision=lambda p: ('{"x": 1}', None)))
 
     def broken(*a, **kw):
         raise OSError("disk full")
@@ -132,3 +134,25 @@ def test_claude_user_prompt_submit_swallows_capture_failure(monkeypatch, capsys)
     captured = capsys.readouterr()
     assert captured.out == '{"x": 1}\n'
     assert "claude-session-logging capture failed" in captured.err
+
+
+def test_claude_hook_passes_the_ab_arm_to_the_session_log(monkeypatch, capsys):
+    seen = []
+    meta = {"forum_cue_experiment": "forum_cue_v2", "forum_cue_arm": "v2", "forum_cue_reason": "first_prompt"}
+    monkeypatch.setitem(sys.modules, "forum_cue", types.SimpleNamespace(
+        forum_cue_decision=lambda p: ('{"x": 1}', meta)))
+    monkeypatch.setitem(sys.modules, "session_logging", types.SimpleNamespace(
+        read_stdin_json=lambda: payload(), capture_hook_event=lambda p, **kw: seen.append(kw)))
+    load(CLAUDE_SCRIPTS / "user_prompt_submit.py", "claude_prompt_ab").main()
+    assert seen == [{"event_name": "UserPromptSubmit", "extra_metadata": meta}]
+
+
+def test_claude_capture_hook_event_merges_extra_metadata(monkeypatch, tmp_path):
+    monkeypatch.setenv("CLAUDE_SESSION_LOG_STATE_DIR", str(tmp_path))
+    sl = load(CLAUDE_SCRIPTS / "session_logging.py", "claude_session_logging_ab")
+    monkeypatch.setattr(sl, "try_auto_drain", lambda: None)
+    monkeypatch.setattr(sl, "should_capture_payload", lambda p: True)
+    event = sl.capture_hook_event(payload(), event_name="UserPromptSubmit",
+                                  extra_metadata={"forum_cue_arm": "v1"})
+    assert event["metadata"]["forum_cue_arm"] == "v1"
+    assert event["metadata"]["thread_event"] == "prompt_submitted"

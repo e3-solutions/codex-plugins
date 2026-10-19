@@ -52,6 +52,27 @@ For eligible E3 sessions, `SessionStart` adds a compact reminder about the E3 Co
 
 Since `0.2.18`, in canonical E3 repositories (`origin` is an `e3-solutions` GitHub HTTPS/SSH remote) `UserPromptSubmit` adds a short Forum decision cue as `hookSpecificOutput.additionalContext`, the same text Codex Session Logging uses (`scripts/forum_cue.py`, kept in parity by tests). It fires on a session's first prompt and on a new task of 25+ words at most once an hour. It asks for one `forum__search_research_posts` with 2-4 words naming the system, tool or component plus the failure or decision before committing to an approach, then one explained `give_collective_feedback` (up/down/abstain) per fully read post using the `post_id`, `body_sha256` and `search_id` from the search result, and to name the Forum posts used in the final answer. The hook never contacts Forum. It logs only the session id, time, reason and prompt word count under `~/.claude/session-logging/forum-cue` (or `$CLAUDE_SESSION_LOG_STATE_DIR/forum-cue`), never prompt text. Prompt capture runs as before, and a cue failure never blocks it. Disable the cue with `FORUM_CUE_ENABLED=0`.
 
+## Forum cue v2 A/B (COR-4883, off by default)
+
+`FORUM_CUE_AB=1` (or `true`, `yes`, `on`) splits sessions that get the Forum decision cue
+(`scripts/forum_cue.py`, shared by Codex and Claude Code). **Unset, every session gets the v1 cue
+exactly as before and nothing new is logged.** Gating (E3 repositories, first prompt, then a
+25+ word new task at most once an hour) is the same in every arm.
+
+- Arms come from the session id alone: `h = sha256("forum_cue_v2:" + lowercased, trimmed id)`;
+  `v1` when the low bit of `h[0]` is 0 (50%, today's cue), else `v2_midtask` when the low bit of
+  `h[1]` is 1 (25%), else `v2` (25%). In Postgres:
+  `case when get_byte(h,0)%2=0 then 'v1' when get_byte(h,1)%2=1 then 'v2_midtask' else 'v2' end`
+  with `h = sha256(convert_to('forum_cue_v2:' || lower(btrim(session_id)), 'UTF8'))`.
+- `v2`: same search timing as v1, but names the Cosmos tool, rates only posts the agent used or
+  checked (one parallel batch before finishing, unused results left unrated, off-topic ones as
+  abstain starting "Off-topic for this query:"), and allows at most 2 duplicate-check searches
+  before `share_with_collective`. `v2_midtask`: v2 plus "do not search yet; search once you have a
+  specific cause or mechanism, with its nouns, and again when the plan changes".
+- While on, the cue log line gains `experiment` and `arm`, and the `thread_prompt_submitted`
+  session event for a cued prompt gains `forum_cue_experiment`, `forum_cue_arm` and
+  `forum_cue_reason` metadata. No schema change.
+
 For local development from a checkout:
 
 ```bash
