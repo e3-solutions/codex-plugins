@@ -1,0 +1,110 @@
+{
+  "schema_version": 1,
+  "id": "sesh",
+  "version": "0.1.0",
+  "owner": "Core Edge",
+  "providers": [
+    "codex"
+  ],
+  "include": [
+    "scripts/sesh_plugin.py",
+    "scripts/sesh_context.py",
+    "scripts/sesh_need.py",
+    "scripts/session_logging.py",
+    "scripts/drain_queue.py",
+    "scripts/session_start.py",
+    "scripts/user_prompt_submit.py",
+    "scripts/pre_tool_use.py",
+    "scripts/post_tool_use.py",
+    "skills/search-coding-sessions"
+  ],
+  "hook_defaults": {
+    "providers": [
+      "codex"
+    ],
+    "timeout_seconds": 10,
+    "background_work": {
+      "mode": "none"
+    }
+  },
+  "hooks": [
+    {
+      "id": "sesh-session-start",
+      "event": "SessionStart",
+      "entrypoint": "scripts/session_start.py",
+      "invocation": {
+        "kind": "python-script",
+        "args": [],
+        "output": "context"
+      }
+    },
+    {
+      "id": "sesh-user-prompt-submit",
+      "event": "UserPromptSubmit",
+      "entrypoint": "scripts/user_prompt_submit.py",
+      "invocation": {
+        "kind": "python-script",
+        "args": [],
+        "output": "context"
+      }
+    },
+    {
+      "id": "sesh-pre-tool-use",
+      "event": "PreToolUse",
+      "entrypoint": "scripts/pre_tool_use.py",
+      "invocation": {
+        "kind": "python-script",
+        "args": [],
+        "output": "context"
+      }
+    },
+    {
+      "id": "sesh-post-tool-use",
+      "event": "PostToolUse",
+      "entrypoint": "scripts/post_tool_use.py",
+      "invocation": {
+        "kind": "python-script",
+        "args": [],
+        "output": "ignore"
+      }
+    }
+  ],
+  "skills": [
+    {
+      "path": "skills/search-coding-sessions",
+      "providers": [
+        "codex"
+      ]
+    }
+  ],
+  "dependencies": [
+    {
+      "kind": "executable",
+      "name": "git"
+    },
+    {
+      "kind": "mcp",
+      "name": "cosmos",
+      "providers": [
+        "codex"
+      ]
+    }
+  ],
+  "state": [
+    {
+      "id": "sesh-link-queue",
+      "purpose": "Pending Sesh linkage events and the installation id (~/.codex/sesh/session-logging).",
+      "rollback_compatible": true
+    },
+    {
+      "id": "sesh-turn-guard",
+      "purpose": "One-search-per-turn markers shared with codex-session-logging (~/.codex/sesh-turn-guard).",
+      "rollback_compatible": true
+    }
+  ],
+  "environment": {
+    "E3_SESH_STATE_DIR": {
+      "state": "sesh-link-queue"
+    }
+  }
+}

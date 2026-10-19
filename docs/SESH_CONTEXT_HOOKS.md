@@ -61,3 +61,17 @@ blocked, bots and opt-outs are never limited, and errors allow the call.
 E3_SESH_PAST_WORK_CUE adds a one-line UserPromptSubmit cue to search Sesh once when a
 person's message in an E3 repository asks about earlier work (the study's tight pattern).
 With both set to 0 the hooks are identical to 0.2.36. Rollback: set the variables to 0.
+
+## Update: standalone `sesh` plugin (COR-4884, sesh 0.1.0)
+
+The same hooks also ship as their own Codex plugin, `plugins/sesh`. This is because Jolly
+Roger #15/#16 retires Codex Session Logging, which turned them off on retired machines.
+
+- **Same code and defaults.** The cue, routine A/B, past-work cue, guard and Sesh-only linking
+  events are the code from 0.2.38, with the same defaults. A differential test runs both
+  plugins' real hooks and checks that their output and Sesh events match.
+- **No hook fires twice.** When an active Codex Session Logging will run a hook, the plugin
+  does nothing for that event. Codex Session Logging is unchanged.
+- **Plugin version is recorded per session.** Uploads name `plugin: sesh`, and the session's
+  `environment_snapshot` lists the `sesh` skill and its version. No ingest or schema change.
+- **Shipping:** through the jolly-roger #10 native plugin catalog. See `plugins/sesh/README.md`.

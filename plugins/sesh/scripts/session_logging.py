@@ -1,0 +1,1797 @@
+#!/usr/bin/env python3
+# Vendored from plugins/codex-session-logging/scripts/session_logging.py (0.2.38) so the
+# standalone `sesh` plugin can post its few Sesh linkage events without that plugin.
+# Only the lines marked "sesh plugin:" differ; tests/test_sesh_plugin.py pins the diff.
+from __future__ import annotations
+
+import argparse
+import contextlib
+import fcntl
+import getpass
+import hashlib
+import json
+import os
+import re
+import socket
+import stat
+import subprocess
+import sys
+import threading
+import urllib.error
+import urllib.request
+import uuid
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
+from functools import lru_cache
+from pathlib import Path
+from typing import Any, Callable
+
+try:
+    import tomllib
+except ModuleNotFoundError:  # pragma: no cover - Python < 3.11 fallback.
+    tomllib = None  # type: ignore[assignment]
+
+JsonDict = dict[str, Any]
+
+STATE_DIR_ENV = "E3_SESH_STATE_DIR"  # sesh plugin: own queue, never the logger's
+SUPABASE_BUCKET_ENV = "CODEX_SESSION_LOG_BUCKET"
+INGEST_URL_ENV = "CODEX_SESSION_LOG_INGEST_URL"
+INGEST_TOKEN_ENV = "CODEX_SESSION_LOG_INGEST_TOKEN"
+AUTO_UPLOAD_ENV = "CODEX_SESSION_LOG_AUTO_UPLOAD"
+UPLOAD_WORKERS_ENV = "CODEX_SESSION_LOG_UPLOAD_WORKERS"
+DEFAULT_SUPABASE_URL = "https://pmdfllwuctzkdjiehezq.supabase.co"
+DEFAULT_INGEST_URL = f"{DEFAULT_SUPABASE_URL}/functions/v1/codex-session-ingest"
+DEFAULT_BUCKET = "codex-sessions"
+ALLOWED_GITHUB_ORG = "e3-solutions"
+COLLECTIVE_SESSION_SOURCES = frozenset({"startup", "resume", "compact"})
+EXCERPT_BYTES = 4096
+PLUGIN_NAME = "sesh"  # sesh plugin: name sent with every upload
+PLUGIN_VERSION = "0.1.0"  # sesh plugin: keep equal to .codex-plugin/plugin.json
+PERMANENT_HTTP_STATUSES = {400, 413, 415, 422}
+_SESSION_UPLOAD_LOCKS: dict[str, threading.Lock] = {}
+_SESSION_UPLOAD_LOCKS_GUARD = threading.Lock()
+
+
+def main(argv: list[str] | None = None) -> None:
+    parser = argparse.ArgumentParser(description="Capture and upload Codex session logging events.")
+    subparsers = parser.add_subparsers(dest="command")
+    capture_parser = subparsers.add_parser("capture", help="Capture one hook payload from stdin.")
+    capture_parser.add_argument("--event", help="Hook event name override.")
+    subparsers.add_parser("drain", help="Upload queued records to Supabase.")
+    args = parser.parse_args(argv)
+
+    if args.command == "drain":
+        result = drain_queue()
+        print(json.dumps(result, sort_keys=True))
+        return
+
+    payload = read_stdin_json()
+    captured = capture_hook_event(payload, event_name=getattr(args, "event", None))
+    if captured:
+        summary = {
+            "captured": captured["id"],
+            "type": captured.get("type", "message"),
+        }
+        for key in ("role", "event_type"):
+            if captured.get(key):
+                summary[key] = captured[key]
+        print(json.dumps(summary, sort_keys=True))
+
+
+def read_stdin_json() -> JsonDict:
+    raw = sys.stdin.read()
+    if not raw.strip():
+        return {}
+    try:
+        loaded = json.loads(raw)
+    except json.JSONDecodeError:
+        return {"raw": raw}
+    return loaded if isinstance(loaded, dict) else {"payload": loaded}
+
+
+def capture_hook_event(
+    payload: JsonDict,
+    *,
+    event_name: str | None = None,
+    extra_metadata: JsonDict | None = None,
+) -> JsonDict | None:
+    hook_event = event_name or str(payload.get("hook_event_name") or payload.get("event") or "")
+    role, content = message_from_payload(hook_event, payload)
+    if not should_capture_payload(payload):
+        return None
+    if role and content is not None:
+        if hook_event == "Stop":
+            capture_turn_commentary(payload, hook_event=hook_event)
+            return capture_message_event(
+                payload, hook_event=hook_event, role=role, content=content,
+                extra_metadata={"message_phase": "final_answer"})
+        return capture_message_event(payload, hook_event=hook_event, role=role, content=content)
+    event_type, event_metadata = event_from_payload(hook_event, payload)
+    if not event_type:
+        return None
+    if extra_metadata:
+        event_metadata.update(extra_metadata)
+    return capture_metadata_event(payload, hook_event=hook_event, event_type=event_type, event_metadata=event_metadata)
+
+
+def capture_message_event(
+    payload: JsonDict,
+    *,
+    hook_event: str,
+    role: str,
+    content: str,
+    extra_metadata: JsonDict | None = None,
+) -> JsonDict:
+    base = ensure_state_dir()
+    session_id = safe_segment(first_string(payload, "session_id", "sessionId") or "unknown-session")
+    thread_id = thread_id_from_payload(payload)
+    turn_id = first_string(payload, "turn_id", "turnId")
+    seq = next_sequence(base, session_id)
+    user_key = "local"
+    content_bytes = content.encode("utf-8")
+    content_hash = hashlib.sha256(content_bytes).hexdigest()
+    storage_path = f"users/{user_key}/sessions/{session_id}/messages/{seq:06d}-{role}.json"
+    local_content_path = storage_path
+    created_at = now_iso()
+    metadata = metadata_from_payload(payload)
+    if extra_metadata:
+        metadata.update(extra_metadata)
+    message = {
+        "id": uuid.uuid4().hex,
+        "session_id": session_id,
+        "turn_id": turn_id,
+        "seq": seq,
+        "role": role,
+        "content": content,
+        "content_sha256": content_hash,
+        "content_byte_size": len(content_bytes),
+        "hook_event_name": hook_event,
+        "created_at": created_at,
+        "metadata": metadata,
+    }
+    if thread_id:
+        message["thread_id"] = thread_id
+    write_json_atomic(base / local_content_path, message)
+    append_jsonl(base / f"users/{user_key}/sessions/{session_id}/raw.jsonl", {"payload": payload, "captured_at": created_at})
+
+    event = {
+        "id": message["id"],
+        "type": "message",
+        "session_id": session_id,
+        "turn_id": turn_id,
+        "seq": seq,
+        "role": role,
+        "hook_event_name": hook_event,
+        "storage_bucket": bucket_name(),
+        "storage_path": storage_path,
+        "local_content_path": local_content_path,
+        "content_sha256": content_hash,
+        "content_byte_size": len(content_bytes),
+        "content_excerpt": utf8_excerpt(content_bytes),
+        "metadata": metadata,
+        "created_at": created_at,
+        "uploaded_at": None,
+    }
+    if thread_id:
+        event["thread_id"] = thread_id
+    append_jsonl(base / "events.jsonl", event)
+    enqueue_record(base, event)
+    try_auto_drain()
+    return event
+
+
+def capture_metadata_event(
+    payload: JsonDict,
+    *,
+    hook_event: str,
+    event_type: str,
+    event_metadata: JsonDict,
+) -> JsonDict:
+    base = ensure_state_dir()
+    session_id = safe_segment(first_string(payload, "session_id", "sessionId") or "unknown-session")
+    thread_id = thread_id_from_payload(payload)
+    turn_id = first_string(payload, "turn_id", "turnId")
+    seq = next_sequence(base, session_id)
+    created_at = now_iso()
+    metadata = metadata_from_payload(payload)
+    metadata.update(event_metadata)
+    event_id = uuid.uuid4().hex
+    storage_path = f"users/local/sessions/{session_id}/events/{seq:06d}-{safe_segment(event_type)}.json"
+    detail = {
+        "id": event_id,
+        "session_id": session_id,
+        "turn_id": turn_id,
+        "seq": seq,
+        "event_type": event_type,
+        "hook_event_name": hook_event,
+        "created_at": created_at,
+        "metadata": metadata,
+    }
+    if thread_id:
+        detail["thread_id"] = thread_id
+    write_json_atomic(base / storage_path, detail)
+
+    event = {
+        "id": event_id,
+        "type": "event",
+        "session_id": session_id,
+        "turn_id": turn_id,
+        "seq": seq,
+        "event_type": event_type,
+        "hook_event_name": hook_event,
+        "storage_bucket": bucket_name(),
+        "storage_path": storage_path,
+        "local_content_path": storage_path,
+        "metadata": metadata,
+        "created_at": created_at,
+        "uploaded_at": None,
+    }
+    if thread_id:
+        event["thread_id"] = thread_id
+    append_jsonl(base / "events.jsonl", event)
+    enqueue_record(base, event)
+    try_auto_drain()
+    return event
+
+
+COMMENTARY_INITIAL_TAIL_BYTES = 8 * 1024 * 1024
+COMMENTARY_MAX_PER_TURN = 50
+COMMENTARY_SEEN_LIMIT = 500
+
+
+def commentary_capture_enabled() -> bool:
+    value = os.environ.get("CODEX_SESSION_LOG_COMMENTARY", "1").strip().lower()
+    return value not in {"0", "false", "no", "off"}
+
+
+def capture_turn_commentary(payload: JsonDict, *, hook_event: str) -> list[JsonDict]:
+    """Record the turn's progress updates ("commentary") before its final answer.
+
+    The Stop payload carries only the final message, but agents state most
+    concrete findings in commentary. Only transcript bytes appended since the
+    previous Stop are read, so long sessions are never rescanned. Never raises.
+    """
+    if not commentary_capture_enabled():
+        return []
+    try:
+        transcript = first_string(payload, "transcript_path", "transcriptPath")
+        if not transcript:
+            return []
+        path = Path(transcript).expanduser()
+        if not path.is_file():
+            return []
+        turn_id = first_string(payload, "turn_id", "turnId")
+        base = ensure_state_dir()
+        state_path = base / "commentary_offsets" / f"{sha256_hex(str(path))}.json"
+        state: JsonDict = {}
+        if state_path.is_file():
+            try:
+                loaded = json.loads(state_path.read_text(encoding="utf-8"))
+                state = loaded if isinstance(loaded, dict) else {}
+            except (OSError, ValueError):
+                state = {}
+        size = path.stat().st_size
+        stored = state.get("offset")
+        resume = isinstance(stored, int) and 0 <= stored <= size
+        offset = stored if resume else max(0, size - COMMENTARY_INITIAL_TAIL_BYTES)
+        seen = [value for value in state.get("seen", []) if isinstance(value, str)]
+        seen_set = set(seen)
+        found: list[tuple[str, str]] = []
+        with path.open("rb") as handle:
+            handle.seek(offset)
+            if offset and not resume:
+                handle.readline()  # Skip the partial line when starting mid-file.
+            for raw in handle:
+                if b'"AgentMessage"' not in raw or b'"commentary"' not in raw:
+                    continue
+                try:
+                    record = json.loads(raw)
+                except ValueError:
+                    continue
+                body = record.get("payload") if isinstance(record, dict) else None
+                item = body.get("item") if isinstance(body, dict) else None
+                if (not isinstance(item, dict) or item.get("type") != "AgentMessage"
+                        or item.get("phase") != "commentary"):
+                    continue
+                if turn_id and body.get("turn_id") not in (None, turn_id):
+                    continue
+                item_id = str(item.get("id") or "")
+                if item_id and item_id in seen_set:
+                    continue
+                text = "\n".join(
+                    part["text"] for part in item.get("content", [])
+                    if isinstance(part, dict) and isinstance(part.get("text"), str)
+                ).strip()
+                if text:
+                    found.append((item_id, text))
+                    if item_id:
+                        seen_set.add(item_id)
+            next_offset = handle.tell()
+        captured = []
+        for item_id, text in found[-COMMENTARY_MAX_PER_TURN:]:
+            captured.append(capture_message_event(
+                payload, hook_event=hook_event, role="assistant", content=text,
+                extra_metadata={"message_phase": "commentary"}))
+            if item_id:
+                seen.append(item_id)
+        write_json_atomic(state_path, {"offset": next_offset, "seen": seen[-COMMENTARY_SEEN_LIMIT:]})
+        return captured
+    except Exception as exc:  # noqa: BLE001 - logging must not interrupt Codex.
+        print(f"codex-session-logging commentary capture failed: {exc}", file=sys.stderr)
+        return []
+
+
+def message_from_payload(hook_event: str, payload: JsonDict) -> tuple[str | None, str | None]:
+    if hook_event == "UserPromptSubmit":
+        return "user", first_string(payload, "prompt")
+    if hook_event == "Stop":
+        return "assistant", first_string(payload, "last_assistant_message", "lastAssistantMessage")
+    return None, None
+
+
+def event_from_payload(hook_event: str, payload: JsonDict) -> tuple[str | None, JsonDict]:
+    if hook_event == "SessionStart":
+        return "environment_snapshot", {"codex_setup": codex_setup_snapshot()}
+    if hook_event == "PreToolUse":
+        metadata = tool_event_metadata(payload, phase="started")
+        return ("tool_call_started", metadata) if metadata.get("tool_name") else (None, {})
+    if hook_event == "PostToolUse":
+        metadata = tool_event_metadata(payload, phase="finished")
+        metadata.update(search_receipt_metadata(payload))
+        if metadata.get("sesh_request_id"):
+            metadata.update(search_origin_metadata(payload))
+        metadata.update(source_open_metadata(payload))
+        success = tool_success(payload)
+        if success is not None:
+            metadata["success"] = success
+        return ("tool_call_finished", metadata) if metadata.get("tool_name") else (None, {})
+    return None, {}
+
+
+SESH_SEARCH_TOOL = 'mcp__e3_cosmos__sesh__search_coding_sessions'
+SESH_SEARCH_TOOLS = (
+    SESH_SEARCH_TOOL,
+    'mcp__e3__sesh__search_coding_sessions',
+    'mcp__cosmos__sesh__search_coding_sessions',
+    'mcp__cosmos_e3__sesh__search_coding_sessions',
+)
+# Any MCP namespace that serves Sesh search: mcp__<ns>__sesh__search_coding_sessions
+# (including mcp__codex_apps__cosmos__... and mcp__e3_mcp__...), mcp__<ns>__search_coding_sessions,
+# or the bare tool name. Nothing before or after the name.
+SESH_SEARCH_TOOL_PATTERN = re.compile(r'(?:[A-Za-z0-9_-]+__)?(?:sesh__)?search_coding_sessions')
+# Full JSON parse of a text envelope up to this size. Uncompacted answers with many evidence
+# passages pass 256 KB (Oct 5, 2026), and the request id sits at the end of the text.
+SESH_MAX_RESPONSE_BYTES = 16 * 1024 * 1024
+# Larger texts are not parsed; only structural (unescaped) search_request_id keys are read.
+SESH_MAX_SCAN_BYTES = 64 * 1024 * 1024
+SESH_MAX_REQUEST_IDS = 32
+SESH_REQUEST_ID_KEY_PATTERN = re.compile(
+    r'(?<!\\)"search_request_id"\s*:\s*"([^"\\]{0,64})"'
+)
+SESH_MAX_DELIVERED_SOURCE_HANDLES = 75
+SESH_MAX_SOURCE_HANDLE_OCCURRENCES = 80
+SESH_UUID_PATTERN = re.compile(
+    r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[89ab][0-9a-f]{3}-[0-9a-f]{12}'
+)
+SESH_ANY_UUID_PATTERN = re.compile(
+    r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
+)
+SESH_ROLLOUT_REFERENCE_PATTERN = re.compile(
+    r'[0-9a-f]{64}:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
+)
+
+
+def _sesh_unique_object(pairs):
+    value = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError('ambiguous JSON object')
+        value[key] = item
+    return value
+
+
+def _sesh_response_bodies(response):
+    """Return only bounded, unambiguous response objects; never tool input."""
+    if not isinstance(response, dict):
+        return None
+    bodies = []
+    if 'search_request_id' in response or 'results' in response:
+        bodies.append(response)
+    structured = response.get('structuredContent')
+    if 'structuredContent' in response and not isinstance(structured, dict):
+        return None
+    if isinstance(structured, dict):
+        bodies.append(structured)
+    content = response.get('content')
+    if 'content' in response and (not isinstance(content, list) or len(content) != 1):
+        return None
+    if isinstance(content, list) and len(content) == 1:
+        item = content[0]
+        if not isinstance(item, dict) or item.get('type') != 'text':
+            return None
+        raw = item.get('text')
+        if not isinstance(raw, str):
+            return None
+        if len(raw) > SESH_MAX_RESPONSE_BYTES:
+            # Too big to parse: keep only the request ids, never the content.
+            scanned = _sesh_scanned_request_body(raw)
+            if scanned is None:
+                return None
+            bodies.append(scanned)
+            return bodies
+        try:
+            decoded = json.loads(raw, object_pairs_hook=_sesh_unique_object)
+        except (ValueError, UnicodeError, RecursionError):
+            return None
+        if not isinstance(decoded, dict):
+            return None
+        bodies.append(decoded)
+    return bodies
+
+
+def _sesh_scanned_request_body(raw):
+    """Request ids of an oversized JSON text envelope, read without parsing it.
+
+    Only keys whose opening quote is not escaped are structural, so ids quoted inside
+    passages (always escaped in JSON text) are never read. The first id is the answer's own
+    search_request_id when it is the last key, as Sesh writes it; per-question ids precede it.
+    """
+    if len(raw) > SESH_MAX_SCAN_BYTES or not raw.lstrip().startswith('{'):
+        return None
+    found = SESH_REQUEST_ID_KEY_PATTERN.findall(raw)
+    if not found or len(found) > SESH_MAX_REQUEST_IDS + 1:
+        return None
+    if any(SESH_UUID_PATTERN.fullmatch(value) is None for value in found):
+        return None
+    # Sesh appends the top-level id last; earlier ones are per_query entries.
+    return {'search_request_id': found[-1],
+            'per_query': [{'search_request_id': value} for value in found[:-1]]}
+
+
+def _canonical_uuid(value):
+    if not isinstance(value, str) or SESH_ANY_UUID_PATTERN.fullmatch(value) is None:
+        return False
+    try:
+        return str(uuid.UUID(value)) == value and uuid.UUID(value).int != 0
+    except (ValueError, AttributeError):
+        return False
+
+
+def _canonical_source_handle(tool, arguments):
+    """Validate the two exact displayed source-handle shapes."""
+    if tool == 'open_coding_session_source':
+        if not isinstance(arguments, dict) or set(arguments) != {'reference_id'}:
+            return None
+        reference_id = arguments.get('reference_id')
+        if (not isinstance(reference_id, str) or
+                SESH_ROLLOUT_REFERENCE_PATTERN.fullmatch(reference_id) is None):
+            return None
+        message_id = reference_id.rsplit(':', 1)[-1]
+        if not _canonical_uuid(message_id):
+            return None
+        leaf = 'sesh__open_coding_session_source'
+    elif tool == 'get_chat':
+        if (not isinstance(arguments, dict) or
+                set(arguments) != {'sessionId', 'includeContent'} or
+                arguments.get('includeContent') is not True or
+                not _canonical_uuid(arguments.get('sessionId'))):
+            return None
+        leaf = 'timetracker__get_chat'
+    else:
+        return None
+    encoded = json.dumps(arguments, sort_keys=True, separators=(',', ':'),
+                         ensure_ascii=True, allow_nan=False)
+    return leaf, encoded
+
+
+def _source_handle_digest(tool, arguments):
+    canonical = _canonical_source_handle(tool, arguments)
+    if canonical is None:
+        return None
+    leaf, encoded = canonical
+    return hashlib.sha256(f'v1\n{leaf}\n{encoded}'.encode('ascii')).hexdigest()
+
+
+def _delivered_source_handle_digests(body):
+    if 'results' not in body:
+        return None
+    results = body.get('results')
+    if not isinstance(results, list) or len(results) > 5:
+        raise ValueError('invalid Sesh result count')
+    digests = []
+    seen = set()
+    visited = 0
+
+    def add_source(source, depth=0):
+        nonlocal visited
+        visited += 1
+        if visited > SESH_MAX_SOURCE_HANDLE_OCCURRENCES or depth > 4:
+            raise ValueError('too many or too deeply nested Sesh source handles')
+        if not isinstance(source, dict):
+            raise ValueError('invalid Sesh source handle')
+        digest = _source_handle_digest(source.get('tool'), source.get('arguments'))
+        if digest is None:
+            raise ValueError('invalid Sesh source handle')
+        if digest not in seen:
+            seen.add(digest)
+            digests.append(digest)
+            if len(digests) > SESH_MAX_DELIVERED_SOURCE_HANDLES:
+                raise ValueError('too many unique Sesh source handles')
+        additional = source.get('additional_sources', [])
+        if not isinstance(additional, list):
+            raise ValueError('invalid additional Sesh sources')
+        for item in additional:
+            add_source(item, depth + 1)
+
+    for result in results:
+        if not isinstance(result, dict):
+            raise ValueError('invalid Sesh result')
+        if 'source' not in result:
+            raise ValueError('missing Sesh result source')
+        add_source(result['source'])
+        evidence = result.get('evidence', [])
+        if not isinstance(evidence, list) or len(evidence) > 15:
+            raise ValueError('invalid Sesh evidence count')
+        for item in evidence:
+            if not isinstance(item, dict) or 'source' not in item:
+                raise ValueError('invalid Sesh evidence source')
+            add_source(item['source'])
+    return digests
+
+
+def is_sesh_search_tool(name):
+    return isinstance(name, str) and SESH_SEARCH_TOOL_PATTERN.fullmatch(name) is not None
+
+
+def _per_query_request_ids(body):
+    """Ids of a multi-question answer (per_query[i].search_request_id), in question order."""
+    per_query = body.get('per_query')
+    if not isinstance(per_query, list):
+        return []
+    found = []
+    for entry in per_query[:SESH_MAX_REQUEST_IDS]:
+        value = entry.get('search_request_id') if isinstance(entry, dict) else None
+        if isinstance(value, str) and SESH_UUID_PATTERN.fullmatch(value) is not None:
+            found.append(value)
+    return found
+
+
+def search_receipt_metadata(payload):
+    if not isinstance(payload, dict) or not is_sesh_search_tool(payload.get('tool_name')):
+        return {}
+    response = payload.get('tool_response')
+    if not isinstance(response, dict):
+        return {}
+    # Traverse only exact bounded handle fields; never passages or tool input.
+    bodies = _sesh_response_bodies(response)
+    if bodies is None:
+        return {}
+    ids = set()
+    all_ids = []
+    delivered_sets = []
+    delivered_invalid = False
+    for body in bodies:
+        value = body.get('search_request_id')
+        per_query = _per_query_request_ids(body)
+        if value is None and not per_query:
+            continue
+        if value is not None:
+            if not isinstance(value, str) or SESH_UUID_PATTERN.fullmatch(value) is None:
+                return {}
+            ids.add(value)
+        for item in ([value] if value is not None else []) + per_query:
+            if item not in all_ids:
+                all_ids.append(item)
+        if value is None:
+            continue
+        try:
+            delivered = _delivered_source_handle_digests(body)
+            if delivered is not None:
+                delivered_sets.append(delivered)
+        except (ValueError, TypeError, UnicodeError, RecursionError):
+            delivered_invalid = True
+    # Conflicting envelopes are ambiguous, never choose whichever appears first.
+    if len(ids) > 1 or not all_ids:
+        return {}
+    primary = ids.pop() if ids else all_ids[0]
+    ordered = [primary] + [item for item in all_ids if item != primary]
+    metadata = {'sesh_request_id': primary,
+                'sesh_request_ids': ordered[:SESH_MAX_REQUEST_IDS]}
+    if (not delivered_invalid and delivered_sets and
+            all(item == delivered_sets[0] for item in delivered_sets[1:])):
+        metadata['sesh_delivered_source_handle_sha256_v1'] = delivered_sets[0]
+    return metadata
+
+
+def _direct_source_open_tool(payload):
+    name = payload.get('tool_name') if isinstance(payload, dict) else None
+    if not isinstance(name, str):
+        return None
+    for namespace in ('e3_cosmos', 'e3', 'cosmos', 'cosmos_e3'):
+        prefix = f'mcp__{namespace}__'
+        if name == prefix + 'sesh__open_coding_session_source':
+            return 'open_coding_session_source'
+        if name == prefix + 'timetracker__get_chat':
+            return 'get_chat'
+    return None
+
+
+def _verified_sesh_source_open(payload, reference_id):
+    response = payload.get('tool_response')
+    bodies = _sesh_response_bodies(response)
+    if bodies is None:
+        return False
+    if (isinstance(response, dict) and
+            any(key in response for key in ('reference_id', 'message_id', 'verification')) and
+            response not in bodies):
+        bodies.append(response)
+    witnessed = False
+    expected_message = reference_id.rsplit(':', 1)[-1]
+    for body in bodies:
+        keys_present = any(key in body for key in ('reference_id', 'message_id', 'verification'))
+        if not keys_present:
+            continue
+        if (body.get('reference_id') != reference_id or
+                body.get('message_id') != expected_message or
+                body.get('verification') != 'exact_source_bytes'):
+            return False
+        witnessed = True
+    return witnessed
+
+
+def source_open_metadata(payload):
+    """Content-free source-handle correlation; never an authorization claim."""
+    try:
+        tool = _direct_source_open_tool(payload)
+        if tool is None:
+            return {}
+        arguments = payload.get('tool_input')
+        digest = _source_handle_digest(tool, arguments)
+        if digest is None:
+            return {}
+        success = tool_success(payload)
+        witness = 'failed' if success is False else 'unknown'
+        if (success is not False and tool == 'open_coding_session_source' and
+                _verified_sesh_source_open(payload, arguments['reference_id'])):
+            witness = 'verified'
+        return {'sesh_opened_source_handle_sha256_v1': digest,
+                'sesh_source_open_witness_v1': witness}
+    except (ValueError, TypeError, UnicodeError, RecursionError):
+        return {}
+
+
+def search_origin_metadata(payload: JsonDict) -> JsonDict:
+    """Client-observed session linkage, never an authorization or origin claim."""
+    context_id = first_string(payload, "session_id", "sessionId")
+    transcript = first_string(payload, "transcript_path", "transcriptPath")
+    if not context_id or not SESH_UUID_PATTERN.fullmatch(context_id) or not transcript:
+        return {}
+    path = Path(transcript)
+    if not path.is_absolute():
+        return {}
+    try:
+        # Read only the bounded session header, never tool bodies or passages.
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+        with os.fdopen(fd, "rb") as stream:
+            if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
+                return {}
+            raw = stream.readline(524289)
+        if len(raw) > 524288:
+            return {}
+        header = json.loads(raw, object_pairs_hook=_sesh_unique_object)
+        if not isinstance(header, dict) or header.get("type") != "session_meta":
+            return {}
+        meta = header.get("payload")
+        if not isinstance(meta, dict):
+            return {}
+        origin_id = meta.get("id")
+        if not isinstance(origin_id, str) or not SESH_UUID_PATTERN.fullmatch(origin_id):
+            return {}
+        if not path.name.endswith(f"-{origin_id}.jsonl"):
+            return {}
+        if "session_id" in meta and meta["session_id"] != context_id:
+            return {}
+        if context_id != origin_id:
+            source = meta.get("source")
+            subagent = source.get("subagent") if isinstance(source, dict) else None
+            spawn = subagent.get("thread_spawn") if isinstance(subagent, dict) else None
+            if isinstance(source, dict) and "subagent" in source and not isinstance(subagent, dict):
+                return {}
+            if isinstance(subagent, dict) and "thread_spawn" in subagent and not isinstance(spawn, dict):
+                return {}
+            parents = []
+            if "parent_thread_id" in meta:
+                parents.append(meta["parent_thread_id"])
+            if isinstance(spawn, dict) and "parent_thread_id" in spawn:
+                parents.append(spawn["parent_thread_id"])
+            if not parents or any(parent != context_id for parent in parents):
+                return {}
+        return {"sesh_origin_session_id": origin_id,
+                "sesh_context_session_id": context_id,
+                "sesh_origin_basis": "client_transcript_header_v1"}
+    except (OSError, ValueError, UnicodeError, RecursionError):
+        return {}
+
+
+def metadata_from_payload(payload: JsonDict) -> JsonDict:
+    metadata: JsonDict = {}
+    cwd = first_string(payload, "cwd") or os.getcwd()
+    if cwd:
+        metadata["cwd"] = cwd
+    for key in ("transcript_path", "model", "source"):
+        value = payload.get(key)
+        if isinstance(value, str) and value:
+            metadata[key] = value
+    return metadata
+
+
+def thread_id_from_payload(payload: JsonDict) -> str | None:
+    transcript_path = first_string(payload, "transcript_path", "transcriptPath")
+    return sha256_hex(transcript_path) if transcript_path else None
+
+
+def sha256_hex(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def tool_event_metadata(payload: JsonDict, *, phase: str) -> JsonDict:
+    tool = tool_name(payload)
+    if not tool:
+        return {}
+    metadata: JsonDict = {
+        "tool_name": tool,
+        "tool_phase": phase,
+    }
+    call_id = first_string(payload, "tool_call_id", "toolCallId", "call_id", "callId", "tool_use_id")
+    if call_id:
+        metadata["tool_call_id"] = call_id
+    return metadata
+
+
+def tool_name(payload: JsonDict) -> str:
+    for key in ("tool_name", "toolName", "name", "tool"):
+        value = payload.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    tool = payload.get("tool")
+    if isinstance(tool, dict) and isinstance(tool.get("name"), str):
+        return tool["name"].strip()
+    return ""
+
+
+SOURCE_OPEN_TOOLS = frozenset(
+    f"mcp__{namespace}__{tool}"
+    for namespace in ("e3_cosmos", "e3", "cosmos", "cosmos_e3")
+    for tool in ("timetracker__get_chat", "sesh__open_coding_session_source")
+)
+
+
+def tool_success(payload: JsonDict) -> bool | None:
+    reported = _reported_tool_success(payload)
+    if tool_name(payload) not in SOURCE_OPEN_TOOLS:
+        return reported
+    response = payload.get("tool_response")
+    # Inspect only the MCP envelope, never passage text or nested user content.
+    if isinstance(response, dict) and response.get("isError") is True:
+        return False
+    if any(payload.get(key) is False for key in ("success", "succeeded", "ok")):
+        return False
+    if any(isinstance(payload.get(key), str) and payload[key].strip().lower()
+           in {"failure", "failed", "error", "errored"}
+           for key in ("status", "result")):
+        return False
+    # A completed transport (including isError=false) does not prove that the
+    # requested source content was returned. Success needs a separate witness.
+    return None
+
+
+def _reported_tool_success(payload: JsonDict) -> bool | None:
+    for key in ("success", "succeeded", "ok"):
+        value = payload.get(key)
+        if isinstance(value, bool):
+            return value
+    status = first_string(payload, "status", "result")
+    if status:
+        normalized = status.strip().lower()
+        if normalized in {"success", "succeeded", "ok", "passed", "complete", "completed"}:
+            return True
+        if normalized in {"failure", "failed", "error", "errored"}:
+            return False
+    return None
+
+
+def codex_setup_snapshot() -> JsonDict:
+    config = read_codex_config()
+    snapshot: JsonDict = {
+        "settings": codex_settings(config),
+        "plugins": codex_plugins(config),
+        "skills": codex_skills(),
+        "mcp_servers": codex_mcp_servers(config),
+        "marketplaces": codex_marketplaces(config),
+        "apps": codex_apps(config),
+        "connections": codex_connections(config),
+    }
+    return {key: value for key, value in snapshot.items() if value not in ({}, [])}
+
+
+def codex_config_path() -> Path:
+    home = os.environ.get("CODEX_HOME")
+    base = Path(home).expanduser().resolve() if home else Path.home() / ".codex"
+    return base / "config.toml"
+
+
+def read_codex_config() -> JsonDict:
+    path = codex_config_path()
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except OSError:
+        return {}
+    if tomllib is not None:
+        try:
+            data = tomllib.loads(raw)
+        except Exception:
+            return fallback_codex_config(raw)
+        return data if isinstance(data, dict) else {}
+    return fallback_codex_config(raw)
+
+
+def fallback_codex_config(raw: str) -> JsonDict:
+    config: JsonDict = {
+        "plugins": {},
+        "mcp_servers": {},
+        "marketplaces": {},
+        "apps": {},
+    }
+    for match in re.finditer(r'^\[plugins\."([^"]+)"\]', raw, flags=re.MULTILINE):
+        config["plugins"][match.group(1)] = {"enabled": True}
+    for match in re.finditer(r"^\[mcp_servers\.([^\]\.]+)\]", raw, flags=re.MULTILINE):
+        config["mcp_servers"][match.group(1).strip('"')] = {}
+    for match in re.finditer(r"^\[marketplaces\.([^\]]+)\]", raw, flags=re.MULTILINE):
+        config["marketplaces"][match.group(1).strip('"')] = {}
+    for key in ("model", "service_tier", "sandbox_mode", "personality"):
+        match = re.search(rf'^{key}\s*=\s*"([^"]*)"', raw, flags=re.MULTILINE)
+        if match:
+            config[key] = match.group(1)
+    return config
+
+
+def codex_settings(config: JsonDict) -> JsonDict:
+    allowed = (
+        "model",
+        "model_reasoning_effort",
+        "plan_mode_reasoning_effort",
+        "service_tier",
+        "sandbox_mode",
+        "personality",
+    )
+    return {
+        key: value
+        for key in allowed
+        if isinstance((value := config.get(key)), str) and value
+    }
+
+
+def codex_plugins(config: JsonDict) -> list[JsonDict]:
+    plugins = config.get("plugins")
+    if not isinstance(plugins, dict):
+        return []
+    result: list[JsonDict] = []
+    for name, value in plugins.items():
+        if not isinstance(name, str):
+            continue
+        enabled = value.get("enabled") if isinstance(value, dict) else None
+        result.append({"name": name, "enabled": enabled is not False})
+    return sorted(result, key=lambda item: str(item["name"]))
+
+
+def codex_skills() -> list[JsonDict]:
+    result: list[JsonDict] = []
+    seen: set[tuple[str, str, str, str]] = set()
+    for skill_file in iter_skill_files():
+        item = skill_item_for_path(skill_file)
+        if not item:
+            continue
+        key = (
+            str(item.get("source") or ""),
+            str(item.get("marketplace") or ""),
+            str(item.get("plugin") or ""),
+            str(item.get("name") or ""),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(item)
+    return sorted(result, key=lambda item: json.dumps(item, sort_keys=True))
+
+
+def iter_skill_files() -> list[Path]:
+    roots = [
+        codex_config_path().parent / "skills",
+        agents_home_path() / "skills",
+        codex_config_path().parent / "plugins" / "cache",
+    ]
+    files: list[Path] = []
+    for root in roots:
+        try:
+            files.extend(path for path in root.rglob("SKILL.md") if path.is_file())
+        except OSError:
+            continue
+    return files
+
+
+def agents_home_path() -> Path:
+    home = os.environ.get("AGENTS_HOME")
+    return Path(home).expanduser().resolve() if home else Path.home() / ".agents"
+
+
+def skill_item_for_path(path: Path) -> JsonDict | None:
+    codex_home = codex_config_path().parent
+    agents_home = agents_home_path()
+    for base, source in ((codex_home / "skills", "user"), (agents_home / "skills", "agent")):
+        try:
+            rel = path.relative_to(base)
+        except ValueError:
+            continue
+        parts = rel.parts
+        if not parts:
+            return None
+        if parts[0] == ".system" and len(parts) > 1:
+            return {"name": parts[1], "source": "system"}
+        return {"name": parts[0], "source": source}
+
+    cache_root = codex_home / "plugins" / "cache"
+    try:
+        rel = path.relative_to(cache_root)
+    except ValueError:
+        return None
+    parts = rel.parts
+    if "skills" not in parts:
+        return None
+    skills_index = parts.index("skills")
+    if skills_index + 1 >= len(parts):
+        return None
+    item: JsonDict = {
+        "name": parts[skills_index + 1],
+        "source": "plugin",
+    }
+    if len(parts) > 0:
+        item["marketplace"] = parts[0]
+    if len(parts) > 1:
+        item["plugin"] = parts[1]
+    if len(parts) > 2 and skills_index >= 3:
+        item["version"] = parts[2]
+    return item
+
+
+def codex_mcp_servers(config: JsonDict) -> list[JsonDict]:
+    servers = config.get("mcp_servers")
+    if not isinstance(servers, dict):
+        return []
+    result: list[JsonDict] = []
+    for name, value in servers.items():
+        if not isinstance(name, str) or not isinstance(value, dict):
+            continue
+        transport = "url" if isinstance(value.get("url"), str) else "command" if isinstance(value.get("command"), str) else "unknown"
+        result.append({"name": name, "transport": transport})
+    return sorted(result, key=lambda item: str(item["name"]))
+
+
+def codex_marketplaces(config: JsonDict) -> list[JsonDict]:
+    marketplaces = config.get("marketplaces")
+    if not isinstance(marketplaces, dict):
+        return []
+    result: list[JsonDict] = []
+    for name, value in marketplaces.items():
+        if not isinstance(name, str):
+            continue
+        item: JsonDict = {"name": name}
+        if isinstance(value, dict) and isinstance(value.get("source_type"), str):
+            item["source_type"] = value["source_type"]
+        result.append(item)
+    return sorted(result, key=lambda item: str(item["name"]))
+
+
+def codex_apps(config: JsonDict) -> list[JsonDict]:
+    apps = config.get("apps")
+    if not isinstance(apps, dict):
+        return []
+    return [{"id": name} for name in sorted(name for name in apps if isinstance(name, str))]
+
+
+def codex_connections(config: JsonDict) -> list[JsonDict]:
+    apps = config.get("apps")
+    if not isinstance(apps, dict):
+        return []
+    result: list[JsonDict] = []
+    for app_id, value in apps.items():
+        if not isinstance(app_id, str):
+            continue
+        item: JsonDict = {"id": app_id}
+        if isinstance(value, dict) and isinstance(value.get("tools"), dict):
+            tools = sorted(name for name in value["tools"] if isinstance(name, str))
+            if tools:
+                item["tools"] = tools
+        result.append(item)
+    return sorted(result, key=lambda item: str(item["id"]))
+
+
+def should_capture_payload(payload: JsonDict) -> bool:
+    cwd = first_string(payload, "cwd") or os.getcwd()
+    remote = git_origin_remote(cwd)
+    if not remote_belongs_to_org(remote, ALLOWED_GITHUB_ORG):
+        return False
+    return not session_excluded(
+        first_string(payload, "session_id", "sessionId"),
+        first_string(payload, "transcript_path", "transcriptPath"),
+    )
+
+
+EXCLUSION_ANCESTOR_DEPTH = 8
+
+
+def excluded_session_ids() -> set[str]:
+    """Session ids the user excluded from capture, including their subagents.
+
+    Read from the logger's own list and from the Sherlock exclusion file, so a
+    session excluded once stays excluded from both collectors.
+    """
+    home = Path.home()
+    codex_home = Path(os.environ.get("CODEX_HOME") or home / ".codex").expanduser()
+    ids: set[str] = set()
+    for path in (codex_home / "session-logging" / "excluded_sessions.json",
+                 home / ".sherlock" / "session-exclusions.json"):
+        try:
+            loaded = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        values = loaded.get("excluded_session_ids") if isinstance(loaded, dict) else None
+        if isinstance(values, list):
+            ids.update(str(value).strip().lower() for value in values if isinstance(value, str))
+    return ids
+
+
+def transcript_parent_id(path: Path) -> str | None:
+    try:
+        with path.open("rb") as handle:
+            record = json.loads(handle.readline())
+    except (OSError, ValueError):
+        return None
+    payload = record.get("payload") if isinstance(record, dict) else None
+    parent = payload.get("parent_thread_id") if isinstance(payload, dict) else None
+    return str(parent).lower() if isinstance(parent, str) and parent else None
+
+
+def transcript_path_for_session(session_id: str) -> Path | None:
+    codex_home = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex").expanduser()
+    for root in (codex_home / "sessions", codex_home / "archived_sessions"):
+        matches = sorted(root.glob(f"**/*{session_id}.jsonl")) if root.is_dir() else []
+        if matches:
+            return matches[0]
+    return None
+
+
+def session_excluded(session_id: str | None, transcript_path: str | None = None) -> bool:
+    excluded = excluded_session_ids()
+    if not excluded:
+        return False
+    current = (session_id or "").strip().lower()
+    path = Path(transcript_path).expanduser() if transcript_path else None
+    for _ in range(EXCLUSION_ANCESTOR_DEPTH):
+        if current and current in excluded:
+            return True
+        if path is None and current:
+            path = transcript_path_for_session(current)
+        parent = transcript_parent_id(path) if path is not None else None
+        if not parent:
+            return False
+        current, path = parent, None
+    return False
+
+
+def should_prompt_collective(payload: JsonDict) -> bool:
+    source = first_string(payload, "source")
+    if not source or source.strip().lower() not in COLLECTIVE_SESSION_SOURCES:
+        return False
+    cwd = first_string(payload, "cwd") or os.getcwd()
+    remote = git_origin_remote(cwd)
+    return remote_belongs_to_org(remote, ALLOWED_GITHUB_ORG)
+
+
+def git_origin_remote(cwd: str) -> str | None:
+    result = subprocess.run(
+        ["git", "-C", cwd, "remote", "get-url", "origin"],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+    if result.returncode != 0:
+        return None
+    remote = result.stdout.strip()
+    return remote or None
+
+
+def remote_belongs_to_org(remote: str | None, org: str) -> bool:
+    return canonical_github_remote(remote, org) is not None
+
+
+def canonical_github_remote(remote: str | None, org: str) -> str | None:
+    """Return a GitHub canonical remote after verifying an allowed local alias."""
+    if not remote:
+        return None
+    value = remote.strip()
+    github_https = re.match(
+        rf"^https://github\.com/{re.escape(org)}/(?P<repository>[^/]+?)(?:\.git)?/?$",
+        value,
+        flags=re.IGNORECASE,
+    )
+    if github_https:
+        return canonical_github_url(org, github_https.group("repository"))
+
+    scp_style = re.match(
+        rf"^git@(?P<host>[^:/\s]+):{re.escape(org)}/(?P<repository>[^/]+?)(?:\.git)?/?$",
+        value,
+        flags=re.IGNORECASE,
+    )
+    ssh_url = re.match(
+        rf"^ssh://git@(?P<host>[^/\s:]+)(?::\d+)?/{re.escape(org)}/(?P<repository>[^/]+?)(?:\.git)?/?$",
+        value,
+        flags=re.IGNORECASE,
+    )
+    match = scp_style or ssh_url
+    if not match or not ssh_host_resolves_to_github(match.group("host")):
+        return None
+    return canonical_github_url(org, match.group("repository"))
+
+
+def canonical_github_url(org: str, repository: str) -> str:
+    return f"https://github.com/{org}/{repository}.git"
+
+
+@lru_cache(maxsize=32)
+def ssh_host_resolves_to_github(host: str) -> bool:
+    """Accept SSH aliases only when local SSH configuration resolves them to GitHub."""
+    if host.rstrip(".").lower() == "github.com":
+        return True
+    try:
+        result = subprocess.run(
+            ["ssh", "-G", host],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            check=False,
+            timeout=2,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    if result.returncode != 0:
+        return False
+    for line in result.stdout.splitlines():
+        key, separator, value = line.partition(" ")
+        if key.lower() == "hostname" and separator:
+            return value.strip().rstrip(".").lower() == "github.com"
+    return False
+
+
+def first_string(payload: JsonDict, *keys: str) -> str | None:
+    for key in keys:
+        value = payload.get(key)
+        if isinstance(value, str):
+            return value
+    return None
+
+
+def ensure_state_dir() -> Path:
+    base = state_dir()
+    base.mkdir(parents=True, exist_ok=True)
+    return base
+
+
+def state_dir() -> Path:
+    override = os.environ.get(STATE_DIR_ENV)
+    if override:
+        return Path(override).expanduser().resolve()
+    codex_home = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex")
+    return codex_home.expanduser().resolve() / "sesh" / "session-logging"  # sesh plugin: own state
+
+
+def next_sequence(base: Path, session_id: str) -> int:
+    path = base / "sessions" / session_id / "sequence.txt"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = path.with_suffix(".lock")
+    with lock_path.open("a", encoding="utf-8") as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        try:
+            try:
+                current = int(path.read_text(encoding="utf-8").strip() or "0")
+            except (FileNotFoundError, OSError, ValueError):
+                current = 0
+            value = current + 1
+            path.write_text(f"{value}\n", encoding="utf-8")
+            return value
+        finally:
+            fcntl.flock(handle, fcntl.LOCK_UN)
+
+
+def utf8_excerpt(content_bytes: bytes, *, limit: int = EXCERPT_BYTES) -> str:
+    return content_bytes[:limit].decode("utf-8", errors="replace")
+
+
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def safe_segment(value: str) -> str:
+    cleaned = "".join(char if char.isalnum() or char in "._-" else "-" for char in value.strip())
+    cleaned = "-".join(part for part in cleaned.split("-") if part)
+    return cleaned or "unknown"
+
+
+def bucket_name() -> str:
+    return os.environ.get(SUPABASE_BUCKET_ENV) or DEFAULT_BUCKET
+
+
+def write_json_atomic(path: Path, payload: JsonDict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + f".{uuid.uuid4().hex}.tmp")
+    tmp.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    tmp.replace(path)
+
+
+def append_jsonl(path: Path, payload: JsonDict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(payload, sort_keys=True) + "\n")
+
+
+def enqueue_record(base: Path, record: JsonDict) -> None:
+    write_json_atomic(queue_record_path(base, record), record)
+
+
+def queue_record_path(base: Path, record: JsonDict) -> Path:
+    record_id = safe_segment(str(record["id"]))
+    return pending_queue_dir(base) / f"{record_id}.json"
+
+
+def pending_queue_paths(base: Path) -> list[Path]:
+    return sorted(pending_queue_dir(base).glob("*.json"))
+
+
+def pending_queue_dir(base: Path) -> Path:
+    return base / "queue" / "pending"
+
+
+def processing_queue_dir(base: Path) -> Path:
+    return base / "queue" / "processing"
+
+
+def dead_letter_queue_dir(base: Path) -> Path:
+    return base / "queue" / "dead-letter"
+
+
+def read_json_file(path: Path) -> JsonDict:
+    loaded = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(loaded, dict):
+        raise ValueError(f"{path} does not contain a JSON object")
+    return loaded
+
+
+def migrate_legacy_queue(base: Path) -> None:
+    queue_path = base / "queue.jsonl"
+    records = read_jsonl(queue_path)
+    for record in records:
+        enqueue_record(base, record)
+    if records:
+        queue_path.unlink(missing_ok=True)
+    for legacy_path in sorted((base / "queue").glob("*.json")):
+        target = pending_queue_dir(base) / legacy_path.name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            legacy_path.replace(target)
+        except FileNotFoundError:
+            continue
+
+
+def recover_processing_records(base: Path) -> None:
+    pending_dir = pending_queue_dir(base)
+    pending_dir.mkdir(parents=True, exist_ok=True)
+    for processing_path in sorted(processing_queue_dir(base).glob("*.json")):
+        try:
+            processing_path.replace(pending_dir / processing_path.name)
+        except FileNotFoundError:
+            continue
+
+
+def claim_queue_path(path: Path, base: Path) -> Path | None:
+    claimed_path = processing_queue_dir(base) / path.name
+    claimed_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        path.replace(claimed_path)
+    except FileNotFoundError:
+        return None
+    return claimed_path
+
+
+@contextlib.contextmanager
+def drain_lock(base: Path):
+    lock_path = base / "queue" / "drain.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a", encoding="utf-8") as handle:
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            yield False
+            return
+        try:
+            yield True
+        finally:
+            fcntl.flock(handle, fcntl.LOCK_UN)
+
+
+def drain_queue(progress_callback: Callable[[JsonDict], None] | None = None) -> JsonDict:
+    base = ensure_state_dir()
+    with drain_lock(base) as acquired:
+        if not acquired:
+            return {
+                "uploaded": 0,
+                "failed": 0,
+                "dead_lettered": 0,
+                "remaining": len(pending_queue_paths(base)),
+                "locked": True,
+            }
+
+        migrate_legacy_queue(base)
+        recover_processing_records(base)
+        uploaded = 0
+        failed = 0
+        dead_lettered = 0
+        failed_record_names: set[str] = set()
+        uploader: IngestUploader | None = None
+        with ThreadPoolExecutor(max_workers=upload_worker_count()) as executor:
+            while True:
+                queue_paths = [path for path in pending_queue_paths(base) if path.name not in failed_record_names]
+                if not queue_paths:
+                    break
+                if uploader is None:
+                    uploader = IngestUploader.from_env()
+                claimed_paths = [
+                    claimed
+                    for path in queue_paths
+                    if (claimed := claim_queue_path(path, base)) is not None
+                ]
+                for status, record_name in executor.map(
+                    lambda path: upload_claimed_record(path, uploader=uploader, base=base),
+                    claimed_paths,
+                ):
+                    if status == "uploaded":
+                        uploaded += 1
+                    elif status == "dead_lettered":
+                        dead_lettered += 1
+                    else:
+                        failed += 1
+                        failed_record_names.add(record_name)
+                    if progress_callback:
+                        progress_callback({
+                            "uploaded": uploaded,
+                            "failed": failed,
+                            "dead_lettered": dead_lettered,
+                            "remaining": len(pending_queue_paths(base))
+                            + len(list(processing_queue_dir(base).glob("*.json"))),
+                        })
+        return {
+            "uploaded": uploaded,
+            "failed": failed,
+            "dead_lettered": dead_lettered,
+            "remaining": len(pending_queue_paths(base)),
+        }
+
+
+def upload_worker_count() -> int:
+    try:
+        return min(32, max(1, int(os.environ.get(UPLOAD_WORKERS_ENV, "4"))))
+    except ValueError:
+        return 4
+
+
+def upload_claimed_record(
+    claimed_path: Path,
+    *,
+    uploader: "IngestUploader",
+    base: Path,
+) -> tuple[str, str]:
+    record: JsonDict | None = None
+    try:
+        record = read_json_file(claimed_path)
+        with session_upload_lock(str(record.get("session_id") or "unknown-session")):
+            uploader.upload_message(record, base=base)
+    except PermanentUploadError as exc:
+        if record is None:
+            target = dead_letter_queue_dir(base) / claimed_path.name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            claimed_path.replace(target)
+        else:
+            dead_letter_record(base, record, claimed_path, exc)
+        return "dead_lettered", claimed_path.name
+    except Exception as exc:  # noqa: BLE001 - uploader must preserve queue on any failure.
+        if record is None:
+            claimed_path.replace(pending_queue_dir(base) / claimed_path.name)
+        else:
+            record["last_upload_error"] = str(exc)
+            record["last_upload_failed_at"] = now_iso()
+            enqueue_record(base, record)
+            claimed_path.unlink(missing_ok=True)
+        return "failed", claimed_path.name
+    (dead_letter_queue_dir(base) / claimed_path.name).unlink(missing_ok=True)
+    claimed_path.unlink(missing_ok=True)
+    return "uploaded", claimed_path.name
+
+
+def dead_letter_record(base: Path, record: JsonDict, source_path: Path, exc: Exception) -> None:
+    failed_at = now_iso()
+    record["last_upload_error"] = str(exc)
+    record["last_upload_failed_at"] = failed_at
+    record["dead_letter_reason"] = "permanent_upload_failure"
+    record["dead_lettered_at"] = failed_at
+    write_json_atomic(dead_letter_queue_dir(base) / source_path.name, record)
+    source_path.unlink(missing_ok=True)
+
+
+def session_upload_lock(session_id: str) -> threading.Lock:
+    with _SESSION_UPLOAD_LOCKS_GUARD:
+        return _SESSION_UPLOAD_LOCKS.setdefault(session_id, threading.Lock())
+
+
+def try_auto_drain() -> None:
+    if not upload_configured():
+        return
+    try:
+        spawn_drain()
+    except Exception as exc:  # noqa: BLE001 - capture must not fail because remote upload is unavailable.
+        append_jsonl(ensure_state_dir() / "upload_errors.jsonl", {"created_at": now_iso(), "error": str(exc)})
+
+
+def upload_configured() -> bool:
+    return auto_upload_enabled() and bool(ingest_url())
+
+
+def auto_upload_enabled() -> bool:
+    explicit = os.environ.get(AUTO_UPLOAD_ENV)
+    if explicit is not None:
+        enabled = explicit.strip().lower() not in {"0", "false", "no", "off"}
+        persist_auto_upload_preference(enabled)
+        return enabled
+    try:
+        preference = read_json_file(auto_upload_preference_path()).get("enabled")
+    except (FileNotFoundError, OSError, ValueError, json.JSONDecodeError):
+        preference = None
+    return preference if isinstance(preference, bool) else True
+
+
+def auto_upload_preference_path() -> Path:
+    codex_home = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex").expanduser().resolve()
+    return codex_home / "session-logging" / "preferences.json"
+
+
+def persist_auto_upload_preference(enabled: bool) -> None:
+    path = auto_upload_preference_path()
+    try:
+        existing = read_json_file(path)
+    except (FileNotFoundError, OSError, ValueError, json.JSONDecodeError):
+        existing = {}
+    if existing.get("enabled") is enabled:
+        return
+    write_json_atomic(path, {"enabled": enabled})
+    os.chmod(path, 0o600)
+
+
+def spawn_drain() -> None:
+    script = Path(__file__).with_name("drain_queue.py")
+    subprocess.Popen(
+        [sys.executable, str(script)],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        close_fds=True,
+        start_new_session=True,
+    )
+
+
+def read_jsonl(path: Path) -> list[JsonDict]:
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except FileNotFoundError:
+        return []
+    records: list[JsonDict] = []
+    for line in lines:
+        if not line.strip():
+            continue
+        try:
+            loaded = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(loaded, dict):
+            records.append(loaded)
+    return records
+
+
+def rewrite_jsonl(path: Path, records: list[JsonDict]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("".join(json.dumps(record, sort_keys=True) + "\n" for record in records), encoding="utf-8")
+
+
+def ingest_url() -> str:
+    return os.environ.get(INGEST_URL_ENV) or DEFAULT_INGEST_URL
+
+
+def build_ingest_payload(record: JsonDict, *, base: Path) -> JsonDict:
+    inline_usage = record.get("usage")
+    if record.get("type") == "usage" and isinstance(inline_usage, dict):
+        detail = inline_usage
+        payload_record = {
+            key: value
+            for key, value in record.items()
+            if key != "usage"
+        }
+    else:
+        detail = read_json_file(base / str(record["local_content_path"]))
+        payload_record = record
+    payload = {
+        "version": 1,
+        "plugin": {
+            "name": PLUGIN_NAME,  # sesh plugin
+            "version": PLUGIN_VERSION,
+        },
+        "record": payload_record,
+        "client": client_context(record, base=base),
+    }
+    if record.get("event_type") == "rollout_chunk":
+        payload["kind"] = "rollout_chunk"
+        payload["rollout_chunk"] = detail
+    elif record.get("type") == "event":
+        payload["event"] = detail
+    elif record.get("type") == "usage":
+        payload["usage"] = detail
+    else:
+        payload["message"] = detail
+    return payload
+
+
+def client_context(record: JsonDict, *, base: Path) -> JsonDict:
+    metadata = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
+    cwd = metadata.get("cwd") if isinstance(metadata.get("cwd"), str) else None
+    git_email = git_config_value(cwd, "user.email")
+    hostname = local_hostname()
+    username = local_username()
+    installation_id = local_installation_id(base)
+    remote = metadata.get("repo_remote") or (git_origin_remote(cwd) if cwd else None)
+    canonical_remote = canonical_github_remote(
+        str(remote) if isinstance(remote, str) else None,
+        ALLOWED_GITHUB_ORG,
+    )
+    context: JsonDict = {
+        "cwd": cwd,
+        "repo_remote": canonical_remote or remote,
+        "git_email": git_email,
+        "git_user_name": git_config_value(cwd, "user.name"),
+        "git_branch": metadata.get("git_branch")
+        or (current_git_branch(cwd) if cwd else None),
+        "linear_user_name": saved_linear_user_name(),
+        "hostname": hostname,
+        "local_username": username,
+        "installation_id": installation_id,
+    }
+    identity_key = client_identity_key(
+        git_email=git_email,
+        installation_id=installation_id,
+        local_username=username,
+        hostname=hostname,
+    )
+    if identity_key:
+        context["identity_key"] = identity_key
+    return {key: value for key, value in context.items() if value}
+
+
+def local_installation_id(base: Path) -> str:
+    path = base / "installation_id"
+    try:
+        existing = path.read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        existing = ""
+    if existing:
+        path.chmod(0o600)
+        return existing
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = path.with_suffix(".lock")
+    with lock_path.open("a", encoding="utf-8") as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        try:
+            try:
+                existing = path.read_text(encoding="utf-8").strip()
+            except FileNotFoundError:
+                existing = ""
+            if existing:
+                path.chmod(0o600)
+                return existing
+
+            value = logger_installation_id() or str(uuid.uuid4())  # sesh plugin: same identity
+            tmp = path.with_name(f"{path.name}.{uuid.uuid4().hex}.tmp")
+            descriptor = os.open(
+                tmp,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                0o600,
+            )
+            with os.fdopen(descriptor, "w", encoding="utf-8") as temporary:
+                temporary.write(f"{value}\n")
+            tmp.replace(path)
+            return value
+        finally:
+            fcntl.flock(handle, fcntl.LOCK_UN)
+
+
+def logger_installation_id() -> str | None:  # sesh plugin: reuse the logger's id if present
+    codex_home = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex").expanduser()  # sesh plugin
+    try:  # sesh plugin
+        value = (codex_home / "session-logging" / "installation_id").read_text(encoding="utf-8").strip()  # sesh plugin
+    except (OSError, UnicodeError):  # sesh plugin
+        return None  # sesh plugin
+    try:  # sesh plugin
+        return value if uuid.UUID(value).version == 4 and str(uuid.UUID(value)) == value else None  # sesh plugin
+    except ValueError:  # sesh plugin
+        return None  # sesh plugin
+
+
+def client_identity_key(
+    *,
+    git_email: str | None,
+    installation_id: str | None,
+    local_username: str | None,
+    hostname: str | None,
+) -> str | None:
+    if git_email:
+        return f"git_email:{git_email.strip().lower()}"
+    if installation_id:
+        return f"installation:{installation_id.strip()}"
+    if local_username and hostname:
+        return f"local:{local_username.strip()}@{hostname.strip()}"
+    if local_username:
+        return f"local_username:{local_username.strip()}"
+    if hostname:
+        return f"hostname:{hostname.strip()}"
+    return None
+
+
+def saved_linear_user_name() -> str | None:
+    path = codex_config_path().parent / "linear-sync" / "user.json"
+    try:
+        loaded = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(loaded, dict):
+        return None
+    value = loaded.get("linear_name")
+    if not isinstance(value, str):
+        return None
+    stripped = value.strip()
+    return stripped or None
+
+
+def git_config_value(cwd: str | None, key: str) -> str | None:
+    commands = []
+    if cwd:
+        commands.append(["git", "-C", cwd, "config", "--get", key])
+    commands.append(["git", "config", "--global", "--get", key])
+    for command in commands:
+        result = subprocess.run(
+            command,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return result.stdout.strip()
+    return None
+
+
+def current_git_branch(cwd: str) -> str | None:
+    result = subprocess.run(
+        ["git", "-C", cwd, "branch", "--show-current"],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+    if result.returncode != 0:
+        return None
+    value = result.stdout.strip()
+    return value or None
+
+
+def local_hostname() -> str | None:
+    try:
+        return socket.gethostname() or None
+    except OSError:
+        return None
+
+
+def local_username() -> str | None:
+    try:
+        return getpass.getuser() or None
+    except (KeyError, OSError):
+        return None
+
+
+class IngestUploader:
+    def __init__(self, *, url: str, token: str | None = None) -> None:
+        self.url = url
+        self.token = token
+
+    @classmethod
+    def from_env(cls) -> "IngestUploader":
+        return cls(url=ingest_url(), token=os.environ.get(INGEST_TOKEN_ENV))
+
+    def upload_message(self, record: JsonDict, *, base: Path) -> None:
+        payload = build_ingest_payload(record, base=base)
+        validate_ingest_payload(payload)
+        try:
+            self.post(payload)
+        except PermanentUploadError as exc:
+            # During an automatic plugin rollout, clients can briefly reach the
+            # previous Edge Function, which reports an unknown rollout kind as
+            # HTTP 400. Retain lossless chunks for a later hook instead of
+            # dead-lettering data before the new ingest function is deployed.
+            if (
+                payload.get("kind") == "rollout_chunk"
+                and exc.status == 400
+                and "event must be an object" in str(exc)
+            ):
+                raise RuntimeError(str(exc)) from exc
+            raise
+
+    def post(self, payload: JsonDict) -> None:
+        headers = {
+            "content-type": "application/json",
+            "connection": "close",
+            "user-agent": f"{PLUGIN_NAME}/{PLUGIN_VERSION}",  # sesh plugin
+        }
+        if self.token:
+            headers["x-codex-session-log-token"] = self.token
+        self.request(
+            self.url,
+            method="POST",
+            data=json.dumps(payload).encode("utf-8"),
+            headers=headers,
+        )
+
+    def request(self, url: str, *, method: str, data: bytes, headers: dict[str, str]) -> bytes:
+        request = urllib.request.Request(url, data=data, headers=headers, method=method)
+        try:
+            with urllib.request.urlopen(request, timeout=30):
+                return b""
+        except urllib.error.HTTPError as exc:
+            body = exc.read().decode("utf-8", errors="replace")
+            message = f"Codex session ingest failed {exc.code}: {body}"
+            if exc.code in PERMANENT_HTTP_STATUSES:
+                raise PermanentUploadError(message, status=exc.code) from exc
+            raise RuntimeError(message) from exc
+
+
+class PermanentUploadError(RuntimeError):
+    def __init__(self, message: str, *, status: int | None = None) -> None:
+        super().__init__(message)
+        self.status = status
+
+
+def validate_ingest_payload(payload: JsonDict) -> None:
+    client = payload.get("client")
+    if not isinstance(client, dict) or not non_empty_string(client.get("repo_remote")):
+        raise PermanentUploadError("client.repo_remote must be a non-empty string")
+
+
+def non_empty_string(value: object) -> bool:
+    return isinstance(value, str) and len(value) > 0
+
+
+if __name__ == "__main__":
+    main()
