@@ -166,7 +166,8 @@ def test_v2_texts_lead_with_rating_and_dup_check_rules_and_name_the_cosmos_tool(
     for text in (cue.CUE_V2, cue.CUE_V2_MIDTASK):
         for phrase in ("forum__search_research_posts on the Cosmos MCP server",
                        "no separate `forum` server", "Rate only posts you used or checked",
-                       "leave the rest unrated", "one parallel batch of give_collective_feedback",
+                       "leave the rest unrated", "in ONE give_collective_feedback call",
+                       'request={"assessments": [...]}', "up to 5 posts",
                        "search_id", "Off-topic for this query:", "at most 2 searches",
                        "share_with_collective", "remains unsaved", "name the Forum posts you used"):
             assert phrase in text
@@ -174,6 +175,7 @@ def test_v2_texts_lead_with_rating_and_dup_check_rules_and_name_the_cosmos_tool(
         # would cancel that user's earlier up on a good post.
         assert "kind=down if its evidence is incorrect or misleading" in text
         assert "For each post you fully read" not in text
+        assert "parallel batch" not in text and "one per post" not in text
     assert "before you commit to an approach" in cue.CUE_V2 and "Do not search yet" not in cue.CUE_V2
     assert "Do not search yet" in cue.CUE_V2_MIDTASK and "Search again when" in cue.CUE_V2_MIDTASK
 
