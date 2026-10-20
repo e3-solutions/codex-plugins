@@ -68,6 +68,39 @@ change.
 `E3_SESH_HOOK_OWNER=sesh` or `E3_SESH_HOOK_OWNER=codex-session-logging` forces the choice, for
 testing.
 
+## Install by hand (until Jolly Roger delivers it)
+
+One command, on a Mac or Linux machine with Codex, Python 3 and Git access to this repository:
+
+```sh
+(d="$(mktemp -d)" && trap 'rm -rf "$d"' EXIT && git clone -q https://github.com/e3-solutions/codex-plugins.git "$d/codex-plugins" && python3 "$d/codex-plugins/plugins/sesh/install.py")
+```
+
+Then start a new Codex thread, and trust the sesh hooks once if Codex asks.
+
+`install.py` installs this plugin as pinned in the script (commit `f22c6ec`, version `0.1.0`), using
+the same Codex commands as `setup.py`:
+
+- It writes a private local marketplace `e3-sesh` at `~/.codex/sesh/marketplace/<commit>/` from
+  `git archive` of that commit, then runs `codex plugin marketplace add` and `codex plugin add sesh@e3-sesh`.
+  Codex puts the plugin in `~/.codex/plugins/cache/e3-sesh/sesh/0.1.0/` and enables it in `config.toml`.
+- It is safe to rerun. A rerun repairs a disabled plugin, a missing cache or a changed marketplace
+  copy, and otherwise changes nothing.
+- It touches no other plugin or marketplace and checks that afterwards. It writes no `hooks.json`
+  and installs no scheduler, so there are no automatic updates. Rerun it after a version bump.
+- With or without Codex Session Logging. When the logger is active, sesh steps aside (above).
+- If another `sesh` plugin is already installed (for example `sesh@jolly-roger-sesh`), it does nothing.
+- Jolly Roger's legacy retirement removes only `@coreedge-local` plugins, the `coreedge-local`
+  marketplace and its cache, so it leaves `sesh@e3-sesh` in place.
+- `python3 plugins/sesh/install.py --uninstall` removes `sesh@e3-sesh`, the `e3-sesh` marketplace
+  and its copy, and keeps the Sesh queue in `~/.codex/sesh/session-logging`.
+
+When the Jolly Roger catalog starts delivering `sesh`, run `--uninstall` first: the catalog
+refuses to add a plugin whose name is already installed from another marketplace.
+
+The session's `environment_snapshot` then shows `marketplace: "e3-sesh"` for a by-hand install
+and `"jolly-roger-sesh"` for a Jolly Roger one, so the query above tells them apart.
+
 ## Shipping through Jolly Roger (for Arya)
 
 It is built for the native plugin catalog in jolly-roger #10:
