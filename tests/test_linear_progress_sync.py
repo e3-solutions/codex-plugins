@@ -2112,7 +2112,7 @@ def test_current_marketplace_upgrades_previous_release_and_activates_prompt(tmp_
     manifest.write_text(
         json.dumps(
             {
-                "version": "0.3.39",
+                "version": "0.3.40",
                 "archive_url": archive.as_uri(),
                 "sha256": digest,
                 "plugin_subdir": "plugins/linear-progress-sync",
@@ -2129,7 +2129,7 @@ def test_current_marketplace_upgrades_previous_release_and_activates_prompt(tmp_
         force=True,
         install_hooks=False,
     )
-    new_linear = cache_parent / "0.3.39"
+    new_linear = cache_parent / "0.3.40"
     second = update_plugin.run_update(
         current_plugin_root=new_linear,
         cache_parent=cache_parent,
@@ -2157,7 +2157,7 @@ def test_current_marketplace_upgrades_previous_release_and_activates_prompt(tmp_
     assert first["updated"] is True
     assert second["updated"] is False
     assert second["skipped"] == "current"
-    assert sorted(path.name for path in cache_parent.iterdir() if not path.name.startswith(".")) == ["0.3.39"]
+    assert sorted(path.name for path in cache_parent.iterdir() if not path.name.startswith(".")) == ["0.3.40"]
     codex_versions = cache_root / "codex-session-logging"
     assert sorted(path.name for path in codex_versions.iterdir() if not path.name.startswith(".")) == ["0.2.39"]
     assert installed_prompt.read_bytes() == (
@@ -2326,7 +2326,7 @@ def test_legacy_upgrade_keeps_presence_scheduler_decommissioned(tmp_path, monkey
     manifest.write_text(
         json.dumps(
             {
-                "version": "0.3.39",
+                "version": "0.3.40",
                 "archive_url": archive.as_uri(),
                 "sha256": hashlib.sha256(archive.read_bytes()).hexdigest(),
                 "plugin_subdir": "plugins/linear-progress-sync",
@@ -2382,8 +2382,8 @@ def test_legacy_upgrade_keeps_presence_scheduler_decommissioned(tmp_path, monkey
     resident_root = codex_home / "coreedge"
 
     assert first_cycle.returncode == 0, first_cycle.stderr
-    assert json.loads(first_cycle.stdout)["resident"]["version"] == "0.3.39"
-    assert (resident_root / "runtime" / "current").resolve().name == "0.3.39"
+    assert json.loads(first_cycle.stdout)["resident"]["version"] == "0.3.40"
+    assert (resident_root / "runtime" / "current").resolve().name == "0.3.40"
     assert not (home / "Library" / "LaunchAgents" / "com.coreedge.codex-session-presence.plist").exists()
 
     second_cycle = subprocess.run(
@@ -3223,12 +3223,12 @@ def test_real_marketplace_activates_in_isolated_codex_home_and_passes_doctor(tmp
         platform="unsupported",
     )
 
-    assert activation["version"] == "0.3.39"
+    assert activation["version"] == "0.3.40"
     assert health["healthy"] is True
     assert health["issues"] == []
     assert health["cache_versions"] == {
         "codex-session-logging": ["0.2.39"],
-        "linear-progress-sync": ["0.3.39"],
+        "linear-progress-sync": ["0.3.40"],
     }
     assert subprocess.run(["sh", "-n", str(resident_root / "run.sh")], check=False).returncode == 0
 
@@ -3245,7 +3245,7 @@ def test_resident_hook_repairs_matching_cache_and_runtime_corruption_from_manage
         platform="unsupported",
     )
     managed = resident_root / "marketplace/current/plugins/linear-progress-sync"
-    cache = codex_home / "plugins/cache/coreedge-local/linear-progress-sync/0.3.39"
+    cache = codex_home / "plugins/cache/coreedge-local/linear-progress-sync/0.3.40"
     runtime = resident_root / "runtime/current"
     corrupt_content = (managed / "scripts/linear_sync.py").read_bytes()
     (cache / "scripts/update_plugin.py").write_bytes(corrupt_content)
@@ -4534,7 +4534,7 @@ def test_resident_doctor_reports_content_corruption_and_unloaded_service(tmp_pat
     broken_cache_script = (
         cache_root
         / "linear-progress-sync"
-        / "0.3.39"
+        / "0.3.40"
         / "scripts"
         / "update_plugin.py"
     )
@@ -5189,3 +5189,53 @@ def test_codex_worker_disables_sesh_startup_search(monkeypatch, tmp_path):
     sesh_spec.loader.exec_module(sesh_context)
     monkeypatch.setenv("E3_SESH_CONTEXT_ENABLED", captured["env"]["E3_SESH_CONTEXT_ENABLED"])
     assert sesh_context.sesh_context({"source": "startup", "cwd": str(tmp_path)}) is None
+
+
+@pytest.mark.parametrize("branch,known,expected,automatic", [
+    ("arya/fix-utf-8-COR-123", ["COR-999"], "COR-123", True),
+    ("arya/COR-123-fix-utf-8", ["COR-999"], "COR-123", True),
+    ("feature/api-2-refactor", ["COR-999"], "API-2", False),
+    ("arya/fix-utf-8-COR-123", [], "COR-123", False),
+    ("feature/api-2-refactor", [], "API-2", False),
+    ("arya/cor-123-and-cor-456", ["COR-999"], "COR-456", False),
+])
+def test_branch_ticket_candidates_need_evidence(tmp_path, monkeypatch, branch, known, expected, automatic):
+    monkeypatch.setenv("LINEAR_SYNC_STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setenv("LINEAR_SYNC_CONFIG_DIR", str(tmp_path / "config"))
+    state = linear_sync.default_state()
+    state["stale_issue_cache"]["issues"] = [{"identifier": key} for key in known]
+    inference = linear_sync.infer_issue({"branch": branch}, state, root=tmp_path)
+    assert inference.issue_key == expected
+    assert (inference.confidence >= 0.8) is automatic
+
+
+def test_ambiguous_branch_is_held_without_executing_worker(tmp_path, monkeypatch):
+    monkeypatch.setenv("LINEAR_SYNC_STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setenv("LINEAR_SYNC_CONFIG_DIR", str(tmp_path / "config"))
+    save_linear_user(tmp_path, monkeypatch)
+    repo = init_git_repo(tmp_path / "repo", branch="arya/cor-123-work")
+    linear_sync.enqueue_event("post_commit", {
+        "id": "ambiguous", "branch": "feature/api-2-refactor", "commit_sha": "abc",
+    }, root=repo)
+    calls = []
+    result = linear_sync.drain_once(root=repo, executor=lambda *args: calls.append(args) or linear_sync.WorkerResult(True, "ok"))
+    assert calls == []
+    assert result["reviewed"] == 1
+
+
+def test_branch_ticket_corroborated_by_commit_keeps_automatic_sync(tmp_path, monkeypatch):
+    monkeypatch.setenv("LINEAR_SYNC_STATE_DIR", str(tmp_path / "state"))
+    inference = linear_sync.infer_issue({
+        "branch": "arya/cor-123-fix-utf-8", "commit_subject": "COR-123: fix encoding",
+    }, linear_sync.default_state(), root=tmp_path)
+    assert inference.issue_key == "COR-123"
+    assert inference.confidence >= 0.8
+
+
+@pytest.mark.parametrize("known,subject", [([], "Refactor api-2 helper"), (["COR-999"], "API-2 helper")])
+def test_unknown_branch_prefix_is_not_verified_by_slug_repetition(tmp_path, monkeypatch, known, subject):
+    monkeypatch.setenv("LINEAR_SYNC_STATE_DIR", str(tmp_path / "state"))
+    state = linear_sync.default_state()
+    state["stale_issue_cache"]["issues"] = [{"identifier": key} for key in known]
+    inference = linear_sync.infer_issue({"branch": "feature/api-2-refactor", "commit_subject": subject}, state, root=tmp_path)
+    assert inference.confidence < 0.8

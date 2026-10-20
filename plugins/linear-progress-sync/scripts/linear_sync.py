@@ -974,15 +974,37 @@ def infer_issue(event: JsonDict, state: JsonDict | None = None, *, root: str | P
     if explicit_key:
         return with_cached_status(IssueInference(explicit_key, 1.0, "explicit event issue key"), local_state)
 
-    branch = str(event.get("branch") or current_branch(root) or "")
-    key = first_issue_key(branch)
-    if key:
-        return with_cached_status(IssueInference(key, 0.95, "issue key found in branch name"), local_state)
-
     commit_text = "\n".join(
         str(event.get(name) or "")
         for name in ("commit_subject", "commit_body", "message", "summary")
     )
+    branch = str(event.get("branch") or current_branch(root) or "")
+    candidates = list(dict.fromkeys(match.group(1).upper() for match in ISSUE_RE.finditer(branch)))
+    if candidates:
+        # Bindings store display names (e.g. "Engineering"), not team keys.
+        # Reuse identifiers already returned by Linear rather than guessing a
+        # prefix from a display name or adding another configuration setting.
+        cached_issues = (local_state.get("stale_issue_cache") or {}).get("issues") or []
+        known_prefixes = {
+            key.rsplit("-", 1)[0]
+            for issue in cached_issues if isinstance(issue, dict)
+            if (key := first_issue_key(issue_identifier(issue)))
+        }
+        known = [key for key in candidates if key.rsplit("-", 1)[0] in known_prefixes]
+        explicit_commit_keys = {
+            match.group(1) for match in ISSUE_RE.finditer(commit_text)
+            if match.group(1).isupper()
+        }
+        corroborated = [key for key in candidates if key in explicit_commit_keys]
+        # A cache is not an exhaustive team list, so hold unknown prefixes for
+        # review rather than discarding the event or trusting a slug match.
+        verified = known if known_prefixes else corroborated
+        preferred = verified or candidates
+        key = preferred[-1]
+        confident = len(preferred) == 1 and bool(verified)
+        reason = "issue key found in branch name" if confident else "unverified or ambiguous branch issue key; review required"
+        return with_cached_status(IssueInference(key, 0.95 if confident else 0.65, reason), local_state)
+
     key = first_issue_key(commit_text)
     if key:
         return with_cached_status(IssueInference(key, 0.9, "issue key found in commit/message text"), local_state)

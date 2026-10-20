@@ -130,6 +130,8 @@ Inspect updater health and activation drift:
 python3 ~/.codex/coreedge/runtime/current/update_plugin.py --doctor
 ```
 
+Resident release `0.3.40`: Branch-derived Linear keys now use cached team prefixes or matching commit evidence; ambiguous and unverified keys are held for review.
+
 ## Rolling Out Updates
 
 Teammates install this repository once with `setup.py`. After that, they should not need to reinstall from the marketplace for normal plugin, skill, command, hook, or extension updates.
