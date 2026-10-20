@@ -130,6 +130,8 @@ Inspect updater health and activation drift:
 python3 ~/.codex/coreedge/runtime/current/update_plugin.py --doctor
 ```
 
+Release `0.3.40` accompanies Claude Session Logging `0.2.20`, delivered through its own daily marketplace auto-update. Claude usage counts repeated assistant transcript lines once per API message id, with bounded ids persisted in the cursor.
+
 ## Rolling Out Updates
 
 Teammates install this repository once with `setup.py`. After that, they should not need to reinstall from the marketplace for normal plugin, skill, command, hook, or extension updates.

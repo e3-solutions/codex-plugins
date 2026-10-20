@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import fcntl
 import json
+from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator
@@ -35,6 +36,7 @@ import session_logging
 JsonDict = dict[str, Any]
 
 SYNC_VERSION = 1
+MAX_SEEN_MESSAGE_IDS = 1024
 # Live records must NOT be tagged historical_transcript, or the shared ingest
 # drops them (see ``isHistoricalBackfill`` in the edge function). Use a distinct
 # source so the message/usage rows are written server-side.
@@ -80,7 +82,8 @@ def sync_transcript_records(
     totals), processes only newer lines, emits one ``message`` record per
     user-prompt or assistant-response TEXT turn (tool-result turns and empty
     text turns are skipped), and emits an immutable cumulative ``usage`` record
-    for every new assistant usage snapshot. Then it persists the cursor.
+    once per assistant API message id (or per line when no id is present).
+    Then it persists the cursor, including a bounded recent-message id window.
     Observation-specific deterministic ids + cursor make re-runs a no-op.
 
     ``source`` stamps ``metadata.source`` (live sync uses ``transcript_sync`` so
@@ -118,6 +121,13 @@ def sync_transcript_records(
         # only the newly-processed assistant turns and re-emits one session-total
         # usage row (the ingest upserts codex_session_usage on session_id).
         totals = _load_usage_totals(cursor.get("usage"))
+        raw_seen = cursor.get("seen_message_ids")
+        seen_ids = deque(
+            dict.fromkeys(value for value in raw_seen if isinstance(value, str) and value)
+            if isinstance(raw_seen, list) else [],
+            maxlen=MAX_SEEN_MESSAGE_IDS,
+        )
+        seen_set = set(seen_ids)
 
         messages = 0
         usage_count = 0
@@ -148,7 +158,14 @@ def sync_transcript_records(
                 queued += 1
 
             turn_usage = _extract_turn_usage(envelope)
-            if turn_usage is not None:
+            message = envelope.get("message")
+            message_id = _string(message.get("id")) if isinstance(message, dict) else None
+            if turn_usage is not None and (not message_id or message_id not in seen_set):
+                if message_id:
+                    if len(seen_ids) == MAX_SEEN_MESSAGE_IDS:
+                        seen_set.discard(seen_ids[0])
+                    seen_ids.append(message_id)
+                    seen_set.add(message_id)
                 _accumulate_usage(totals, turn_usage)
                 usage_record = _cumulative_usage_record(
                     target=target,
@@ -166,7 +183,12 @@ def sync_transcript_records(
             _write_cursor(
                 base,
                 cursor_key,
-                {"index": highest_index, "uuid": last_uuid, "usage": totals},
+                {
+                    "index": highest_index,
+                    "uuid": last_uuid,
+                    "usage": totals,
+                    "seen_message_ids": list(seen_ids),
+                },
             )
 
     if queued and auto_drain:

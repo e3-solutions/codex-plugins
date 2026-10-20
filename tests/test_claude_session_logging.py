@@ -350,7 +350,7 @@ def test_claude_plugin_packaging_and_internal_marketplace_are_present():
     hooks_text = json.dumps(hooks)
 
     assert manifest["name"] == "claude-session-logging"
-    assert manifest["version"] == "0.2.19"
+    assert manifest["version"] == "0.2.20"
     assert "Codex" not in manifest["description"]
     assert "SessionStart" in hooks["hooks"]
     assert "UserPromptSubmit" in hooks["hooks"]
@@ -1149,3 +1149,57 @@ def test_auto_update_is_throttled(tmp_path, monkeypatch):
     monkeypatch.setattr(update_plugin.subprocess, "run", lambda *args, **kwargs: pytest.fail("must not run"))
 
     assert update_plugin.run_update(state_path=state_path) == {"updated": False, "reason": "not_due"}
+
+
+@pytest.mark.parametrize("split_runs", [False, True])
+def test_transcript_usage_counts_shared_message_id_once(tmp_path, monkeypatch, split_runs):
+    monkeypatch.setenv("CLAUDE_SESSION_LOG_STATE_DIR", str(tmp_path / "state"))
+    session_logging = load_scripts_module("session_logging")
+    transcript_sync = load_scripts_module("transcript_sync")
+    repo = init_git_repo(tmp_path / "repo", "https://github.com/e3-solutions/codex-plugins.git")
+    transcript = tmp_path / "shared.jsonl"
+    lines = [_assistant_line(
+        f"line-{index}", "2026-07-16T00:00:05.000Z", repo, text=f"Part {index}",
+        usage={"input_tokens": 100, "output_tokens": 20},
+    ) for index in range(2)]
+    for line in lines:
+        line["message"]["id"] = "msg-shared"
+    transcript.write_text(json.dumps(lines[0]) + "\n")
+    if split_runs:
+        transcript_sync.sync_transcript_records("shared", transcript, auto_drain=False)
+        # Reload the module to ensure deduplication survives a new hook process.
+        transcript_sync = load_scripts_module("transcript_sync")
+    with transcript.open("a") as handle:
+        handle.write(json.dumps(lines[1]) + "\n")
+    transcript_sync.sync_transcript_records("shared", transcript, auto_drain=False)
+    records = _pending_records(session_logging, tmp_path / "state")
+    assert len([r for r in records if r["type"] == "message"]) == 2
+    usages = [r for r in records if r["type"] == "usage"]
+    assert len(usages) == 1
+    assert session_logging.build_ingest_payload(usages[0], base=tmp_path / "state")["usage"]["output_tokens"] == 20
+    cursor = transcript_sync._read_cursor(tmp_path / "state", "shared")
+    assert cursor["seen_message_ids"] == ["msg-shared"]
+
+
+def test_transcript_usage_seen_ids_are_bounded_and_persisted(tmp_path, monkeypatch):
+    monkeypatch.setenv("CLAUDE_SESSION_LOG_STATE_DIR", str(tmp_path / "state"))
+    transcript_sync = load_scripts_module("transcript_sync")
+    monkeypatch.setattr(transcript_sync, "MAX_SEEN_MESSAGE_IDS", 2)
+    repo = init_git_repo(tmp_path / "repo", "https://github.com/e3-solutions/codex-plugins.git")
+    transcript = tmp_path / "bounded.jsonl"
+    lines = [_assistant_line(
+        f"line-{index}", "2026-07-16T00:00:05.000Z", repo, text="Response",
+        usage={"input_tokens": 100, "output_tokens": 20},
+    ) for index in range(3)]
+    for index, line in enumerate(lines):
+        line["message"]["id"] = f"msg-{index}"
+    transcript.write_text("\n".join(json.dumps(line) for line in lines) + "\n")
+    transcript_sync.sync_transcript_records("bounded", transcript, auto_drain=False)
+    cursor = transcript_sync._read_cursor(tmp_path / "state", "bounded")
+    assert cursor["seen_message_ids"] == ["msg-1", "msg-2"]
+    assert cursor["usage"]["output_tokens"] == 60
+    with transcript.open("a") as handle:
+        lines[-1]["uuid"] = "new-line-same-response"
+        handle.write(json.dumps(lines[-1]) + "\n")
+    result = transcript_sync.sync_transcript_records("bounded", transcript, auto_drain=False)
+    assert result["usage"] == 0
