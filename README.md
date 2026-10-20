@@ -130,6 +130,8 @@ Inspect updater health and activation drift:
 python3 ~/.codex/coreedge/runtime/current/update_plugin.py --doctor
 ```
 
+Resident release `0.3.42`: Linear drains persist completed-event history even if a later worker raises; corrupt state files are preserved before recovery and I/O errors stop the drain.
+
 ## Rolling Out Updates
 
 Teammates install this repository once with `setup.py`. After that, they should not need to reinstall from the marketplace for normal plugin, skill, command, hook, or extension updates.

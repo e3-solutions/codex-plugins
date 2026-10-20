@@ -162,9 +162,15 @@ def default_state() -> JsonDict:
 
 def read_state(root: str | Path | None = None) -> JsonDict:
     base = ensure_state(root)
+    path = base / "state.json"
     try:
-        data = json.loads((base / "state.json").read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            raise ValueError("Linear sync state must be an object")
+    except (ValueError, UnicodeDecodeError):
+        # Preserve the bytes for diagnosis/recovery before starting fresh.
+        # I/O errors propagate: a temporarily unreadable history is not empty.
+        path.rename(path.with_name(f"state.json.{uuid.uuid4().hex}.corrupt"))
         data = default_state()
     merged = default_state()
     merged.update(data)
@@ -1526,6 +1532,20 @@ def drain_once(
     now: datetime | None = None,
 ) -> JsonDict:
     local_state = read_state(root)
+    try:
+        return _process_queued_events(local_state, root=root, dry_run=dry_run, executor=executor, now=now)
+    finally:
+        save_state(local_state, root)
+
+
+def _process_queued_events(
+    local_state: JsonDict,
+    *,
+    root: str | Path | None = None,
+    dry_run: bool = False,
+    executor: Callable[[str, JsonDict, IssueInference], WorkerResult] | None = None,
+    now: datetime | None = None,
+) -> JsonDict:
     processed = 0
     failed = 0
     reviewed = 0
@@ -1551,7 +1571,6 @@ def drain_once(
                 mark_processed(local_state, event_id)
                 skipped += 1
             safe_unlink(path)
-        save_state(local_state, root)
         return {
             "processed": 0,
             "reviewed": 0,
@@ -1565,7 +1584,6 @@ def drain_once(
             "last_error": active_problem,
             "last_failed_at": now_iso(),
         }
-        save_state(local_state, root)
         return {
             "processed": 0,
             "reviewed": 0,
@@ -1623,7 +1641,6 @@ def drain_once(
         else:
             increment_failure(local_state, event_id, result.message)
             failed += 1
-    save_state(local_state, root)
     return {
         "processed": processed,
         "reviewed": reviewed,
