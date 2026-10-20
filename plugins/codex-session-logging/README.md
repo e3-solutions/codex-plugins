@@ -74,7 +74,7 @@ sanitizer keeps the three keys only when all are valid and both copies agree. **
 the updated `codex-session-ingest` function before turning the flag on**, or the
 arms are dropped and never reach `public.codex_session_events`.
 
-## Forum cue v2 A/B (COR-4883, off by default)
+## Forum cue v2 A/B (COR-4883, 0.2.39, off by default)
 
 `FORUM_CUE_AB=1` (or `true`, `yes`, `on`) splits sessions that get the Forum decision cue
 (`scripts/forum_cue.py`, shared by Codex and Claude Code). **Unset, every session gets the v1 cue
