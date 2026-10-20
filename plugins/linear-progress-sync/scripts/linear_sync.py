@@ -170,7 +170,10 @@ def read_state(root: str | Path | None = None) -> JsonDict:
     except (ValueError, UnicodeDecodeError):
         # Preserve the bytes for diagnosis/recovery before starting fresh.
         # I/O errors propagate: a temporarily unreadable history is not empty.
-        path.rename(path.with_name(f"state.json.{uuid.uuid4().hex}.corrupt"))
+        try:
+            path.rename(path.with_name(f"state.json.{uuid.uuid4().hex}.corrupt"))
+        except FileNotFoundError:
+            pass  # Another reader already quarantined the corrupt file.
         data = default_state()
     merged = default_state()
     merged.update(data)

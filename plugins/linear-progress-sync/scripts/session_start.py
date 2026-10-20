@@ -22,8 +22,11 @@ def main() -> None:
         maybe_spawn_auto_update()
     except Exception:
         pass
-    ensure_state()
-    state = read_state()
+    try:
+        ensure_state()
+        state = read_state()
+    except OSError:
+        return  # Optional cached context must not break SessionStart.
     cache = state.get("stale_issue_cache") or {}
     issues = cache.get("issues") or []
     if not issues:

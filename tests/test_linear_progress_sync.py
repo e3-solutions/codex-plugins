@@ -5246,3 +5246,39 @@ def test_unreadable_state_does_not_reset_dedupe_history(tmp_path, monkeypatch):
     monkeypatch.setattr(Path, "read_text", unreadable)
     with pytest.raises(PermissionError):
         linear_sync.read_state(tmp_path)
+
+
+def test_corrupt_state_already_quarantined_by_another_reader(tmp_path, monkeypatch):
+    monkeypatch.setenv("LINEAR_SYNC_STATE_DIR", str(tmp_path / "state"))
+    base = linear_sync.ensure_state(tmp_path)
+    path = base / "state.json"
+    raw = b'{bad json'
+    path.write_bytes(raw)
+    original = Path.rename
+    def raced_rename(self, target):
+        if self == path:
+            original(self, base / "state.json.other-reader.corrupt")
+        return original(self, target)
+    monkeypatch.setattr(Path, "rename", raced_rename)
+    assert linear_sync.read_state(tmp_path) == linear_sync.default_state()
+    assert (base / "state.json.other-reader.corrupt").read_bytes() == raw
+
+
+@pytest.mark.parametrize("failure_at", ["read_state", "ensure_state"])
+def test_linear_session_start_fails_open_on_state_io_error(tmp_path, monkeypatch, capsys, failure_at):
+    import types
+    monkeypatch.setenv("LINEAR_SYNC_STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setenv("LINEAR_SYNC_CONFIG_DIR", str(tmp_path / "config"))
+    # No updater/service calls outside the isolated fixture.
+    monkeypatch.setitem(sys.modules, "resident_updater", types.SimpleNamespace(ensure_resident_updater=lambda *a, **k: None))
+    monkeypatch.setitem(sys.modules, "update_plugin", types.SimpleNamespace(maybe_spawn_auto_update=lambda: None))
+    spec = importlib.util.spec_from_file_location("linear_session_start", MODULE_PATH.with_name("session_start.py"))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    monkeypatch.setattr(module, "ensure_state", lambda: None)
+    monkeypatch.setattr(module, "read_state", lambda: linear_sync.default_state())
+    def unavailable():
+        raise PermissionError("fixture: state unavailable")
+    monkeypatch.setattr(module, failure_at, unavailable)
+    module.main()
+    assert capsys.readouterr().out == ""
