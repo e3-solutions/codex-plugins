@@ -39,8 +39,8 @@ PLUGIN = "sesh"
 MARKETPLACE = "e3-sesh"
 PLUGIN_ID = f"{PLUGIN}@{MARKETPLACE}"
 # The codex-plugins main merge that contains this plugin release (#97). Bump both together.
-COMMIT = "f22c6ec22ca4b2e609b46e3a2896ead93ee00108"
-VERSION = "0.1.0"
+COMMIT = "c6411e17fd51afdb7410c9f58cd83ce6fce32546"
+VERSION = "0.2.0"
 PLUGIN_PATH = "plugins/sesh"
 REPOSITORY = "https://github.com/e3-solutions/codex-plugins.git"
 CODEX_CANDIDATES = (
