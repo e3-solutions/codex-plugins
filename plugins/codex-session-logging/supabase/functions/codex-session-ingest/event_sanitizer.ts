@@ -243,6 +243,25 @@ const SESH_PLUGIN_VERSION = /^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$/;
 // Any MCP server name (claude.ai connectors are mcp__<uuid>__sesh__...).
 const SESH_TOOL = /^mcp__[A-Za-z0-9_.-]+?__sesh__[A-Za-z0-9_]+$/;
 
+// Labels of one event, not of the session: never merged onto codex_sessions.metadata.
+const SESH_PER_EVENT_KEYS = [
+  "duration_ms",
+  "sesh_subagent",
+  "sesh_turn_guard",
+  "sesh_plan_cue",
+  "sesh_plan_kind",
+  "sesh_plan_topic_sha256",
+  "sesh_plan_cue_index",
+];
+
+export function sessionLevelMetadata(metadata: JsonObject): JsonObject {
+  const result: JsonObject = { ...metadata };
+  for (const key of SESH_PER_EVENT_KEYS) {
+    delete result[key];
+  }
+  return result;
+}
+
 function seshTelemetryEnabled(): boolean {
   try {
     const value = (globalThis as { Deno?: { env: { get(name: string): string | undefined } } })

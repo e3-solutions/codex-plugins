@@ -1,5 +1,5 @@
 // COR-4888: Sesh plugin labels (arm, version, timing, guard, plan cue) behind a flag, off by default.
-import { sanitizeEventPayload } from "./event_sanitizer.ts";
+import { sanitizeEventPayload, sessionLevelMetadata } from "./event_sanitizer.ts";
 
 type JsonObject = Record<string, unknown>;
 
@@ -70,4 +70,15 @@ Deno.test("sanitizeEventPayload keeps Sesh plugin labels only behind CODEX_SESSI
   } finally {
     restoreEnv("CODEX_SESSION_INGEST_SESH_TELEMETRY", previous);
   }
+});
+
+Deno.test("per-event Sesh labels never stick to the session row", () => {
+  const event = { platform: "claude-code", sesh_arm: "treated", sesh_plugin_version: "0.1.0",
+    duration_ms: 5, sesh_subagent: true, sesh_turn_guard: "denied", sesh_plan_cue: "shown",
+    sesh_plan_kind: "module", sesh_plan_topic_sha256: "a".repeat(64), sesh_plan_cue_index: 1 };
+  assertEquals(sessionLevelMetadata(event),
+    { platform: "claude-code", sesh_arm: "treated", sesh_plugin_version: "0.1.0" });
+  // Old clients' metadata passes through unchanged.
+  const old = { cwd: "/r", platform: "codex", tool_name: "x", sesh_request_id: "y" };
+  assertEquals(sessionLevelMetadata(old), old);
 });
