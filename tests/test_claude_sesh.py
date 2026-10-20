@@ -109,7 +109,7 @@ def test_versions_agree():
     market = json.loads((ROOT / ".claude-plugin/marketplace.json").read_text())
     entry = next(p for p in market["plugins"] if p["name"] == "sesh")
     assert manifest["name"] == "sesh"
-    assert manifest["version"] == entry["version"] == cc.PLUGIN_VERSION == "0.1.0"
+    assert manifest["version"] == entry["version"] == cc.PLUGIN_VERSION == "0.1.1"
     assert entry["source"] == "./plugins/claude-sesh"
 
 
@@ -208,7 +208,7 @@ def test_arms():
     assert cc.sesh_arm(p, {**HUMAN, "E3_SESH_EXPERIMENT_OPTOUT": "1"}) == "optout"
     assert cc.sesh_arm({}, HUMAN) == "unassigned"
     meta = cc.arm_metadata({"session_id": TREATED_NEED_ONLY}, HUMAN)
-    assert meta == {"sesh_arm": "treated", "sesh_holdout_pct": 15, "sesh_plugin_version": "0.1.0",
+    assert meta == {"sesh_arm": "treated", "sesh_holdout_pct": 15, "sesh_plugin_version": "0.1.1",
                     "sesh_routine_arm": "need_only"}
 
 
@@ -379,12 +379,12 @@ def test_capture_and_upload_payload(repo, other_repo, state):
     result = linking.drain_queue(post=sent.append)
     assert result["uploaded"] == 1 and result["remaining"] == 0
     body = sent[0]
-    assert body["plugin"] == {"name": "sesh", "version": "0.1.0"}
+    assert body["plugin"] == {"name": "sesh", "version": "0.1.1"}
     assert body["client"]["repo_remote"] == "https://github.com/e3-solutions/example.git"
     metadata = body["event"]["metadata"]
     assert metadata["platform"] == "claude-code" and metadata["agent"] == "claude"
     assert metadata["sesh_request_id"] == REQUEST_ID and metadata["tool_phase"] == "finished"
-    assert metadata["sesh_arm"] == "treated" and metadata["sesh_plugin_version"] == "0.1.0"
+    assert metadata["sesh_arm"] == "treated" and metadata["sesh_plugin_version"] == "0.1.1"
     assert SECRET_TEXT not in json.dumps(body)
     # The ingest keeps sesh_request_id only for this exact shape (event_sanitizer.ts).
     assert re.fullmatch(r"(?:[A-Za-z0-9_-]+__)?(?:sesh__)?search_coding_sessions", metadata["tool_name"])
@@ -403,7 +403,7 @@ def test_environment_snapshot_names_the_plugin(monkeypatch):
     monkeypatch.setenv("CLAUDE_PLUGIN_ROOT", "/h/.claude/plugins/cache/coreedge-internal/sesh/0.1.0")
     setup = linking.environment_metadata({})["codex_setup"]
     assert setup["skills"] == [{"name": "search-coding-sessions", "source": "plugin", "plugin": "sesh",
-                                "marketplace": "coreedge-internal", "version": "0.1.0"}]
+                                "marketplace": "coreedge-internal", "version": "0.1.1"}]
     assert setup["plugins"] == [{"name": "sesh@coreedge-internal", "enabled": True}]
 
 

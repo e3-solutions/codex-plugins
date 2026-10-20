@@ -187,7 +187,9 @@ def resolve(path: str, cwd: str | None, cache: dict):
     root, origin = _repo(parent, cache)
     if not root:
         return None
-    root = posixpath.normpath(root)
+    # Compare real paths: git reports /private/var/... where the patch may say /var/... (macOS).
+    absolute = os.path.realpath(parent) + absolute[len(parent):]
+    root = os.path.realpath(root)
     if not absolute.startswith(root.rstrip("/") + "/"):
         return None
     return root, origin, absolute[len(root.rstrip("/")) + 1:]

@@ -2483,3 +2483,41 @@ Deno.test("sanitizeEventPayload keeps only a valid, agreeing Sesh cue experiment
   );
   assertEquals(tool.metadata, { tool_name: "shell", tool_phase: "finished" });
 });
+
+Deno.test("sanitizeEventPayload keeps COR-4887 arm, guard and exposure labels and nothing else", () => {
+  const event = (event_type: string, metadata: JsonObject) =>
+    sanitizeEventPayload(
+      {
+        id: "0d7a3f40-55c5-4a0e-9d55-0a7f2f8c9b12",
+        session_id: "01a0c524-f3aa-7bbb-8ccc-0123456789ab",
+        seq: 2,
+        event_type,
+        hook_event_name: "PreToolUse",
+        created_at: "2026-10-20T00:00:00.000Z",
+        metadata,
+      },
+      { metadata },
+    ).metadata as JsonObject;
+  const arm = { sesh_arm: "treated", sesh_routine_arm: "need_only", sesh_holdout_pct: 15,
+    sesh_plugin_version: "0.2.0" };
+  assertEquals(event("environment_snapshot", { source: "startup", ...arm }), { source: "startup", ...arm });
+  assertEquals(event("environment_snapshot", { sesh_arm: "holdout", sesh_routine_arm: "routine" }),
+    { sesh_arm: "holdout" });
+  assertEquals(event("environment_snapshot", { sesh_arm: "other", sesh_holdout_pct: 101 }), {});
+  const search = "mcp__cosmos__sesh__search_coding_sessions";
+  assertEquals(
+    event("tool_call_started", { tool_name: search, tool_phase: "started", sesh_scope: "team",
+      sesh_turn_guard: "denied", sesh_turn_guard_first: "failed", sesh_arm: "treated", query: "q" }),
+    { tool_name: search, tool_phase: "started", sesh_scope: "team", sesh_turn_guard: "denied",
+      sesh_turn_guard_first: "failed", sesh_arm: "treated" },
+  );
+  assertEquals(event("tool_call_started", { tool_name: "Bash", tool_phase: "started", sesh_arm: "treated" }),
+    { tool_name: "Bash", tool_phase: "started" });
+  const plan = { sesh_plan_cue: "withheld", sesh_plan_kind: "module", sesh_plan_topic_sha256: "a".repeat(64),
+    sesh_plan_cue_index: 1, sesh_arm: "holdout", tool_name: "apply_patch" };
+  assertEquals(event("sesh_plan_cue_withheld", { ...plan, path: "svc/x.py" }), plan);
+  assertEquals(event("sesh_startup_cue_withheld", { sesh_startup_cue: "withheld", sesh_withheld_by: "need_only" }),
+    { sesh_startup_cue: "withheld", sesh_withheld_by: "need_only" });
+  assertEquals(event("sesh_plan_cue_shown", { sesh_plan_kind: "anything", sesh_plan_cue_index: 3,
+    sesh_plan_topic_sha256: "xyz" }), {});
+});

@@ -6,7 +6,7 @@ off. Sesh itself (the corpus, Sherlock ingestion, the Cosmos tools) never depend
 
 ## What it does
 
-The code is Codex Session Logging 0.2.38 (`38f2466`), unchanged, with the same flags and defaults:
+Since 0.2.0 (COR-4887) the shared code is the same as Codex Session Logging 0.2.40, with the same flags and defaults:
 
 | Hook | Behaviour | Switch (default) |
 |---|---|---|
@@ -14,7 +14,9 @@ The code is Codex Session Logging 0.2.38 (`38f2466`), unchanged, with the same f
 | `SessionStart` | COR-4808 routine A/B: human sessions in arm `need_only` get no routine cue | `E3_SESH_ROUTINE_AB` (on) |
 | `SessionStart` | COR-4681 cue on/off experiment | `E3_SESH_CUE_EXPERIMENT` (off) |
 | `UserPromptSubmit` | One-line cue to search Sesh once when a person asks about earlier work | `E3_SESH_PAST_WORK_CUE` (on) |
-| `PreToolUse` | One Sesh coding-session search per turn; the second is denied | `E3_SESH_ONE_PER_TURN` (on) |
+| `PreToolUse` | One Sesh coding-session search per turn; the second is denied (logged with the first search's outcome) | `E3_SESH_ONE_PER_TURN` (on) |
+| `PreToolUse` | COR-4887 existing-work plan cue before `apply_patch` adds a new code file (at most 2 a session, once per area, never in a turn that searched; people only) | `E3_SESH_PLAN_CUE` (on) |
+| all | COR-4887 holdout: this share of human sessions gets no Sesh cue and no guard; tools stay | `E3_SESH_HOLDOUT_PCT` (15) |
 | `PreToolUse`/`PostToolUse` | Sesh search linking (below) | `E3_SESH_LINKING` (on) |
 
 Bots and `E3_SESH_EXPERIMENT_OPTOUT=1` keep unlimited searches and no routine A/B, as before.

@@ -22,7 +22,7 @@
     {
       "name": "sesh",
       "description": "Sesh prior-work cues, one-search-per-turn guard, existing-work plan cue and metadata-only Sesh search linking for E3 Claude Code sessions.",
-      "version": "0.1.0",
+      "version": "0.1.1",
       "author": {
         "name": "Core Edge Solution"
       },
