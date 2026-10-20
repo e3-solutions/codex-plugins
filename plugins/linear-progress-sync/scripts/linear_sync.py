@@ -991,17 +991,12 @@ def infer_issue(event: JsonDict, state: JsonDict | None = None, *, root: str | P
             if (key := first_issue_key(issue_identifier(issue)))
         }
         known = [key for key in candidates if key.rsplit("-", 1)[0] in known_prefixes]
-        explicit_commit_keys = {
-            match.group(1) for match in ISSUE_RE.finditer(commit_text)
-            if match.group(1).isupper()
-        }
-        corroborated = [key for key in candidates if key in explicit_commit_keys]
-        # A cache is not an exhaustive team list, so hold unknown prefixes for
-        # review rather than discarding the event or trusting a slug match.
-        verified = known if known_prefixes else corroborated
-        preferred = verified or candidates
+        # Preserve normal single-ticket branches, even with an empty cache.
+        # For multiple candidates, commit text alone cannot establish a team
+        # prefix: tokens such as UTF-8 and SHA-256 are uppercase too.
+        preferred = known or candidates
         key = preferred[-1]
-        confident = len(preferred) == 1 and bool(verified)
+        confident = len(candidates) == 1 or len(known) == 1
         reason = "issue key found in branch name" if confident else "unverified or ambiguous branch issue key; review required"
         return with_cached_status(IssueInference(key, 0.95 if confident else 0.65, reason), local_state)
 

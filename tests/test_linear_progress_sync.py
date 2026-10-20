@@ -5194,10 +5194,10 @@ def test_codex_worker_disables_sesh_startup_search(monkeypatch, tmp_path):
 @pytest.mark.parametrize("branch,known,expected,automatic", [
     ("arya/fix-utf-8-COR-123", ["COR-999"], "COR-123", True),
     ("arya/COR-123-fix-utf-8", ["COR-999"], "COR-123", True),
-    ("feature/api-2-refactor", ["COR-999"], "API-2", False),
-    ("arya/fix-utf-8-COR-123", [], "COR-123", False),
-    ("feature/api-2-refactor", [], "API-2", False),
-    ("arya/cor-123-and-cor-456", ["COR-999"], "COR-456", False),
+    ("feature/api-2-refactor", ["COR-999"], "API-2", True),
+    ("arya/fix-utf-8-COR-123", [], None, False),
+    ("feature/api-2-refactor", [], "API-2", True),
+    ("arya/cor-123-and-cor-456", ["COR-999"], None, False),
 ])
 def test_branch_ticket_candidates_need_evidence(tmp_path, monkeypatch, branch, known, expected, automatic):
     monkeypatch.setenv("LINEAR_SYNC_STATE_DIR", str(tmp_path / "state"))
@@ -5205,7 +5205,8 @@ def test_branch_ticket_candidates_need_evidence(tmp_path, monkeypatch, branch, k
     state = linear_sync.default_state()
     state["stale_issue_cache"]["issues"] = [{"identifier": key} for key in known]
     inference = linear_sync.infer_issue({"branch": branch}, state, root=tmp_path)
-    assert inference.issue_key == expected
+    if expected is not None:
+        assert inference.issue_key == expected
     assert (inference.confidence >= 0.8) is automatic
 
 
@@ -5215,7 +5216,7 @@ def test_ambiguous_branch_is_held_without_executing_worker(tmp_path, monkeypatch
     save_linear_user(tmp_path, monkeypatch)
     repo = init_git_repo(tmp_path / "repo", branch="arya/cor-123-work")
     linear_sync.enqueue_event("post_commit", {
-        "id": "ambiguous", "branch": "feature/api-2-refactor", "commit_sha": "abc",
+        "id": "ambiguous", "branch": "arya/fix-utf-8-COR-123", "commit_sha": "abc",
     }, root=repo)
     calls = []
     result = linear_sync.drain_once(root=repo, executor=lambda *args: calls.append(args) or linear_sync.WorkerResult(True, "ok"))
@@ -5223,11 +5224,13 @@ def test_ambiguous_branch_is_held_without_executing_worker(tmp_path, monkeypatch
     assert result["reviewed"] == 1
 
 
-def test_branch_ticket_corroborated_by_commit_keeps_automatic_sync(tmp_path, monkeypatch):
+def test_known_branch_ticket_keeps_automatic_sync(tmp_path, monkeypatch):
     monkeypatch.setenv("LINEAR_SYNC_STATE_DIR", str(tmp_path / "state"))
+    state = linear_sync.default_state()
+    state["stale_issue_cache"]["issues"] = [{"identifier": "COR-999"}]
     inference = linear_sync.infer_issue({
         "branch": "arya/cor-123-fix-utf-8", "commit_subject": "COR-123: fix encoding",
-    }, linear_sync.default_state(), root=tmp_path)
+    }, state, root=tmp_path)
     assert inference.issue_key == "COR-123"
     assert inference.confidence >= 0.8
 
@@ -5237,5 +5240,27 @@ def test_unknown_branch_prefix_is_not_verified_by_slug_repetition(tmp_path, monk
     monkeypatch.setenv("LINEAR_SYNC_STATE_DIR", str(tmp_path / "state"))
     state = linear_sync.default_state()
     state["stale_issue_cache"]["issues"] = [{"identifier": key} for key in known]
-    inference = linear_sync.infer_issue({"branch": "feature/api-2-refactor", "commit_subject": subject}, state, root=tmp_path)
+    inference = linear_sync.infer_issue({"branch": "feature/api-2-utf-8-refactor", "commit_subject": subject}, state, root=tmp_path)
+    assert inference.confidence < 0.8
+
+
+def test_single_branch_ticket_without_cache_keeps_prior_confidence(tmp_path, monkeypatch):
+    monkeypatch.setenv("LINEAR_SYNC_STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setenv("LINEAR_SYNC_CONFIG_DIR", str(tmp_path / "config"))
+    inference = linear_sync.infer_issue({
+        "branch": "arya/cor-4894-find-meetings-latency",
+        "commit_subject": "Reduce meeting latency",
+    }, linear_sync.default_state(), root=tmp_path)
+    assert inference.issue_key == "COR-4894"
+    assert inference.confidence == 0.95
+
+
+@pytest.mark.parametrize("token", ["UTF-8", "SHA-256", "COR-123"])
+def test_ambiguous_branch_commit_text_alone_cannot_confirm(tmp_path, monkeypatch, token):
+    monkeypatch.setenv("LINEAR_SYNC_STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setenv("LINEAR_SYNC_CONFIG_DIR", str(tmp_path / "config"))
+    branch = "arya/fix-sha-256-COR-123" if token == "SHA-256" else "arya/fix-utf-8-COR-123"
+    inference = linear_sync.infer_issue({
+        "branch": branch, "commit_subject": f"{token} decoding fix",
+    }, linear_sync.default_state(), root=tmp_path)
     assert inference.confidence < 0.8
