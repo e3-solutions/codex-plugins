@@ -98,8 +98,9 @@ Deno.test("COR-4887: guard first outcome, search scope and every cue's exposure,
       { metadata },
     ).metadata as JsonObject;
   const search = "mcp__cosmos__sesh__search_coding_sessions";
+  // Key order is the sanitizer's output order (assertEquals compares JSON text).
   const denied = { tool_name: search, tool_phase: "started", sesh_arm: "treated", sesh_plugin_version: "0.2.40",
-    sesh_scope: "team", sesh_turn_guard: "denied", sesh_turn_guard_first: "failed" };
+    sesh_turn_guard: "denied", sesh_turn_guard_first: "failed", sesh_scope: "team" };
   try {
     Deno.env.delete("CODEX_SESSION_INGEST_SESH_TELEMETRY");
     assertEquals(event("tool_call_started", denied), { tool_name: search, tool_phase: "started" });
