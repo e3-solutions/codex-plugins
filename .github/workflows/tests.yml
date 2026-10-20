@@ -18,6 +18,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
+          fetch-depth: 0
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -26,7 +27,7 @@ jobs:
           deno-version: v2.x
       - name: Install test dependencies
         run: python3 -m pip install pytest
-      - name: Run tests in an isolated home
+      - name: Run pytest in an isolated home
         shell: bash
         run: |
           set -euo pipefail
@@ -41,6 +42,13 @@ jobs:
             GIT_COMMITTER_NAME="Test User" \
             GIT_COMMITTER_EMAIL="test@example.invalid" \
             python3 -m pytest tests -q
+      - name: Run Deno ingest tests
+        if: success() || failure()
+        shell: bash
+        run: |
+          set -euo pipefail
+          test_home="$(mktemp -d)"
+          trap 'rm -rf "$test_home"' EXIT
           env HOME="$test_home" DENO_DIR="$test_home/.cache/deno" \
             deno test --allow-env \
             plugins/codex-session-logging/supabase/functions/codex-session-ingest
