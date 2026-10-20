@@ -130,6 +130,7 @@ COR-4888), and `tests/test_sesh_plan_cue_holdout.py` checks that.
 
 **Ingest.** The deployed `codex-session-ingest` drops labels it does not know. In 4 days of prod
 events, none carried `sesh_turn_guard` or `sesh_cue_arm`, so the Oct 16 "0 guard denials" count
-was a logging artifact. `event_sanitizer.ts` now allowlists the labels above as enums, small
-integers or hashes. It must be deployed before the labels land. Until then the event types still
+was a logging artifact. #106 (COR-4888) allowlists Sesh labels behind `CODEX_SESSION_INGEST_SESH_TELEMETRY` (off by default).
+This change extends that allowlist with the guard's first outcome, the search scope and the startup
+and past-work exposure events. It needs a deploy with the flag on before the labels land. Until then the event types still
 land, and the arm can be recomputed from the session id with the formula above.

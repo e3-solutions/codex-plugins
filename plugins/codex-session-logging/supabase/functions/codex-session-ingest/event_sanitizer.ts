@@ -235,7 +235,12 @@ function sanitizeSeshCueExperiment(
 // Off unless CODEX_SESSION_INGEST_SESH_TELEMETRY is 1/true/on, so the default deploy keeps
 // exactly today's rows. Labels and numbers only, never content; both copies must agree.
 export const SESH_TELEMETRY_ENV = "CODEX_SESSION_INGEST_SESH_TELEMETRY";
-const SESH_PLAN_CUE_EVENTS = ["sesh_plan_cue_shown", "sesh_plan_cue_withheld"];
+const SESH_PLAN_CUE_EVENTS = [
+  "sesh_plan_cue_shown", "sesh_plan_cue_withheld",
+  // COR-4887 exposure events for the other cues (Codex), same shape.
+  "sesh_startup_cue_shown", "sesh_startup_cue_withheld",
+  "sesh_past_work_cue_shown", "sesh_past_work_cue_withheld",
+];
 const SESH_ARMS = ["holdout", "treated", "bot", "optout", "unassigned"];
 const SESH_ROUTINE_ARMS = ["routine", "need_only"];
 const SESH_PLAN_KINDS = ["service", "migration or table", "script", "module"];
@@ -252,6 +257,11 @@ const SESH_PER_EVENT_KEYS = [
   "sesh_plan_kind",
   "sesh_plan_topic_sha256",
   "sesh_plan_cue_index",
+  "sesh_turn_guard_first",
+  "sesh_scope",
+  "sesh_startup_cue",
+  "sesh_past_work_cue",
+  "sesh_withheld_by",
 ];
 
 export function sessionLevelMetadata(metadata: JsonObject): JsonObject {
@@ -322,6 +332,13 @@ function sanitizeSeshTelemetry(
     keep("sesh_subagent", (value) => value === true);
     if (eventType === "tool_call_started") {
       keep("sesh_turn_guard", oneOf(["denied"]));
+      // COR-4887: how this turn's first search ended, and the scope enum the agent asked for.
+      if (result.sesh_turn_guard === "denied") {
+        keep("sesh_turn_guard_first", oneOf(["succeeded", "failed", "unknown"]));
+      }
+      if (isSeshSearchTool(source.tool_name)) {
+        keep("sesh_scope", oneOf(["all", "mine", "team"]));
+      }
     }
   }
   if (SESH_PLAN_CUE_EVENTS.includes(eventType)) {
@@ -329,6 +346,9 @@ function sanitizeSeshTelemetry(
     keep("sesh_plan_kind", oneOf(SESH_PLAN_KINDS));
     keep("sesh_plan_topic_sha256", (value) => canonicalDigest(value) !== null);
     keep("sesh_plan_cue_index", integer(1, 2));
+    keep("sesh_startup_cue", oneOf(["shown", "withheld"]));
+    keep("sesh_past_work_cue", oneOf(["shown", "withheld"]));
+    keep("sesh_withheld_by", oneOf(["holdout", "need_only"]));
   }
   return result;
 }
