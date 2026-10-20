@@ -12,16 +12,20 @@ def main() -> None:
     except Exception as exc:  # noqa: BLE001 - logging must not interrupt Claude Code.
         print(f"claude-session-logging capture failed: {exc}", file=sys.stderr)
         return
+    forum_meta = None
     try:
-        from forum_cue import forum_cue
+        from forum_cue import forum_cue_decision
 
-        cue = forum_cue(payload)
+        cue, forum_meta = forum_cue_decision(payload)  # COR-4883 arm only while FORUM_CUE_AB is on.
         if cue:
             print(cue, flush=True)
     except Exception:
         pass  # Forum guidance must not interrupt logging or the user's prompt.
     try:
-        capture_hook_event(payload, event_name="UserPromptSubmit")
+        if forum_meta:
+            capture_hook_event(payload, event_name="UserPromptSubmit", extra_metadata=forum_meta)
+        else:
+            capture_hook_event(payload, event_name="UserPromptSubmit")
     except Exception as exc:  # noqa: BLE001 - logging must not interrupt Claude Code.
         print(f"claude-session-logging capture failed: {exc}", file=sys.stderr)
 

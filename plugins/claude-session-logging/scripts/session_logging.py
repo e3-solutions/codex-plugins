@@ -77,13 +77,20 @@ def read_stdin_json() -> JsonDict:
     return loaded if isinstance(loaded, dict) else {"payload": loaded}
 
 
-def capture_hook_event(payload: JsonDict, *, event_name: str | None = None) -> JsonDict | None:
+def capture_hook_event(
+    payload: JsonDict,
+    *,
+    event_name: str | None = None,
+    extra_metadata: JsonDict | None = None,
+) -> JsonDict | None:
     hook_event = event_name or str(payload.get("hook_event_name") or payload.get("event") or "")
     if not should_capture_payload(payload):
         return None
     event_type, event_metadata = event_from_payload(hook_event, payload)
     if not event_type:
         return None
+    if extra_metadata:  # e.g. the COR-4883 Forum cue arm; same contract as the Codex plugin.
+        event_metadata.update(extra_metadata)
     return capture_metadata_event(payload, hook_event=hook_event, event_type=event_type, event_metadata=event_metadata)
 
 

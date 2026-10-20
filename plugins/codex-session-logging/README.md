@@ -74,6 +74,28 @@ sanitizer keeps the three keys only when all are valid and both copies agree. **
 the updated `codex-session-ingest` function before turning the flag on**, or the
 arms are dropped and never reach `public.codex_session_events`.
 
+## Forum cue v2 A/B (COR-4883, off by default)
+
+`FORUM_CUE_AB=1` (or `true`, `yes`, `on`) splits sessions that get the Forum decision cue
+(`scripts/forum_cue.py`, shared by Codex and Claude Code). **Unset, every session gets the v1 cue
+exactly as before and nothing new is logged.** Gating (E3 repositories, first prompt, then a
+25+ word new task at most once an hour) is the same in every arm.
+
+- Arms come from the session id alone: `h = sha256("forum_cue_v2:" + lowercased, trimmed id)`;
+  `v1` when the low bit of `h[0]` is 0 (50%, today's cue), else `v2_midtask` when the low bit of
+  `h[1]` is 1 (25%), else `v2` (25%). In Postgres:
+  `case when get_byte(h,0)%2=0 then 'v1' when get_byte(h,1)%2=1 then 'v2_midtask' else 'v2' end`
+  with `h = sha256(convert_to('forum_cue_v2:' || lower(btrim(session_id)), 'UTF8'))`.
+- `v2`: same search timing as v1, but names the Cosmos tool, rates only posts the agent used or
+  checked (one `give_collective_feedback` call with `request.assessments`, up to 5 posts, before
+  finishing; unused results left unrated; off-topic ones as abstain starting "Off-topic for this
+  query:"; down only with contrary evidence), and allows at most 2 duplicate-check searches
+  before `share_with_collective`. `v2_midtask`: v2 plus "do not search yet; search once you have a
+  specific cause or mechanism, with its nouns, and again when the plan changes".
+- While on, the cue log line gains `experiment` and `arm`, and the `thread_prompt_submitted`
+  session event for a cued prompt gains `forum_cue_experiment`, `forum_cue_arm` and
+  `forum_cue_reason` metadata. No schema change.
+
 ## Fewer routine Sesh searches A/B (COR-4808, on by default since Oct 16, 2026)
 
 An Oct 16, 2026 study of 58 searches where Sesh showed an answer that the agent ignored
