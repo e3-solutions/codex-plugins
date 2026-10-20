@@ -55,6 +55,18 @@ function sanitizeEventMetadata(
       metadata,
       sanitizeSeshCueExperiment(recordMetadata, eventMetadata),
     );
+    Object.assign(
+      metadata,
+      sanitizeSeshTelemetry(eventType, source, recordMetadata, eventMetadata),
+    );
+    return metadata;
+  }
+
+  if (SESH_PLAN_CUE_EVENTS.includes(eventType)) {
+    Object.assign(
+      metadata,
+      sanitizeSeshTelemetry(eventType, source, recordMetadata, eventMetadata),
+    );
     return metadata;
   }
 
@@ -135,6 +147,11 @@ function sanitizeEventMetadata(
       }
     }
 
+    Object.assign(
+      metadata,
+      sanitizeSeshTelemetry(eventType, source, recordMetadata, eventMetadata),
+    );
+
     if (
       eventType === "tool_call_finished" &&
       isSeshSourceOpenTool(source.tool_name) &&
@@ -212,6 +229,108 @@ function sanitizeSeshCueExperiment(
     return { sesh_cue_experiment: experiment, sesh_cue_arm: arm, sesh_cue_salt: salt };
   }
   return {};
+}
+
+// COR-4888: Sesh plugin labels (arm, plugin version, timing, guard denials, plan cue fires).
+// Off unless CODEX_SESSION_INGEST_SESH_TELEMETRY is 1/true/on, so the default deploy keeps
+// exactly today's rows. Labels and numbers only, never content; both copies must agree.
+export const SESH_TELEMETRY_ENV = "CODEX_SESSION_INGEST_SESH_TELEMETRY";
+const SESH_PLAN_CUE_EVENTS = ["sesh_plan_cue_shown", "sesh_plan_cue_withheld"];
+const SESH_ARMS = ["holdout", "treated", "bot", "optout", "unassigned"];
+const SESH_ROUTINE_ARMS = ["routine", "need_only"];
+const SESH_PLAN_KINDS = ["service", "migration or table", "script", "module"];
+const SESH_PLUGIN_VERSION = /^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$/;
+// Any MCP server name (claude.ai connectors are mcp__<uuid>__sesh__...).
+const SESH_TOOL = /^mcp__[A-Za-z0-9_.-]+?__sesh__[A-Za-z0-9_]+$/;
+
+// Labels of one event, not of the session: never merged onto codex_sessions.metadata.
+const SESH_PER_EVENT_KEYS = [
+  "duration_ms",
+  "sesh_subagent",
+  "sesh_turn_guard",
+  "sesh_plan_cue",
+  "sesh_plan_kind",
+  "sesh_plan_topic_sha256",
+  "sesh_plan_cue_index",
+];
+
+export function sessionLevelMetadata(metadata: JsonObject): JsonObject {
+  const result: JsonObject = { ...metadata };
+  for (const key of SESH_PER_EVENT_KEYS) {
+    delete result[key];
+  }
+  return result;
+}
+
+function seshTelemetryEnabled(): boolean {
+  try {
+    const value = (globalThis as { Deno?: { env: { get(name: string): string | undefined } } })
+      .Deno?.env.get(SESH_TELEMETRY_ENV);
+    return ["1", "true", "on"].includes((value ?? "").trim().toLowerCase());
+  } catch {
+    return false;
+  }
+}
+
+function sanitizeSeshTelemetry(
+  eventType: string,
+  source: JsonObject,
+  recordMetadata: JsonObject,
+  eventMetadata: JsonObject,
+): JsonObject {
+  const toolEvent = eventType.startsWith("tool_call_");
+  if (
+    !seshTelemetryEnabled() ||
+    !(toolEvent || eventType === "environment_snapshot" || SESH_PLAN_CUE_EVENTS.includes(eventType))
+  ) {
+    return {};
+  }
+  if (
+    toolEvent &&
+    !(isSeshSearchTool(source.tool_name) ||
+      (typeof source.tool_name === "string" && source.tool_name.length <= 256 &&
+        SESH_TOOL.test(source.tool_name)))
+  ) {
+    return {};
+  }
+  const result: JsonObject = {};
+  const agreed = (key: string): unknown => {
+    const value = recordMetadata[key];
+    if (key in eventMetadata && eventMetadata[key] !== value) {
+      return undefined;
+    }
+    return value;
+  };
+  const keep = (key: string, valid: (value: unknown) => boolean) => {
+    const value = agreed(key);
+    if (value !== undefined && valid(value)) {
+      result[key] = value;
+    }
+  };
+  const oneOf = (values: string[]) => (value: unknown) =>
+    typeof value === "string" && values.includes(value);
+  const integer = (minimum: number, maximum: number) => (value: unknown) =>
+    typeof value === "number" && Number.isInteger(value) && value >= minimum && value <= maximum;
+
+  keep("sesh_arm", oneOf(SESH_ARMS));
+  keep("sesh_routine_arm", oneOf(SESH_ROUTINE_ARMS));
+  keep("sesh_holdout_pct", integer(0, 100));
+  keep("sesh_plugin_version", (value) =>
+    typeof value === "string" && SESH_PLUGIN_VERSION.test(value));
+  if (toolEvent) {
+    keep("duration_ms", integer(0, 86_400_000));
+    keep("sesh_subagent", (value) => value === true);
+    if (eventType === "tool_call_started") {
+      keep("sesh_turn_guard", oneOf(["denied"]));
+    }
+  }
+  if (SESH_PLAN_CUE_EVENTS.includes(eventType)) {
+    keep("sesh_plan_cue", oneOf(["shown", "withheld"]));
+    keep("sesh_plan_kind", oneOf(SESH_PLAN_KINDS));
+    keep("sesh_plan_topic_sha256", (value) => canonicalDigest(value) !== null);
+    keep("sesh_plan_cue_index", integer(1, 2));
+  }
+  return result;
 }
 
 // Any namespace serving Sesh search (mcp__codex_apps__cosmos__sesh__..., mcp__e3_mcp__sesh__...),

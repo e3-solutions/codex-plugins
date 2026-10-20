@@ -1,5 +1,5 @@
 import { userIdForClientIdentity } from "./client_identity.ts";
-import { sanitizeEventPayload } from "./event_sanitizer.ts";
+import { sanitizeEventPayload, sessionLevelMetadata } from "./event_sanitizer.ts";
 
 type JsonObject = Record<string, unknown>;
 type ExistingSession = {
@@ -827,7 +827,10 @@ async function sessionMetadataForUpsert(
   client: JsonObject,
   existingMetadata: JsonObject,
 ): Promise<JsonObject> {
-  const nextMetadata: JsonObject = { ...existingMetadata, ...metadata };
+  const nextMetadata: JsonObject = {
+    ...existingMetadata,
+    ...sessionLevelMetadata(metadata),
+  };
   // Stamp the coding-agent family onto the session row so downstream consumers
   // (heartbeat dashboard, codestat) can label sessions without heuristics.
   // Sticky: once a session is seen as "claude" it stays "claude" even if a later

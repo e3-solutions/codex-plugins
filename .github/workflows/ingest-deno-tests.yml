@@ -1,0 +1,25 @@
+name: Ingest Deno tests
+
+on:
+  pull_request:
+    paths:
+      - "plugins/codex-session-logging/supabase/functions/**"
+      - ".github/workflows/ingest-deno-tests.yml"
+  push:
+    branches: [main]
+    paths:
+      - "plugins/codex-session-logging/supabase/functions/**"
+
+jobs:
+  deno-test:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+      - name: deno test codex-session-ingest
+        working-directory: plugins/codex-session-logging/supabase/functions/codex-session-ingest
+        run: deno test --allow-env --allow-net=127.0.0.1,localhost --no-lock .
