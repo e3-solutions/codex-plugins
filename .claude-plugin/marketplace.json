@@ -18,6 +18,17 @@
       "category": "productivity",
       "source": "./plugins/claude-session-logging",
       "homepage": "https://github.com/e3-solutions/codex-plugins/tree/main/plugins/claude-session-logging"
+    },
+    {
+      "name": "sesh",
+      "description": "Sesh prior-work cues, one-search-per-turn guard, existing-work plan cue and metadata-only Sesh search linking for E3 Claude Code sessions.",
+      "version": "0.1.0",
+      "author": {
+        "name": "Core Edge Solution"
+      },
+      "category": "productivity",
+      "source": "./plugins/claude-sesh",
+      "homepage": "https://github.com/e3-solutions/codex-plugins/tree/main/plugins/claude-sesh"
     }
   ]
 }

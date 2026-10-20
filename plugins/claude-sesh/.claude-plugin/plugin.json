@@ -1,0 +1,16 @@
+{
+  "name": "sesh",
+  "version": "0.1.0",
+  "description": "Sesh prior-work cues, the one-search-per-turn guard, the existing-work plan cue and Sesh search linking for E3 Claude Code sessions.",
+  "author": {
+    "name": "Core Edge Solution"
+  },
+  "homepage": "https://github.com/e3-solutions/codex-plugins/tree/main/plugins/claude-sesh",
+  "repository": "https://github.com/e3-solutions/codex-plugins",
+  "keywords": [
+    "claude-code",
+    "sesh",
+    "search",
+    "sessions"
+  ]
+}
