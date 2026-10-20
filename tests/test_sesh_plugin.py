@@ -162,7 +162,8 @@ class Machine:
             self.plugins.append(self._install(SESH, "jolly-roger-sesh", "sesh", _manifest()["version"]))
             config.append('[plugins."sesh@jolly-roger-sesh"]\nenabled = true\n')
         if logger:
-            installed = self._install(LOGGER, "coreedge-local", "codex-session-logging", "0.2.38")
+            installed = self._install(LOGGER, "coreedge-local", "codex-session-logging",
+                                      json.loads((LOGGER / ".codex-plugin/plugin.json").read_text())["version"])
             if logger_enabled:  # Codex runs hooks only for enabled plugins.
                 self.plugins.append(installed)
             config.append(f'[plugins."codex-session-logging@coreedge-local"]\nenabled = {str(logger_enabled).lower()}\n')
@@ -251,10 +252,13 @@ def _sesh_events(machine: Machine, events: list[dict]) -> list[dict]:
     keep = []
     for event in events:
         tool = event["metadata"].get("tool_name")
-        if event.get("event_type") == "environment_snapshot" or sesh_plugin.is_sesh_tool(tool):
+        if (event.get("event_type") == "environment_snapshot" or sesh_plugin.is_sesh_tool(tool)
+                or str(event.get("event_type")).startswith("sesh_")):  # COR-4887 exposure events.
             item = {key: value for key, value in event.items()
                     if key not in {"id", "seq", "created_at", "storage_path", "local_content_path", "thread_id"}}
-            item["metadata"] = {key: value for key, value in event["metadata"].items() if key != "codex_setup"}
+            # The plugin version label names each plugin's own release, so it differs by design.
+            item["metadata"] = {key: value for key, value in event["metadata"].items()
+                                if key not in {"codex_setup", "sesh_plugin_version"}}
             keep.append(item)
     return keep
 
@@ -270,11 +274,14 @@ def test_alone_it_runs_every_sesh_hook_with_0_2_38_defaults(tmp_path):
     assert out["first"] == [] and denials(out["second"]) == 1
     events = machine.events("sesh")
     kinds = [(e["event_type"], e["metadata"].get("tool_name")) for e in events]
-    assert kinds == [("environment_snapshot", None), ("tool_call_started", SEARCH), ("tool_call_finished", SEARCH),
-                     ("tool_call_started", SEARCH)]
-    assert events[1]["metadata"].get("sesh_turn_guard") is None
-    assert events[3]["metadata"]["sesh_turn_guard"] == "denied"
-    assert events[2]["metadata"]["sesh_request_id"] == REQUEST_ID
+    assert kinds == [("environment_snapshot", None), ("sesh_startup_cue_shown", None),
+                     ("sesh_past_work_cue_shown", None), ("tool_call_started", SEARCH),
+                     ("tool_call_finished", SEARCH), ("tool_call_started", SEARCH)]
+    assert events[0]["metadata"]["sesh_arm"] == "treated"
+    assert events[3]["metadata"].get("sesh_turn_guard") is None
+    assert events[5]["metadata"]["sesh_turn_guard"] == "denied"
+    assert events[5]["metadata"]["sesh_turn_guard_first"] in {"succeeded", "unknown"}
+    assert events[4]["metadata"]["sesh_request_id"] == REQUEST_ID
     assert not machine.events("logger")
 
 
@@ -298,7 +305,7 @@ def test_alone_matches_codex_session_logging_0_2_38_output_and_sesh_events(tmp_p
     logger = Machine(tmp_path / "logger", sesh=False, logger=True, env=env)
     assert session(alone, session_id=session_id) == session(logger, session_id=session_id)
     ours = _sesh_events(alone, alone.events("sesh"))
-    assert len(ours) == 4 and ours == _sesh_events(logger, logger.events("logger"))
+    assert len(ours) >= 4 and ours == _sesh_events(logger, logger.events("logger"))
 
 
 def test_alone_never_stores_prompts_queries_or_other_tools(tmp_path):
@@ -313,7 +320,7 @@ def test_alone_never_stores_prompts_queries_or_other_tools(tmp_path):
 def test_the_session_snapshot_names_the_sesh_plugin_and_version(tmp_path):
     machine = Machine(tmp_path)
     machine.fire("SessionStart", source="startup")
-    [snapshot] = machine.events("sesh")
+    [snapshot] = [e for e in machine.events("sesh") if e.get("event_type") == "environment_snapshot"]
     detail = json.loads((tmp_path / "sesh-state" / snapshot["local_content_path"]).read_text())
     skills = detail["metadata"]["codex_setup"]["skills"]
     assert {"name": "search-coding-sessions", "plugin": "sesh", "marketplace": "jolly-roger-sesh",
@@ -390,7 +397,7 @@ def test_a_logger_that_cannot_run_leaves_sesh_in_charge(tmp_path, change):
         machine.plugins = machine.plugins[:1]
     out = session(machine)
     assert cues(out["start"], sesh_context.CONTEXT) == 1 and denials(out["second"]) == 1
-    assert len(machine.events("sesh")) == 4
+    assert len(machine.events("sesh")) == 6  # Snapshot, 2 exposure events, 3 Sesh tool events.
 
 
 def test_logger_hooks_merged_into_the_global_hooks_file_count_as_active(tmp_path):

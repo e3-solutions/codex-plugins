@@ -365,8 +365,12 @@ def test_user_prompt_submit_hook_adds_the_cue_unless_turned_off(tmp_path):
     assert json.loads(on.stdout)["hookSpecificOutput"]["additionalContext"] == need.PAST_WORK_CUE
     # Nothing new is logged: the prompt event carries the same metadata keys either way.
     keys = [sorted(e["metadata"]) for path in ("off", "default", "on") for e in events(tmp_path / path)
-            if e["hook_event_name"] == "UserPromptSubmit"]
+            if e["hook_event_name"] == "UserPromptSubmit" and not str(e.get("event_type", "")).startswith("sesh_")]
     assert keys and all(k == keys[0] for k in keys)
+    # COR-4887: the shown cue is logged as a content-free exposure event, only when it fires.
+    exposure = {path: [e["event_type"] for e in events(tmp_path / path) if str(e.get("event_type", "")).startswith("sesh_")]
+                for path in ("off", "default", "on")}
+    assert exposure == {"off": [], "default": ["sesh_past_work_cue_shown"], "on": ["sesh_past_work_cue_shown"]}
 
 
 def test_user_prompt_submit_hook_merges_with_the_forum_cue(tmp_path):
@@ -396,11 +400,16 @@ VOLATILE = {"id", "created_at", "seq", "thread_id", "content_path", "storage_pat
 
 
 def _comparable(items: list[dict]) -> list[dict]:
+    # COR-4887 adds arm labels to Sesh events and exposure events of its own; everything else
+    # must still match the previous release exactly.
     out = []
     for item in items:
+        if str(item.get("event_type", "")).startswith("sesh_"):
+            continue
         item = {k: v for k, v in item.items() if k not in VOLATILE}
         meta = {k: v for k, v in (item.get("metadata") or {}).items()
-                if k not in {"plugin_version", "codex_setup", "hook_received_at", "captured_at"}}
+                if k not in {"plugin_version", "codex_setup", "hook_received_at", "captured_at", "sesh_arm",
+                             "sesh_routine_arm", "sesh_holdout_pct", "sesh_plugin_version", "sesh_scope"}}
         out.append({**item, "metadata": meta})
     return out
 
