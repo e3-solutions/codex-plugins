@@ -35,7 +35,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
-from sesh_cc import PLUGIN_NAME, PLUGIN_VERSION, _falsy, arm_metadata, digest, state_dir
+from sesh_cc import PLUGIN_NAME, PLUGIN_VERSION, _falsy, _prune_old, arm_metadata, digest, state_dir
 
 JsonDict = dict[str, Any]
 
@@ -57,6 +57,7 @@ PERMANENT_HTTP_STATUSES = {400, 403, 413, 415, 422}
 # use negative numbers).
 SEQ_OFFSET = 1_500_000_000
 SKILL_NAME = "search-coding-sessions"
+MAX_EVENT_AGE_SECONDS = 30 * 60
 
 
 def linking_enabled(env=None) -> bool:
@@ -374,6 +375,7 @@ def mark_started(payload: JsonDict, base: Path | None = None) -> None:
         return
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     path.write_text(str(time.time()), encoding="utf-8")
+    _prune_old(path.parent)
 
 
 def duration_ms(payload: JsonDict, base: Path | None = None) -> int | None:
@@ -598,6 +600,10 @@ def drain_queue(base: Path | None = None, post=None) -> JsonDict:
         for path in sorted(pending_queue_dir(base).glob("*.json")):
             try:
                 record = json.loads(path.read_text(encoding="utf-8"))
+                if time.time() - path.stat().st_mtime > MAX_EVENT_AGE_SECONDS:
+                    # A late event would mark an ended session live again (the ingest clears
+                    # ended_at on every event), so stale ones are dropped, not sent.
+                    raise PermanentUploadError("event older than 30 minutes; not sent")
                 post(build_ingest_payload(record, base=base))
             except PermanentUploadError as exc:
                 dead += 1
@@ -668,17 +674,22 @@ def _quiet(function):
 
 
 def local_installation_id(base: Path) -> str:
-    """claude-session-logging's installation id when it has one (same person), else this plugin's own."""
-    config = os.environ.get("CLAUDE_CONFIG_DIR")
-    logger = (Path(config).expanduser() if config else Path.home() / ".claude") / "session-logging"
-    for path in (logger / "installation_id", base / "installation_id"):
-        with contextlib.suppress(OSError):
-            value = path.read_text(encoding="utf-8").strip()
-            if value:
-                return value
+    """claude-session-logging's installation id, at exactly its path, created there if missing.
+
+    The ingest ties a session to the first installation id it sees, so this plugin and the
+    logger must always send the same one.
+    """
+    override = os.environ.get("CLAUDE_SESSION_LOG_STATE_DIR")
+    logger = Path(override).expanduser().resolve() if override else Path.home() / ".claude" / "session-logging"
+    path = logger / "installation_id"
+    with contextlib.suppress(OSError):
+        value = path.read_text(encoding="utf-8").strip()
+        if value:
+            return value
     value = str(uuid.uuid4())
     with contextlib.suppress(OSError):
-        write_text_atomic(base / "installation_id", f"{value}\n")
+        write_text_atomic(path, f"{value}\n")
+        return path.read_text(encoding="utf-8").strip() or value
     return value
 
 

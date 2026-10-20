@@ -17,6 +17,7 @@ Nothing here reads, stores or sends prompts, queries, passages or file contents.
 """
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
 import os
@@ -237,8 +238,8 @@ def session_kind(payload, env=None) -> str:
     env = os.environ if env is None else env
     if not isinstance(payload, dict):
         return "unknown"
-    if payload.get("agent_id"):
-        return "bot"  # A subagent's hook call; its parent session is the human one.
+    if payload.get("agent_id") or payload.get("agent_type"):
+        return "bot"  # A subagent (or --agent) hook call; never limited.
     entrypoint = env.get(HUMAN_ENTRYPOINT_HINT) or transcript_entrypoint(payload)
     if not isinstance(entrypoint, str) or not entrypoint.strip():
         return "unknown"
@@ -309,7 +310,12 @@ _E3_REMOTE = re.compile(
 )
 
 
-def git(cwd: str, *args: str, timeout: float = 0.5) -> str | None:
+def git(cwd: str, *args: str, timeout: float | None = None) -> str | None:
+    if timeout is None:  # Bounded so a slow machine skips a cue instead of stalling the hook.
+        try:
+            timeout = float(os.environ.get("E3_SESH_GIT_TIMEOUT_SECONDS") or 2.0)
+        except ValueError:
+            timeout = 2.0
     try:
         result = subprocess.run(["git", "-C", cwd, *args], capture_output=True, text=True,
                                 check=False, timeout=timeout)
@@ -389,6 +395,13 @@ def current_turn(payload, env=None, base: Path | None = None) -> str | None:
 
 def _search_marker(sid: str, turn: str, base: Path) -> Path:
     return base / "turns" / f"{digest(sid)}.{digest(turn, 16)}.searched"
+
+
+def release_search(payload, env=None, base: Path | None = None) -> None:
+    """A search that failed or was refused at the permission prompt gives the turn its search back."""
+    sid, turn = session_id(payload), current_turn(payload, env, base)
+    if sid is not None and turn is not None:
+        _search_marker(sid, turn, base or state_dir(env)).unlink(missing_ok=True)
 
 
 def searched_this_turn(payload, env=None, base: Path | None = None) -> bool:
@@ -578,16 +591,18 @@ def plan_cue_decision(payload, env=None, base: Path | None = None):
     remote = git(cwd, "remote", "get-url", "origin") or ""
     topic = digest(f"{remote}\n{plan_topic(relative)}", 64)
     state_path = _plan_state_path(sid, base)
-    state = _read_plan_state(state_path)
-    if topic in state["topics"] or state["fires"] >= PLAN_CUE_MAX_PER_SESSION:
-        return None, None
-    arm = sesh_arm(payload, env)
-    state["fires"] += 1
-    state["topics"].append(topic)
     state_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    tmp = state_path.with_name(f"{state_path.name}.{uuid.uuid4().hex}.tmp")
-    tmp.write_text(json.dumps(state), encoding="utf-8")
-    tmp.replace(state_path)
+    with open(state_path.with_suffix(".lock"), "a", encoding="utf-8") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)  # Parallel Writes must not both take the last slot.
+        state = _read_plan_state(state_path)
+        if topic in state["topics"] or state["fires"] >= PLAN_CUE_MAX_PER_SESSION:
+            return None, None
+        state["fires"] += 1
+        state["topics"].append(topic)
+        tmp = state_path.with_name(f"{state_path.name}.{uuid.uuid4().hex}.tmp")
+        tmp.write_text(json.dumps(state), encoding="utf-8")
+        tmp.replace(state_path)
+    arm = sesh_arm(payload, env)
     metadata = {"sesh_plan_cue": "withheld" if arm == "holdout" else "shown",
                 "sesh_plan_kind": kind, "sesh_plan_topic_sha256": topic,
                 "sesh_plan_cue_index": state["fires"]}

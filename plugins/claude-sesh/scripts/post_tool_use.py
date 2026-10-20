@@ -16,6 +16,14 @@ def main() -> None:
         if not is_sesh_tool(payload.get("tool_name")):
             return
         failed = payload.get("hook_event_name") == "PostToolUseFailure"
+        if failed:
+            from sesh_cc import is_sesh_search_tool, release_search
+
+            if is_sesh_search_tool(payload.get("tool_name")):
+                try:
+                    release_search(payload)
+                except Exception:  # noqa: BLE001
+                    pass
         metadata = tool_metadata(payload, "failed" if failed else "finished")
         if not failed:
             metadata.update(search_metadata(payload))

@@ -24,7 +24,11 @@ one. Sesh tools are matched under any MCP server name, including claude.ai conne
 **Bots keep Sesh.** Subagents (`agent_id` in the hook payload) and SDK/headless sessions
 (`CLAUDE_CODE_ENTRYPOINT=sdk-*`, or the transcript's `entrypoint`) are never limited, never held
 out and never in the routine A/B. `E3_SESH_EXPERIMENT_OPTOUT=1` does the same for a person.
-Every check fails open: an error never blocks a tool.
+Every check fails open: an error never blocks a tool. The repository check uses `git` with a
+2-second limit (`E3_SESH_GIT_TIMEOUT_SECONDS`); on a machine too busy for that, the cue is skipped.
+A search that fails or is refused at the permission prompt gives the turn its search back. A
+turn ends only when you send a message, so a long autonomous run gets one search per message,
+as in Codex. The guard applies in both holdout arms (it is not a nudge).
 
 ### Arms
 

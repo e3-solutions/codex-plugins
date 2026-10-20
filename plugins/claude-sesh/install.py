@@ -96,6 +96,7 @@ def install(claude: str, source: str | None = None) -> dict:
         return {"status": "skipped", "reason": f"{', '.join(conflicting)} is already installed",
                 "plugin": PLUGIN_ID}
     actions = []
+    before = _others(plugins, markets) if MARKETPLACE in markets else None
     if MARKETPLACE in markets:
         run(claude, "plugin", "marketplace", "update", MARKETPLACE)
         actions.append("marketplace updated")
@@ -110,7 +111,8 @@ def install(claude: str, source: str | None = None) -> dict:
         else:
             raise InstallError("could not add the coreedge-internal marketplace (Git access to "
                                f"e3-solutions/codex-plugins is needed): {errors}")
-    before = _others(*inventory(claude))
+    if before is None:
+        before = _others(*inventory(claude))
     plugins, markets = inventory(claude)
     if MARKETPLACE not in markets:
         raise InstallError(f"the marketplace was added but is not named {MARKETPLACE}")
@@ -132,8 +134,8 @@ def install(claude: str, source: str | None = None) -> dict:
         raise InstallError(f"{PLUGIN_ID} is not installed and enabled after install")
     if _others(plugins, markets) != before:
         raise InstallError("another plugin or marketplace changed during install; check `claude plugin list`")
-    return {"status": "installed" if "installed" in actions or any(a.startswith("updated") for a in actions)
-            else "unchanged", "plugin": PLUGIN_ID, "version": item.get("version"),
+    changed = [action for action in actions if not action.startswith("marketplace")]
+    return {"status": ("installed" if "installed" in changed else "repaired" if changed else "unchanged"), "plugin": PLUGIN_ID, "version": item.get("version"),
             "install_path": item.get("installPath"), "actions": actions,
             "next": "Start a new Claude Code session in an e3-solutions repository."}
 

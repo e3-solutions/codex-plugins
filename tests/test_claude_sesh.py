@@ -38,6 +38,7 @@ sys.modules["sesh_cc"] = cc
 linking = load(SCRIPTS / "sesh_linking.py", "sesh_linking")
 sys.modules["sesh_linking"] = linking
 
+os.environ.setdefault("E3_SESH_GIT_TIMEOUT_SECONDS", "30")  # Loaded CI machines.
 SEARCH = "mcp__cf0ec861-5a4e-415b-b73e-6e017f49ace3__sesh__search_coding_sessions"  # claude.ai connector
 LOCAL_SEARCH = "mcp__cosmos__sesh__search_coding_sessions"
 ASK = "mcp__cosmos__sesh__ask_sesh"
@@ -87,9 +88,11 @@ def state(tmp_path, monkeypatch):
     base = tmp_path / "state"
     monkeypatch.setenv("E3_SESH_STATE_DIR", str(base))
     monkeypatch.setenv("CLAUDE_SESSION_LOG_AUTO_UPLOAD", "0")
+    monkeypatch.setenv("CLAUDE_SESSION_LOG_STATE_DIR", str(tmp_path / "logger-state"))
     for name in list(os.environ):
         if name.startswith("E3_SESH_") and name != "E3_SESH_STATE_DIR":
             monkeypatch.delenv(name)
+    monkeypatch.setenv("E3_SESH_GIT_TIMEOUT_SECONDS", "30")
     monkeypatch.setenv("CLAUDE_CODE_ENTRYPOINT", "cli")
     return base
 
@@ -217,6 +220,7 @@ def test_session_kind(tmp_path):
     assert cc.session_kind({"transcript_path": str(transcript)}, {}) == "human"
     assert cc.session_kind({"transcript_path": "/nope"}, {}) == "unknown"
     assert cc.session_kind({"agent_id": "x"}, HUMAN) == "bot"
+    assert cc.session_kind({"agent_type": "Explore"}, HUMAN) == "bot"
     assert cc.session_kind({}, {"CLAUDE_CODE_ENTRYPOINT": "claude-vscode"}) == "human"
 
 
@@ -414,7 +418,7 @@ def test_duration(state):
 
 def run_hook(script, body, env):
     result = subprocess.run([sys.executable, str(SCRIPTS / script)], input=json.dumps(body),
-                            capture_output=True, text=True, env=env, timeout=30)
+                            capture_output=True, text=True, env=env, timeout=120)
     assert result.returncode == 0, result.stderr
     return result.stdout.strip()
 
@@ -427,7 +431,7 @@ def queued(base):
 def test_hook_scripts_end_to_end(repo, tmp_path):
     base = tmp_path / "hookstate"
     env = {"PATH": os.environ["PATH"], "HOME": str(tmp_path / "home"), "E3_SESH_STATE_DIR": str(base),
-           "CLAUDE_SESSION_LOG_AUTO_UPLOAD": "0", "CLAUDE_CODE_ENTRYPOINT": "cli",
+           "CLAUDE_SESSION_LOG_AUTO_UPLOAD": "0", "CLAUDE_CODE_ENTRYPOINT": "cli", "E3_SESH_GIT_TIMEOUT_SECONDS": "30",
            "CLAUDE_PLUGIN_ROOT": str(tmp_path / "plugins/cache/coreedge-internal/sesh/0.1.0")}
     out = run_hook("session_start.py", payload("SessionStart", repo, source="startup"), env)
     assert json.loads(out)["hookSpecificOutput"]["additionalContext"] == cc.CONTEXT
@@ -470,7 +474,8 @@ def test_hook_scripts_end_to_end(repo, tmp_path):
 def test_hook_scripts_for_bots_and_holdout(repo, tmp_path):
     base = tmp_path / "botstate"
     env = {"PATH": os.environ["PATH"], "HOME": str(tmp_path / "home"), "E3_SESH_STATE_DIR": str(base),
-           "CLAUDE_SESSION_LOG_AUTO_UPLOAD": "0", "CLAUDE_CODE_ENTRYPOINT": "sdk-ts"}
+           "CLAUDE_SESSION_LOG_AUTO_UPLOAD": "0", "CLAUDE_CODE_ENTRYPOINT": "sdk-ts",
+           "E3_SESH_GIT_TIMEOUT_SECONDS": "30"}
     run_hook("user_prompt_submit.py", payload("UserPromptSubmit", repo, prompt="go"), env)
     for call in ("a", "b", "c"):
         assert run_hook("pre_tool_use.py", payload("PreToolUse", repo, tool_name=SEARCH, tool_use_id=call), env) == ""
@@ -480,3 +485,99 @@ def test_hook_scripts_for_bots_and_holdout(repo, tmp_path):
     assert run_hook("pre_tool_use.py", write(repo, "src/new_module.py", session=HOLDOUT), held) == ""
     arms = {e["metadata"]["sesh_arm"] for e in queued(base)}
     assert arms == {"bot", "holdout"}
+
+
+# Installer (a fake `claude` CLI; the real one is exercised by hand in a throwaway CLAUDE_CONFIG_DIR) ---
+
+FAKE_CLAUDE = r'''#!/usr/bin/env python3
+import json, os, sys
+path = os.environ["FAKE_CLAUDE_STATE"]
+state = json.load(open(path))
+args = [a for a in sys.argv[1:] if a != "--json"]
+state.setdefault("calls", []).append(args)
+out = None
+if args[:2] == ["plugin", "list"]:
+    out = [dict(p, id=k) for k, p in state["plugins"].items()]
+elif args[:3] == ["plugin", "marketplace", "list"]:
+    out = [dict(m, name=k) for k, m in state["markets"].items()]
+elif args[:3] == ["plugin", "marketplace", "add"]:
+    state["markets"]["coreedge-internal"] = {"source": "git", "url": args[3]}
+elif args[:3] == ["plugin", "marketplace", "update"]:
+    pass
+elif args[:2] == ["plugin", "install"]:
+    state["plugins"][args[2]] = {"version": "0.1.0", "scope": "user", "enabled": True}
+elif args[:2] == ["plugin", "enable"]:
+    state["plugins"][args[2]]["enabled"] = True
+elif args[:2] == ["plugin", "uninstall"]:
+    state["plugins"].pop(args[2])
+json.dump(state, open(path, "w"))
+if out is not None:
+    print(json.dumps(out))
+'''
+
+
+@pytest.fixture
+def fake_claude(tmp_path, monkeypatch):
+    binary = tmp_path / "claude"
+    binary.write_text(FAKE_CLAUDE)
+    binary.chmod(0o755)
+    state_path = tmp_path / "fake_state.json"
+    monkeypatch.setenv("FAKE_CLAUDE_STATE", str(state_path))
+
+    def setup(plugins=None, markets=None):
+        state_path.write_text(json.dumps({"plugins": plugins or {}, "markets": markets or {}}))
+        return str(binary)
+
+    setup.read = lambda: json.loads(state_path.read_text())
+    return setup
+
+
+def test_installer(fake_claude):
+    installer = load(PLUGIN / "install.py", "claude_sesh_install")
+    other = {"claude-session-logging@coreedge-internal": {"version": "0.2.18", "scope": "user", "enabled": True}}
+    claude = fake_claude(plugins=dict(other))
+    result = installer.install(claude)
+    assert result["status"] == "installed" and result["plugin"] == "sesh@coreedge-internal"
+    state = fake_claude.read()
+    assert state["markets"]["coreedge-internal"]["url"] == installer.SOURCES[0]
+    assert state["plugins"]["claude-session-logging@coreedge-internal"] == other["claude-session-logging@coreedge-internal"]
+    assert installer.install(claude)["status"] == "unchanged"
+    state["plugins"]["sesh@coreedge-internal"]["enabled"] = False
+    fake_claude(plugins=state["plugins"], markets=state["markets"])
+    repaired = installer.install(claude)
+    assert repaired["status"] == "repaired" and "enabled" in repaired["actions"]
+    assert installer.uninstall(claude)["status"] == "uninstalled"
+    state = fake_claude.read()
+    assert "coreedge-internal" in state["markets"] and list(state["plugins"]) == list(other)
+    assert installer.uninstall(claude)["status"] == "not-installed"
+
+
+def test_installer_refuses_a_second_sesh(fake_claude):
+    installer = load(PLUGIN / "install.py", "claude_sesh_install_conflict")
+    claude = fake_claude(plugins={"sesh@somewhere-else": {"version": "9", "enabled": True}})
+    assert installer.install(claude)["status"] == "skipped"
+    assert not any(call[:2] == ["plugin", "install"] for call in fake_claude.read()["calls"])
+
+
+def test_failed_search_gives_the_turn_its_search_back(repo, state):
+    cc.start_turn(payload("UserPromptSubmit", repo))
+    p = payload("PreToolUse", repo, tool_name=SEARCH)
+    assert cc.one_per_turn_denial(p) is None
+    cc.release_search(p)
+    assert cc.one_per_turn_denial(p) is None
+    assert cc.one_per_turn_denial(p) is not None
+
+
+def test_shares_the_logger_installation_id_and_drops_stale_events(repo, state, tmp_path):
+    logger = tmp_path / "logger-state"
+    logger.mkdir(exist_ok=True)
+    (logger / "installation_id").write_text("logger-id\n")
+    linking.capture(payload("SessionStart", repo), event_type="environment_snapshot", hook_event="SessionStart")
+    sent = []
+    linking.drain_queue(post=sent.append)
+    assert sent[0]["client"]["installation_id"] == "logger-id"
+    linking.capture(payload("SessionStart", repo), event_type="environment_snapshot", hook_event="SessionStart")
+    for path in (state / "session-logging/queue/pending").glob("*.json"):
+        os.utime(path, (0, 0))
+    result = linking.drain_queue(post=sent.append)
+    assert result["uploaded"] == 0 and result["dead_lettered"] == 1 and len(sent) == 1
