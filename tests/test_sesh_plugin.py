@@ -51,7 +51,8 @@ def _session(arm: str) -> str:
 
     for index in range(1000):
         candidate = f"019a0c52-0000-7000-8000-{index:012d}"
-        if sesh_context.routine_arm(candidate) == arm:
+        # COR-4887: a treated session (not in the default 15% holdout), so every nudge applies.
+        if sesh_context.routine_arm(candidate) == arm and sesh_context.holdout_bucket(candidate) >= 50:
             return candidate
     raise AssertionError(arm)
 
@@ -75,9 +76,11 @@ def test_versions_agree_everywhere():
     assert session_logging.PLUGIN_NAME == "sesh" and session_logging.PLUGIN_VERSION == version
 
 
-def test_version_never_reuses_a_logger_version():
-    # Draft #92 and later logger releases keep the 0.2.x line; this plugin starts its own.
-    assert not _manifest()["version"].startswith("0.2.")
+def test_version_never_equals_the_loggers_version():
+    # COR-4887: Vansh set this plugin to 0.2.0. Versions are per plugin name, so only an exact
+    # match with the logger's own release would read ambiguously in a codex_setup snapshot.
+    logger = json.loads((LOGGER / ".codex-plugin/plugin.json").read_text())["version"]
+    assert _manifest()["version"] == "0.2.0" and _manifest()["version"] != logger
 
 
 def test_hooks_point_at_this_plugins_scripts():
@@ -113,8 +116,9 @@ def test_fits_the_jolly_roger_native_plugin_payload_rules():
         assert mode in {"100644", "100755"}, (path, mode)
 
 
-@pytest.mark.parametrize("name", ["scripts/sesh_context.py", "scripts/sesh_need.py",
-                                  "scripts/drain_queue.py", "skills/search-coding-sessions/SKILL.md"])
+@pytest.mark.parametrize("name", ["scripts/sesh_context.py", "scripts/sesh_need.py", "scripts/plan_cue.py",
+                                  "scripts/sesh_hooks.py", "scripts/drain_queue.py",
+                                  "skills/search-coding-sessions/SKILL.md"])
 def test_sesh_code_is_the_loggers_code_byte_for_byte(name):
     assert (SESH / name).read_bytes() == (LOGGER / name).read_bytes()
 
@@ -373,7 +377,7 @@ def test_alongside_the_logger_snapshot_still_records_the_sesh_plugin_version(tmp
     [snapshot] = [e for e in machine.events("logger") if e.get("event_type") == "environment_snapshot"]
     detail = json.loads((tmp_path / "logger-state" / snapshot["local_content_path"]).read_text())
     plugins = {(s.get("plugin"), s.get("version")) for s in detail["metadata"]["codex_setup"]["skills"]}
-    assert ("sesh", _manifest()["version"]) in plugins and ("codex-session-logging", "0.2.38") in plugins
+    assert ("sesh", _manifest()["version"]) in plugins and ("codex-session-logging", json.loads((LOGGER / ".codex-plugin/plugin.json").read_text())["version"]) in plugins
 
 
 @pytest.mark.parametrize("change", ["disabled", "no-cache"])

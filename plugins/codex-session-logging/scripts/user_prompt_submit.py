@@ -13,7 +13,7 @@ def main() -> None:
     except Exception as exc:  # noqa: BLE001 - logging must not interrupt Codex.
         print(f"codex-session-logging capture failed: {exc}", file=sys.stderr)
         return
-    cue = forum_meta = None
+    cue = forum_meta = nudge = None
     try:
         from forum_cue import forum_cue_decision
 
@@ -21,16 +21,24 @@ def main() -> None:
     except Exception:
         pass  # Forum guidance must not interrupt logging or the user's prompt.
     try:
-        from sesh_need import with_past_work_cue
+        from sesh_need import with_past_work_nudge
 
-        cue = with_past_work_cue(cue, payload)  # COR-4811, on unless E3_SESH_PAST_WORK_CUE=0/false/no/off.
+        # COR-4811, on unless E3_SESH_PAST_WORK_CUE=0/false/no/off; COR-4887 exposure labels.
+        cue, nudge = with_past_work_nudge(cue, payload)
     except Exception:
-        pass  # Sesh guidance must not interrupt logging or the user's prompt.
+        nudge = None  # Sesh guidance must not interrupt logging or the user's prompt.
     try:
         if cue:
             print(cue, flush=True)
     except Exception:
         pass
+    if nudge:
+        try:
+            from sesh_hooks import capture_nudge
+
+            capture_nudge(payload, nudge, "UserPromptSubmit")
+        except Exception as exc:  # noqa: BLE001 - logging must not interrupt Codex.
+            print(f"codex-session-logging capture failed: {exc}", file=sys.stderr)
     try:
         if forum_meta:
             capture_hook_event(payload, event_name="UserPromptSubmit", extra_metadata=forum_meta)

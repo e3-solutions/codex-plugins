@@ -1,6 +1,6 @@
 {
   "name": "sesh",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Sesh prior-work cues, the one-search-per-turn guard and Sesh search linking for E3 Codex sessions.",
   "author": {
     "name": "Core Edge Solution"

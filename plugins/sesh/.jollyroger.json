@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "id": "sesh",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "owner": "Core Edge",
   "providers": [
     "codex"
@@ -16,6 +16,8 @@
     "scripts/user_prompt_submit.py",
     "scripts/pre_tool_use.py",
     "scripts/post_tool_use.py",
+    "scripts/plan_cue.py",
+    "scripts/sesh_hooks.py",
     "skills/search-coding-sessions"
   ],
   "hook_defaults": {

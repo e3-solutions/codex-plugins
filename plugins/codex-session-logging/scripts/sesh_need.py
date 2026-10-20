@@ -2,14 +2,17 @@
 setting either to 0/false/no/off turns that one off.
 
 E3_SESH_ONE_PER_TURN (PreToolUse): allow one Sesh coding-session search per turn and deny
-the next one in the same turn. In the Oct 16, 2026 study a second search in the same turn
-helped 0 of 51 times. Opening, find-similar and ask_sesh are never blocked. Bots and
+the next one in the same turn. In the Oct 16, 2026 study no finished second search in a turn
+was judged helpful (39 no, 12 unknown of 51); that is not proof of no harm, so every denial is
+logged with the turn's first-search outcome and the COR-4887 holdout (no guard) measures it. Opening, find-similar and ask_sesh are never blocked. Bots and
 E3_SESH_EXPERIMENT_OPTOUT keep unlimited searches. Any error allows the call.
 
 E3_SESH_PAST_WORK_CUE (UserPromptSubmit): when a person's own message in an e3-solutions
 repository asks about earlier work, add a one-line cue to search Sesh once. The pattern is
 the study's tight one (about 73% precise on the prompts it was built from, against 26% for a
 plain past-work regex on messages people typed). Nothing is logged or stored for it.
+
+Neither switch acts in a COR-4887 holdout session (E3_SESH_HOLDOUT_PCT, see sesh_context).
 """
 from __future__ import annotations
 
@@ -19,19 +22,22 @@ import os
 import re
 from pathlib import Path
 
-from sesh_context import DISABLE_ENVS, _e3_repository, _falsy, automated_thread, opted_out, transcript_header
+from sesh_context import DISABLE_ENVS, _e3_repository, _falsy, automated_thread, held_out, opted_out, transcript_header
 from session_logging import is_sesh_search_tool
 
 ONE_PER_TURN_ENV = "E3_SESH_ONE_PER_TURN"
 PAST_WORK_CUE_ENV = "E3_SESH_PAST_WORK_CUE"
 
 DENY_REASON = (
-    "Sesh: this turn already ran a coding-session search, and a second search in the same "
-    "turn has not helped before. Use the results you already have, or open one with "
-    "open_session_passages. You can search again in the next turn."
+    "Sesh: this plugin allows one coding-session search per turn (E3_SESH_ONE_PER_TURN), and this "
+    "turn already ran one. Use or open the results you already have (open_session_passages), or "
+    "search again in the next turn."
 )
-# Added to this call's existing tool_call_started event so a denial can be counted.
+# Added to this call's existing tool_call_started event so a denial can be counted (the event
+# already carries the turn id). sesh_turn_guard_first says how this turn's first search ended:
+# succeeded, failed or unknown (still running, or no outcome reported).
 DENIED_METADATA = {"sesh_turn_guard": "denied"}
+FIRST_OUTCOMES = ("succeeded", "failed", "unknown")
 
 PAST_WORK_CUE = (
     "Sesh: this message asks about earlier work. Make one Sesh coding-session search for it "
@@ -100,12 +106,15 @@ def _denial(payload, env, directory: Path) -> str | None:
     turn = _string(payload, "turn_id", "turnId")
     if session is None or turn is None or opted_out(env) or not _human_thread(payload):
         return None  # Bots keep Sesh; unknown turns or threads are allowed.
+    if held_out(payload, env):
+        return None  # COR-4887 holdout: Sesh runs exactly as with no plugin.
     folder = directory / _digest(session)
     folder.mkdir(mode=0o700, parents=True, exist_ok=True)
     marker = folder / _digest(turn)
     try:
         os.close(os.open(marker, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600))
     except FileExistsError:
+        _LAST_FIRST_OUTCOME[0] = first_outcome(marker)
         return json.dumps({"hookSpecificOutput": {
             "hookEventName": "PreToolUse",
             "permissionDecision": "deny",
@@ -117,6 +126,42 @@ def _denial(payload, env, directory: Path) -> str | None:
     return None
 
 
+_LAST_FIRST_OUTCOME = ["unknown"]
+
+
+def first_outcome(marker: Path) -> str:
+    try:
+        value = marker.read_text(encoding="utf-8").strip()
+    except (OSError, UnicodeError):
+        return "unknown"
+    return value if value in FIRST_OUTCOMES else "unknown"
+
+
+def denied_metadata() -> dict:
+    """DENIED_METADATA plus how this turn's first search ended (call right after a denial)."""
+    return {**DENIED_METADATA, "sesh_turn_guard_first": _LAST_FIRST_OUTCOME[0]}
+
+
+def record_search_outcome(payload, success, directory: Path | None = None) -> None:
+    """PostToolUse: note on this turn's guard marker whether its first search succeeded. Never raises."""
+    try:
+        if not isinstance(payload, dict) or not is_sesh_search_tool(payload.get("tool_name")):
+            return
+        session = _string(payload, "session_id", "sessionId")
+        turn = _string(payload, "turn_id", "turnId")
+        if session is None or turn is None:
+            return
+        marker = (directory or state_dir()) / _digest(session) / _digest(turn)
+        if not marker.exists() or first_outcome(marker) != "unknown":
+            return  # No guard marker (guard off, bot, holdout) or the first outcome is already known.
+        outcome = "unknown" if success is None else ("succeeded" if success else "failed")
+        fd = os.open(marker, os.O_WRONLY | os.O_TRUNC)
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            stream.write(outcome)
+    except Exception:  # noqa: BLE001
+        return
+
+
 def asks_about_past_work(prompt) -> bool:
     return (
         isinstance(prompt, str)
@@ -126,35 +171,47 @@ def asks_about_past_work(prompt) -> bool:
     )
 
 
-def past_work_cue(payload, env=None) -> str | None:
-    """The one-line cue for a person's past-work question in an E3 repository, else None."""
+def past_work_decision(payload, env=None):
+    """(cue or None, COR-4887 exposure labels or None) for a person's past-work question."""
     env = os.environ if env is None else env
     if not switch_on(env, PAST_WORK_CUE_ENV) or not isinstance(payload, dict):
-        return None
+        return None, None
     if payload.get("hook_event_name", "UserPromptSubmit") != "UserPromptSubmit":
-        return None
+        return None, None
     if not asks_about_past_work(payload.get("prompt")):
-        return None
+        return None, None
     if opted_out(env) or any(_falsy(env.get(name)) for name in DISABLE_ENVS):
-        return None
+        return None, None
     if not _human_thread(payload) or not _e3_repository(payload):
-        return None
-    return PAST_WORK_CUE
+        return None, None
+    if held_out(payload, env):
+        return None, {"sesh_past_work_cue": "withheld", "sesh_withheld_by": "holdout"}
+    return PAST_WORK_CUE, {"sesh_past_work_cue": "shown"}
+
+
+def past_work_cue(payload, env=None) -> str | None:
+    """The one-line cue for a person's past-work question in an E3 repository, else None."""
+    return past_work_decision(payload, env)[0]
 
 
 def with_past_work_cue(output: str | None, payload, env=None) -> str | None:
     """Add the cue to the UserPromptSubmit output (None or hook JSON); unchanged when it does not fire."""
+    return with_past_work_nudge(output, payload, env)[0]
+
+
+def with_past_work_nudge(output: str | None, payload, env=None):
+    """(output with the cue added when it fires, exposure labels or None). Never raises."""
     try:
-        cue = past_work_cue(payload, env)
+        cue, nudge = past_work_decision(payload, env)
         if cue is None:
-            return output
+            return output, nudge
         if not output:
             return json.dumps({"hookSpecificOutput": {
                 "hookEventName": "UserPromptSubmit", "additionalContext": cue,
-            }})
+            }}), nudge
         merged = json.loads(output)
         specific = merged["hookSpecificOutput"]
         specific["additionalContext"] = f"{specific['additionalContext']}\n\n{cue}"
-        return json.dumps(merged)
+        return json.dumps(merged), nudge
     except Exception:  # noqa: BLE001 - the cue must never change or break the prompt.
-        return output
+        return output, None
