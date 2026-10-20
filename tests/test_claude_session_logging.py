@@ -1203,3 +1203,27 @@ def test_transcript_usage_seen_ids_are_bounded_and_persisted(tmp_path, monkeypat
         handle.write(json.dumps(lines[-1]) + "\n")
     result = transcript_sync.sync_transcript_records("bounded", transcript, auto_drain=False)
     assert result["usage"] == 0
+
+
+def test_transcript_usage_rollout_boundary_can_count_same_response_twice(tmp_path, monkeypatch):
+    monkeypatch.setenv("CLAUDE_SESSION_LOG_STATE_DIR", str(tmp_path / "state"))
+    transcript_sync = load_scripts_module("transcript_sync")
+    repo = init_git_repo(tmp_path / "repo", "https://github.com/e3-solutions/codex-plugins.git")
+    transcript = tmp_path / "rollout.jsonl"
+    first = _assistant_line("first", "2026-07-16T00:00:05.000Z", repo,
+                            text="First block", usage={"input_tokens": 100, "output_tokens": 20})
+    first["message"]["id"] = "msg-straddles-rollout"
+    transcript.write_text(json.dumps(first) + "\n")
+    transcript_sync.sync_transcript_records("rollout", transcript, auto_drain=False)
+    # A pre-deploy cursor has usage totals and a line offset, but no ID window.
+    cursor = transcript_sync._read_cursor(tmp_path / "state", "rollout")
+    cursor.pop("seen_message_ids")
+    transcript_sync._write_cursor(tmp_path / "state", "rollout", cursor)
+    second = dict(first, uuid="second")
+    second["message"] = dict(first["message"], content=[{"type": "text", "text": "Second block"}])
+    with transcript.open("a") as stream:
+        stream.write(json.dumps(second) + "\n")
+    transcript_sync.sync_transcript_records("rollout", transcript, auto_drain=False)
+    cursor = transcript_sync._read_cursor(tmp_path / "state", "rollout")
+    assert cursor["usage"]["output_tokens"] == 40
+    assert cursor["seen_message_ids"] == ["msg-straddles-rollout"]
