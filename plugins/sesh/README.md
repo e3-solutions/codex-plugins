@@ -80,12 +80,12 @@ One command, on a Mac or Linux machine with Codex, Python 3 and Git access to th
 
 Then start a new Codex thread, and trust the sesh hooks once if Codex asks.
 
-`install.py` installs this plugin as pinned in the script (commit `f22c6ec`, version `0.1.0`), using
+`install.py` installs this plugin as pinned in the script (commit `c6411e1`, version `0.2.0`; COR-4887 plan cue and holdout), using
 the same Codex commands as `setup.py`:
 
 - It writes a private local marketplace `e3-sesh` at `~/.codex/sesh/marketplace/<commit>/` from
   `git archive` of that commit, then runs `codex plugin marketplace add` and `codex plugin add sesh@e3-sesh`.
-  Codex puts the plugin in `~/.codex/plugins/cache/e3-sesh/sesh/0.1.0/` and enables it in `config.toml`.
+  Codex puts the plugin in `~/.codex/plugins/cache/e3-sesh/sesh/0.2.0/` and enables it in `config.toml`.
 - It is safe to rerun. A rerun repairs a disabled plugin, a missing cache or a changed marketplace
   copy, and otherwise changes nothing.
 - It touches no other plugin or marketplace and checks that afterwards. It writes no `hooks.json`

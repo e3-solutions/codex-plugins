@@ -80,14 +80,14 @@ def result(completed):
 def test_fresh_install_writes_cache_and_config_and_is_idempotent(home):
     first = result(run())
     assert first["status"] == "installed"
-    assert first["commit"] == install.COMMIT and first["version"] == "0.1.0"
-    cache = home / ".codex/plugins/cache/e3-sesh/sesh/0.1.0"
+    assert first["commit"] == install.COMMIT and first["version"] == install.VERSION == "0.2.0"
+    cache = home / ".codex/plugins/cache/e3-sesh/sesh/0.2.0"
     for script in ("session_start.py", "user_prompt_submit.py", "pre_tool_use.py", "post_tool_use.py"):
         assert (cache / "scripts" / script).is_file()
     assert (cache / "skills/search-coding-sessions/SKILL.md").is_file()
     config = (home / ".codex/config.toml").read_text()
     assert '[plugins."sesh@e3-sesh"]\nenabled = true' in config
-    assert plugins()["sesh@e3-sesh"]["version"] == "0.1.0"
+    assert plugins()["sesh@e3-sesh"]["version"] == "0.2.0"
     # The plugin's own hook command finds the installed script through $HOME.
     hook = json.loads((cache / "hooks/hooks.json").read_text())["hooks"]["SessionStart"][0]["hooks"][0]["command"]
     found = subprocess.run(["sh", "-c", hook.replace("exec python3", "echo")], capture_output=True, text=True,
@@ -148,9 +148,9 @@ def test_repairs_disabled_plugin_missing_cache_and_tampered_marketplace(home):
     assert result(run())["actions"] == ["installed plugin"]
     assert plugins()["sesh@e3-sesh"]["enabled"] is True
 
-    shutil.rmtree(home / ".codex/plugins/cache/e3-sesh/sesh/0.1.0")
+    shutil.rmtree(home / ".codex/plugins/cache/e3-sesh/sesh/0.2.0")
     assert result(run())["actions"] == ["installed plugin"]
-    assert (home / ".codex/plugins/cache/e3-sesh/sesh/0.1.0/scripts/session_start.py").is_file()
+    assert (home / ".codex/plugins/cache/e3-sesh/sesh/0.2.0/scripts/session_start.py").is_file()
 
     staged = home / ".codex/sesh/marketplace" / install.COMMIT / "plugins/sesh/scripts/sesh_need.py"
     staged.write_text("tampered")
@@ -171,5 +171,6 @@ def test_pinned_archive_matches_the_merged_plugin():
     files = install.plugin_files(ROOT)
     manifest = json.loads(files[".codex-plugin/plugin.json"][0])
     assert manifest == {**manifest, "name": "sesh", "version": install.VERSION}
-    assert "install.py" not in files  # the installer is not part of the pinned 0.1.0 release
-    assert all(mode == 0o644 for _, mode in files.values())
+    # From 0.2.0 the pinned tree includes this installer; hooks never run it.
+    assert all(mode == 0o644 for path, (_, mode) in files.items() if path != "install.py")
+    assert "scripts/plan_cue.py" in files and "scripts/sesh_hooks.py" in files
