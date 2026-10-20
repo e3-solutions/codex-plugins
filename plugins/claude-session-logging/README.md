@@ -11,6 +11,12 @@ Internal Claude Code plugin for Core Edge thread and tool metadata tracking.
 The plugin captures Claude Code lifecycle hooks, spools event records locally under `~/.claude/session-logging`, and queues upload-ready event records for the shared session ingest endpoint. It records session/thread boundaries and tool names/phases only. It does not upload tool inputs, tool outputs, assistant message text, or full user prompt text.
 
 Capture is scoped to repositories whose `origin` remote belongs to the `e3-solutions` GitHub organization. Other repositories return without writing local or remote session data.
+### Opt-in E3 directories outside a repo (COR-4900, off by default)
+
+Some E3 work runs from a scratch directory that is not a git repository, so it has no `origin` and is skipped. To count such a directory as E3, list it, either as `CLAUDE_SESSION_LOG_EXTRA_DIRS` (absolute paths separated by `:`) or one absolute path per line in `~/.claude/session-logging/extra-dirs` (or `$CLAUDE_SESSION_LOG_STATE_DIR/extra-dirs`). For a session whose cwd is that directory or below it **and has no git `origin`**, the plugin captures as for an E3 repository, adds the SessionStart Collective guidance, and shows the Forum decision cue. A real `origin` always wins, so a non-E3 repository inside a listed directory stays out. Relative paths, `/` and the home directory itself are ignored.
+
+These sessions upload the fixed `repo_remote` `https://github.com/e3-solutions/allowlisted-dir.git` (no repository has that name; it is shaped like an in-org remote so the existing ingest accepts it). No new path is uploaded; `cwd` is sent exactly as for repository sessions. The client refuses to upload that marker unless an extra directory is configured. Nothing changes for anyone who does not set this.
+
 
 Every emitted payload is tagged `metadata.agent = "claude"` (Codex tags `"codex"`), so the shared ingest, heartbeat dashboard, and codestat can label and classify sessions by coding agent. This is a metadata-only label and carries no user content.
 

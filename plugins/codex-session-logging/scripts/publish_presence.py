@@ -194,7 +194,7 @@ def eligible_thread(row: JsonDict) -> bool:
     required = ("id", "rollout_path", "cwd", "updated_at_ms")
     if any(not row.get(key) for key in required):
         return False
-    remote = row.get("git_origin_url") or session_logging.git_origin_remote(str(row["cwd"]))
+    remote = row.get("git_origin_url") or session_logging.session_repo_remote(str(row["cwd"]))
     if remote:
         row["git_origin_url"] = str(remote)
     return session_logging.remote_belongs_to_org(

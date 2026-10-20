@@ -97,7 +97,7 @@ def session_target(path: Path) -> JsonDict | None:
     if context is None:
         return None
     cwd = str(context["cwd"])
-    remote = session_logging.git_origin_remote(cwd)
+    remote = session_logging.session_repo_remote(cwd)
     if not session_logging.remote_belongs_to_org(remote, session_logging.allowed_github_org()):
         return None
     return {

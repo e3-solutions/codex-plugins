@@ -290,7 +290,7 @@ def eligible_rollout_thread(row: JsonDict) -> bool:
     path = Path(str(row["rollout_path"])).expanduser()
     if not path.is_file():
         return False
-    remote = row.get("git_origin_url") or session_logging.git_origin_remote(str(row["cwd"]))
+    remote = row.get("git_origin_url") or session_logging.session_repo_remote(str(row["cwd"]))
     if remote:
         row["git_origin_url"] = str(remote)
     return session_logging.remote_belongs_to_org(
