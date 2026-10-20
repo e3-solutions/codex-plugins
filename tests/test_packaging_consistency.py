@@ -10,18 +10,20 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 
 
-@pytest.mark.parametrize(
-    ("plugin", "release_manifest"),
-    [
-        ("linear-progress-sync", "update-manifest.json"),
-        ("codex-session-logging", ".jollyroger.json"),
-    ],
-)
-def test_plugin_version_matches_release_manifest(plugin, release_manifest):
-    root = ROOT / "plugins" / plugin
-    plugin_version = json.loads((root / ".codex-plugin/plugin.json").read_text())["version"]
-    release_version = json.loads((root / release_manifest).read_text())["version"]
-    assert plugin_version == release_version, f"{plugin}: {release_manifest} version differs"
+def version_manifest_pairs():
+    for plugin in sorted((ROOT / "plugins").iterdir()):
+        for plugin_manifest in (".codex-plugin/plugin.json", ".claude-plugin/plugin.json"):
+            for release_manifest in ("update-manifest.json", ".jollyroger.json"):
+                paths = (plugin / plugin_manifest, plugin / release_manifest)
+                if all(path.is_file() and "version" in json.loads(path.read_text()) for path in paths):
+                    yield pytest.param(*paths, id=f"{plugin.name}:{plugin_manifest}:{release_manifest}")
+
+
+@pytest.mark.parametrize(("plugin_manifest", "release_manifest"), list(version_manifest_pairs()))
+def test_plugin_version_matches_release_manifest(plugin_manifest, release_manifest):
+    plugin_version = json.loads(plugin_manifest.read_text())["version"]
+    release_version = json.loads(release_manifest.read_text())["version"]
+    assert plugin_version == release_version, f"{plugin_manifest}: {release_manifest} version differs"
 
 
 @pytest.mark.parametrize(
