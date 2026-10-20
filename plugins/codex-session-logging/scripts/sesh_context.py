@@ -70,6 +70,21 @@ WEEK_SALT_PATTERN = re.compile(r"[0-9]{4}-W(?:0[1-9]|[1-4][0-9]|5[0-3])")
 ROUTINE_AB_ID = "sesh_routine_v1"
 ROUTINE_AB_ENV = "E3_SESH_ROUTINE_AB"
 ROUTINE_ARMS = ("routine", "need_only")
+# COR-4887: session-level holdout, identical to plugins/claude-sesh (COR-4888) so a session id lands
+# in the same arm in both tools. E3_SESH_HOLDOUT_PCT (default 15, 0 turns it off, 0-100) of
+# human sessions get no Sesh nudge at all: no startup cue, no plan cue, no past-work cue, and
+# no one-search-per-turn guard. Sesh tools, the skill and all logging stay. Bots (automated
+# threads), opt-outs and unreadable threads are never held out. The holdout is decided first;
+# the routine A/B above then splits the treated sessions with its own independent hash:
+#   bucket = (b0 * 256 + b1) % 100 where b = sha256("sesh_holdout_v1:" + lower(trim(id)))
+#   SQL: (get_byte(h, 0) * 256 + get_byte(h, 1)) % 100 < 15  -> holdout
+#        with h = sha256(convert_to('sesh_holdout_v1:' || lower(btrim(id)), 'UTF8'))
+HOLDOUT_ID = "sesh_holdout_v1"
+HOLDOUT_ENV = "E3_SESH_HOLDOUT_PCT"
+HOLDOUT_DEFAULT_PCT = 15
+# sesh_arm, logged on every environment snapshot and Sesh event: holdout/treated are the
+# randomized arms; bot/optout/unassigned are never randomized and keep every nudge.
+SESH_ARMS = ("holdout", "treated", "bot", "optout", "unassigned")
 # Native Codex thread sources a person drives; anything else is an automated thread
 # (agent_created_thread, guardian_review, subagent, ...). Same split as publish_presence.
 HUMAN_THREAD_SOURCES = frozenset({"user"})
@@ -112,6 +127,61 @@ def routine_arm(session_id):
     normalized = str(session_id).strip().lower()
     digest = hashlib.sha256(f"{ROUTINE_AB_ID}:{normalized}".encode("utf-8")).digest()
     return ROUTINE_ARMS[digest[0] & 1]
+
+
+def holdout_pct(env=None):
+    """E3_SESH_HOLDOUT_PCT as 0-100, exactly as claude-sesh reads it: unset or not a number means 15."""
+    env = os.environ if env is None else env
+    raw = env.get(HOLDOUT_ENV)
+    if raw is None or not str(raw).strip():
+        return HOLDOUT_DEFAULT_PCT
+    try:
+        value = int(str(raw).strip())
+    except ValueError:
+        return HOLDOUT_DEFAULT_PCT
+    return min(max(value, 0), 100)
+
+
+def holdout_bucket(session_id):
+    """0-99 from the session id alone (independent of the routine A/B hash)."""
+    normalized = str(session_id).strip().lower()
+    digest = hashlib.sha256(f"{HOLDOUT_ID}:{normalized}".encode("utf-8")).digest()
+    return (digest[0] * 256 + digest[1]) % 100
+
+
+def sesh_arm(payload, env=None):
+    """COR-4887 arm of this session: holdout, treated, bot, optout or unassigned."""
+    env = os.environ if env is None else env
+    if opted_out(env):
+        return "optout"
+    session_id = _session_id(payload) if isinstance(payload, dict) else None
+    header = transcript_header(payload) if session_id is not None else None
+    if header is not None and automated_thread(header):
+        return "bot"  # Bots always keep Sesh and its nudges.
+    if session_id is None or header is None:
+        return "unassigned"
+    return "holdout" if holdout_bucket(session_id) < holdout_pct(env) else "treated"
+
+
+def held_out(payload, env=None):
+    """True when this human session is in the no-nudge holdout. Any error means not held out."""
+    try:
+        return sesh_arm(payload, env) == "holdout"
+    except Exception:  # noqa: BLE001 - fail open to today's behaviour.
+        return False
+
+
+def arm_metadata(payload, env=None):
+    """Labels for the event log: sesh_arm, plus sesh_routine_arm for treated sessions while the A/B is on."""
+    env = os.environ if env is None else env
+    try:
+        arm = sesh_arm(payload, env)
+    except Exception:  # noqa: BLE001
+        return {}
+    metadata = {"sesh_arm": arm, "sesh_holdout_pct": holdout_pct(env)}
+    if arm == "treated" and routine_ab_enabled(env):
+        metadata["sesh_routine_arm"] = routine_arm(_session_id(payload))
+    return metadata
 
 
 def uuid7_datetime(session_id):
@@ -225,16 +295,32 @@ def sesh_cue_decision(payload, env=None, now=None):
     The cue is shown at startup only. After compaction it is withheld unless
     E3_SESH_CUE_AFTER_COMPACTION is on; the experiment arm is still logged there.
     """
+    cue, metadata, _ = startup_nudge(payload, env, now)
+    return cue, metadata
+
+
+def startup_nudge(payload, env=None, now=None):
+    """(cue or None, experiment metadata or None, COR-4887 exposure labels or None).
+
+    The labels say whether today's routine cue was shown or withheld (holdout or need_only), so
+    exposure is logged separately from the session's assigned arm.
+    """
     env = os.environ if env is None else env
     compact = isinstance(payload, dict) and payload.get("source") == "compact"
     if compact and not cue_after_compaction(env) and not experiment_enabled(env):
-        return None, None  # Nothing to show or log; skip the git lookup.
+        return None, None, None  # Nothing to show or log; skip the git lookup.
     cue, metadata = _boundary_cue_decision(payload, env, now)
     if cue is not None and compact:
         cue = COMPACTION_CONTEXT if cue_after_compaction(env) else None
-    if cue is not None and routine_cue_withheld(payload, env):
-        cue = None  # COR-4808 need_only arm: no routine cue; Sesh itself is untouched.
-    return cue, metadata
+    if cue is None:
+        return None, metadata, None
+    if held_out(payload, env):
+        # COR-4887 holdout: no Sesh nudge of any kind; Sesh itself is untouched.
+        return None, metadata, {"sesh_startup_cue": "withheld", "sesh_withheld_by": "holdout"}
+    if routine_cue_withheld(payload, env):
+        # COR-4808 need_only arm: no routine cue; Sesh itself is untouched.
+        return None, metadata, {"sesh_startup_cue": "withheld", "sesh_withheld_by": "need_only"}
+    return cue, metadata, {"sesh_startup_cue": "shown"}
 
 
 def routine_cue_withheld(payload, env=None):

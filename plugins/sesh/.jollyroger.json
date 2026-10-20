@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "id": "sesh",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "owner": "Core Edge",
   "providers": [
     "codex"
@@ -16,6 +16,8 @@
     "scripts/user_prompt_submit.py",
     "scripts/pre_tool_use.py",
     "scripts/post_tool_use.py",
+    "scripts/plan_cue.py",
+    "scripts/sesh_hooks.py",
     "skills/search-coding-sessions"
   ],
   "hook_defaults": {
@@ -94,6 +96,11 @@
     {
       "id": "sesh-link-queue",
       "purpose": "Pending Sesh linkage events and the installation id (~/.codex/sesh/session-logging).",
+      "rollback_compatible": true
+    },
+    {
+      "id": "sesh-plan-cue",
+      "purpose": "COR-4887 plan-cue state per session: cue count, topic and folder hashes only (~/.codex/sesh-plan-cue).",
       "rollback_compatible": true
     },
     {

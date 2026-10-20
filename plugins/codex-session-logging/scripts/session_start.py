@@ -11,11 +11,11 @@ from session_logging import capture_hook_event, read_stdin_json, should_prompt_c
 
 def main() -> None:
     payload = read_stdin_json()
-    experiment = None
+    experiment = nudge = None
     try:
-        from sesh_context import sesh_cue_decision
+        from sesh_context import startup_nudge
 
-        context, experiment = sesh_cue_decision(payload)
+        context, experiment, nudge = startup_nudge(payload)
         if context:
             print(context, flush=True)
     except Exception:
@@ -31,10 +31,18 @@ def main() -> None:
         except Exception:
             pass  # An incomplete preview package must not stop telemetry.
     try:
-        if experiment:  # COR-4681 arm, only while E3_SESH_CUE_EXPERIMENT is on.
-            capture_hook_event(payload, event_name="SessionStart", extra_metadata=experiment)
-        else:
-            capture_hook_event(payload, event_name="SessionStart")
+        try:
+            from sesh_hooks import snapshot_metadata
+
+            # COR-4681 arm (only while E3_SESH_CUE_EXPERIMENT is on) and the COR-4887 sesh_arm.
+            labels = snapshot_metadata(payload, experiment)
+        except Exception:  # noqa: BLE001
+            labels = experiment
+        capture_hook_event(payload, event_name="SessionStart", extra_metadata=labels or None)
+        if nudge:
+            from sesh_hooks import capture_nudge
+
+            capture_nudge(payload, nudge, "SessionStart")  # COR-4887 exposure: shown or withheld.
         sync_after_hook(payload, event_name="SessionStart")
     except Exception as exc:  # noqa: BLE001 - logging must not interrupt Codex.
         print(f"codex-session-logging capture failed: {exc}", file=sys.stderr)

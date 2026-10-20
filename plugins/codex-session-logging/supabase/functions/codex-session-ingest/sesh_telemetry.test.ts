@@ -82,3 +82,46 @@ Deno.test("per-event Sesh labels never stick to the session row", () => {
   const old = { cwd: "/r", platform: "codex", tool_name: "x", sesh_request_id: "y" };
   assertEquals(sessionLevelMetadata(old), old);
 });
+
+Deno.test("COR-4887: guard first outcome, search scope and every cue's exposure, behind the same flag", () => {
+  const previous = Deno.env.get("CODEX_SESSION_INGEST_SESH_TELEMETRY");
+  const event = (event_type: string, metadata: JsonObject) =>
+    sanitizeEventPayload(
+      {
+        id: "7c1f0a52-2222-4333-8444-955566667778",
+        session_id: "6f0e2a1c-0000-4000-8000-000000000002",
+        seq: 1500000002,
+        event_type,
+        created_at: "2026-10-20T00:00:00.000Z",
+        metadata,
+      },
+      { metadata },
+    ).metadata as JsonObject;
+  const search = "mcp__cosmos__sesh__search_coding_sessions";
+  // Key order is the sanitizer's output order (assertEquals compares JSON text).
+  const denied = { tool_name: search, tool_phase: "started", sesh_arm: "treated", sesh_plugin_version: "0.2.40",
+    sesh_turn_guard: "denied", sesh_turn_guard_first: "failed", sesh_scope: "team" };
+  try {
+    Deno.env.delete("CODEX_SESSION_INGEST_SESH_TELEMETRY");
+    assertEquals(event("tool_call_started", denied), { tool_name: search, tool_phase: "started" });
+    assertEquals(event("sesh_startup_cue_withheld", { sesh_startup_cue: "withheld", sesh_withheld_by: "holdout" }),
+      {});
+
+    Deno.env.set("CODEX_SESSION_INGEST_SESH_TELEMETRY", "1");
+    assertEquals(event("tool_call_started", denied), denied);
+    // First outcome only with a denial; scope only on searches; bad values dropped.
+    const { sesh_turn_guard: _g, sesh_turn_guard_first: _f, ...allowed } = denied;
+    assertEquals(event("tool_call_started", { ...allowed, sesh_turn_guard_first: "failed" }), allowed);
+    assertEquals(event("tool_call_started", { ...denied, sesh_scope: "everyone", sesh_turn_guard_first: "maybe" }),
+      { tool_name: search, tool_phase: "started", sesh_arm: "treated", sesh_plugin_version: "0.2.40",
+        sesh_turn_guard: "denied" });
+    assertEquals(event("sesh_startup_cue_withheld", { sesh_arm: "holdout", sesh_startup_cue: "withheld",
+      sesh_withheld_by: "holdout" }), { sesh_arm: "holdout", sesh_startup_cue: "withheld", sesh_withheld_by: "holdout" });
+    assertEquals(event("sesh_past_work_cue_shown", { sesh_past_work_cue: "shown", prompt: "text" }),
+      { sesh_past_work_cue: "shown" });
+    assertEquals(sessionLevelMetadata({ sesh_arm: "treated", sesh_withheld_by: "holdout", sesh_scope: "team" }),
+      { sesh_arm: "treated" });
+  } finally {
+    restoreEnv("CODEX_SESSION_INGEST_SESH_TELEMETRY", previous);
+  }
+});

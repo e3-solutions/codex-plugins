@@ -36,7 +36,9 @@ def session_with_arm(arm: str, moment: datetime) -> str:
     salt = context.iso_week_salt(moment)
     while True:
         session_id = uuid7(moment, rng)
-        if context.assign_arm(salt, session_id) == arm:
+        # COR-4887: a treated session in the routine arm, so hooks run as subprocesses show the cue too.
+        if (context.assign_arm(salt, session_id) == arm and context.holdout_bucket(session_id) >= 15
+                and context.routine_arm(session_id) == "routine"):
             return session_id
 
 

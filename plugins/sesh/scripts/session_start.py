@@ -15,11 +15,11 @@ def main() -> None:
             return  # codex-session-logging shows the cue and logs the session itself.
     except Exception:  # noqa: BLE001 - never interrupt Codex.
         return
-    experiment = None
+    experiment = nudge = None
     try:
-        from sesh_context import sesh_cue_decision
+        from sesh_context import startup_nudge
 
-        context, experiment = sesh_cue_decision(payload)
+        context, experiment, nudge = startup_nudge(payload)
         if context:
             print(context, flush=True)
     except Exception:
@@ -30,7 +30,17 @@ def main() -> None:
         # codex_setup in this snapshot lists the installed skills with plugin and version
         # (search-coding-sessions from plugin "sesh"), which is how searches in this session
         # are tied to the sesh plugin version. COR-4681 arm only while that experiment is on.
-        capture_hook_event(payload, event_name="SessionStart", extra_metadata=experiment or None)
+        try:
+            from sesh_hooks import snapshot_metadata
+
+            labels = snapshot_metadata(payload, experiment)  # Plus the COR-4887 sesh_arm.
+        except Exception:  # noqa: BLE001
+            labels = experiment
+        capture_hook_event(payload, event_name="SessionStart", extra_metadata=labels or None)
+        if nudge:
+            from sesh_hooks import capture_nudge
+
+            capture_nudge(payload, nudge, "SessionStart")  # COR-4887 exposure: shown or withheld.
     except Exception as exc:  # noqa: BLE001 - linking must not interrupt Codex.
         print(f"sesh linking failed: {exc}", file=sys.stderr)
 

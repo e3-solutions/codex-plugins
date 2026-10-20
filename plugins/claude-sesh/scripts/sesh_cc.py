@@ -10,7 +10,8 @@ Same behaviour as the Codex `sesh` plugin (plugins/sesh, 0.1.0), adapted to Clau
   Ask, find-similar and open are never limited. Bots and opt-outs keep unlimited searches.
 - PreToolUse on Write of a new code file: the COR-4887 "existing work" plan cue, at most
   twice a session and once per area.
-- A stable 15% session holdout (E3_SESH_HOLDOUT_PCT) gets no cue at all. Tools stay.
+- A stable 15% session holdout (E3_SESH_HOLDOUT_PCT) gets no cue at all and no one-search
+  denial (the turn marker is still kept). Tools stay.
 
 Every check fails open: an error never blocks a tool, and bots are never limited.
 Nothing here reads, stores or sends prompts, queries, passages or file contents.
@@ -28,7 +29,7 @@ import uuid
 from pathlib import Path
 
 PLUGIN_NAME = "sesh"
-PLUGIN_VERSION = "0.1.0"  # keep equal to .claude-plugin/plugin.json
+PLUGIN_VERSION = "0.1.1"  # keep equal to .claude-plugin/plugin.json
 
 # --- switches (same names and defaults as the Codex plugin) --------------------------------------
 DISABLE_ENVS = ("E3_SESH_CONTEXT_ENABLED", "E3_SESH_START_SEARCH_ENABLED")
@@ -81,9 +82,9 @@ PAST_WORK_CUE = (
     "before answering, and open the best result if it fits."
 )
 DENY_REASON = (
-    "Sesh: this turn already ran a coding-session search, and a second search in the same "
-    "turn has not helped before. Use the results you already have, or open one with "
-    "open_session_passages. You can search again in the next turn."
+    "Sesh: this plugin allows one coding-session search per turn (E3_SESH_ONE_PER_TURN), and this "
+    "turn already ran one. Use or open the results you already have (open_session_passages), or "
+    "search again in the next turn."
 )
 # Claude Code only: the one-search guard denial, kept on the tool_call_started event.
 DENIED_METADATA = {"sesh_turn_guard": "denied"}
@@ -147,6 +148,15 @@ _SERVICE_PATH = re.compile(r"(^|/)(services?|servers?|workers?|functions|lambdas
                            r"|(service|server|worker|daemon|handler)[^/]*$", re.IGNORECASE)
 _SCRIPT_PATH = re.compile(r"(^|/)(scripts?|bin|tools|cli|jobs|cron)/", re.IGNORECASE)
 TRIVIAL_NAMES = frozenset({"__init__.py", "index.ts", "index.js", "mod.rs", "__main__.py"})
+# COR-4887 Oct 20 replay: one-off, review and analysis folders, and ticket- or date-named folders,
+# were where the false cues landed. Shared with the Codex plan cue (plan_cue.py).
+PLAN_SKIP_PATH = re.compile(
+    r"(^|/)(outputs?|artifacts?|reviews?|visuali[sz]ations?|viz|analysis|analyses|investigations?|"
+    r"reports?|docs?|examples?|notebooks?|evals?|benchmarks?|bench|playground|sandbox|archive|"
+    r"backups?|data|logs?|debug|repro|qa|smoke|harness|seeds?|cor-\d+|[a-z]+-\d{2,}|"
+    r"\d{4}-\d{2}-\d{2}[^/]*)/",
+    re.IGNORECASE,
+)
 
 HUMAN_ENTRYPOINT_HINT = "CLAUDE_CODE_ENTRYPOINT"
 TRANSCRIPT_HEAD_BYTES = 65536
@@ -471,6 +481,8 @@ def one_per_turn_denial(payload, env=None, base: Path | None = None) -> str | No
         try:
             os.close(os.open(marker, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600))
         except FileExistsError:
+            if sesh_arm(payload, env) == "holdout":
+                return None  # COR-4887 holdout: never denied (marker kept), same as the Codex plugin.
             return hook_output("PreToolUse", permissionDecision="deny",
                                permissionDecisionReason=DENY_REASON)
         return None
@@ -509,6 +521,8 @@ def plan_kind(relative: str) -> str | None:
     path = relative.replace(os.sep, "/")
     name = path.rsplit("/", 1)[-1]
     suffix = os.path.splitext(name)[1].lower()
+    if PLAN_SKIP_PATH.search(path):
+        return None
     if name == "Dockerfile":
         return "service"
     if suffix not in CODE_SUFFIXES or name in TRIVIAL_NAMES:

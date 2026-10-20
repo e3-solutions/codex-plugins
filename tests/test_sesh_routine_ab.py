@@ -41,7 +41,7 @@ def session_in(arm: str, moment: datetime = MONDAY, seed: int = 0) -> str:
     rng = random.Random(f"{arm}:{seed}")
     while True:
         session_id = uuid7(moment, rng)
-        if context.routine_arm(session_id) == arm:
+        if context.routine_arm(session_id) == arm and context.holdout_bucket(session_id) >= 15:  # COR-4887: treated
             return session_id
 
 
