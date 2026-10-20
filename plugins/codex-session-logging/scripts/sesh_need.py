@@ -106,14 +106,16 @@ def _denial(payload, env, directory: Path) -> str | None:
     turn = _string(payload, "turn_id", "turnId")
     if session is None or turn is None or opted_out(env) or not _human_thread(payload):
         return None  # Bots keep Sesh; unknown turns or threads are allowed.
-    if held_out(payload, env):
-        return None  # COR-4887 holdout: Sesh runs exactly as with no plugin.
     folder = directory / _digest(session)
     folder.mkdir(mode=0o700, parents=True, exist_ok=True)
     marker = folder / _digest(turn)
     try:
         os.close(os.open(marker, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600))
     except FileExistsError:
+        if held_out(payload, env):
+            # COR-4887 holdout: never denied. The turn marker is still kept, so "this turn already
+            # searched" (plan cue) and the first search's outcome mean the same in both arms.
+            return None
         _LAST_FIRST_OUTCOME[0] = first_outcome(marker)
         return json.dumps({"hookSpecificOutput": {
             "hookEventName": "PreToolUse",

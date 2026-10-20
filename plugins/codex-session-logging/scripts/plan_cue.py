@@ -7,7 +7,7 @@ later, when the agent is about to build something.
 
 This is the Codex twin of the Claude Code plugin's plan cue (plugins/claude-sesh/scripts/sesh_cc.py,
 COR-4888). The rules, constants, cue text, topic hash and log labels are the same, and
-tests/test_sesh_cross_plugin.py pins that:
+tests/test_sesh_plan_cue_holdout.py pins that:
 
 - It fires before apply_patch adds a new code file (Claude Code: before Write creates one) in a
   person's session in an e3-solutions repository. Tests, fixtures, generated, vendored, scratch and
@@ -208,28 +208,31 @@ def candidates(payload) -> list[str]:
 
 
 class _Locked:
-    """Exclusive lock on one session's state file (a small JSON of hashes), updated in place."""
+    """Exclusive lock (a sibling .lock file) on one session's state, a small JSON of hashes.
+
+    save() writes a temp file and renames it over the state, so a crash never leaves it half written.
+    """
 
     def __init__(self, path: Path):
         self.path = path
 
     def __enter__(self):
         self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        self.fd = os.open(self.path, os.O_RDWR | os.O_CREAT, 0o600)
+        self.fd = os.open(self.path.with_name(self.path.name + ".lock"), os.O_RDWR | os.O_CREAT, 0o600)
         fcntl.flock(self.fd, fcntl.LOCK_EX)
-        raw = os.read(self.fd, 1 << 20)
         try:
-            state = json.loads(raw) if raw else {}
-        except ValueError:
+            state = json.loads(self.path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, UnicodeError):
             state = {}
         self.state = state if isinstance(state, dict) else {}
         return self.state
 
     def save(self):
-        data = json.dumps(self.state, separators=(",", ":")).encode("utf-8")
-        os.lseek(self.fd, 0, os.SEEK_SET)
-        os.ftruncate(self.fd, 0)
-        os.write(self.fd, data)
+        tmp = self.path.with_name(f"{self.path.name}.{os.getpid()}.tmp")
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            json.dump(self.state, stream, separators=(",", ":"))
+        os.replace(tmp, self.path)
 
     def __exit__(self, *exc):
         fcntl.flock(self.fd, fcntl.LOCK_UN)
@@ -280,10 +283,12 @@ def decide(payload, env=None, directory: Path | None = None, now: float | None =
     session = payload.get("session_id") or payload.get("sessionId")
     if not isinstance(session, str) or not session.strip():
         return None, None
+    if opted_out(env) or any(_falsy(env.get(name)) for name in DISABLE_ENVS):
+        return None, None
     cwd = payload.get("cwd") if isinstance(payload.get("cwd"), str) else None
     adds = set(patch_paths(payload, _ADD_FILE))
     cache: dict = {}
-    eligible = (candidates(payload) and not opted_out(env) and not any(_falsy(env.get(n)) for n in DISABLE_ENVS))
+    eligible = bool(candidates(payload))
     header = transcript_header(payload) if eligible else None
     eligible = eligible and header is not None and not automated_thread(header)  # People only, as in Claude Code.
     directory = directory or state_dir()
@@ -329,9 +334,10 @@ def decide(payload, env=None, directory: Path | None = None, now: float | None =
                         "sesh_plan_cue_index": fires}
             result = (None if holdout else PLAN_CUE.format(kind=kind, path=relative), metadata)
         if changed_now - touched or result[1] is not None:
+            ordered = [f for f in state.get("touched", []) if isinstance(f, str)]
+            ordered += [f for f in sorted(changed_now) if f not in touched]
             state.clear()
-            state.update({"fires": fires, "topics": topics[-20:],
-                          "touched": sorted(touched | changed_now)[-400:], "t": now})
+            state.update({"fires": fires, "topics": topics[-20:], "touched": ordered[-400:], "t": now})
             locked.save()
     if fresh:
         _prune(directory / "sessions", now)

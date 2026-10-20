@@ -434,3 +434,33 @@ def test_detection_accepts_unparseable_toml_with_plugin_headers(tmp_path):
 ])
 def test_only_sesh_tools_are_logged(tool, expected):
     assert sesh_plugin.is_sesh_tool(tool) is expected
+
+
+def _patch(machine: Machine, line: str, call: str) -> list[str]:
+    body = f"*** Begin Patch\n{line}\n+x\n*** End Patch"
+    return machine.fire("PreToolUse", tool_name="apply_patch", tool_input={"command": body}, tool_call_id=call)
+
+
+@pytest.fixture
+def non_scratch_root():
+    """The plan cue ignores /tmp and /var/folders (where pytest's tmp_path lives) as scratch."""
+    import uuid
+
+    root = Path.home() / ".cache" / "e3-sesh-tests" / uuid.uuid4().hex
+    root.mkdir(parents=True)
+    yield root
+    shutil.rmtree(root, ignore_errors=True)
+
+
+@pytest.mark.parametrize("who", ["sesh", "logger"])
+def test_plan_cue_through_the_real_hooks_with_the_continuation_rule(non_scratch_root, who):
+    # COR-4887: an update records its folder, so a new file next to it is a continuation (no cue),
+    # and a new file elsewhere cues once. Same in both plugins.
+    machine = Machine(non_scratch_root, sesh=(who == "sesh"), logger=(who == "logger"))
+    assert _patch(machine, "*** Update File: svc/billing/invoice.py", "c1") == []
+    assert _patch(machine, "*** Add File: svc/billing/helpers2.py", "c2") == []
+    [out] = _patch(machine, "*** Add File: workers/digest/run_digest.py", "c3")
+    assert "existing-work card" in json.loads(out)["hookSpecificOutput"]["additionalContext"]
+    shown = [e for e in machine.events(who) if e["event_type"] == "sesh_plan_cue_shown"]
+    assert len(shown) == 1 and shown[0]["metadata"]["sesh_plan_cue_index"] == 1
+    assert "workers" not in json.dumps(shown)  # No path in the log.

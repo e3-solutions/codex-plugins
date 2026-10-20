@@ -45,10 +45,12 @@ def sesh_tool(payload) -> None:
 
 def other_tool(payload) -> None:
     try:
-        from plan_cue import candidates, plan_cue
+        from plan_cue import plan_cue
 
-        if not candidates(payload) or logger_runs("PreToolUse"):
-            return  # Most tool calls stop at the cheap check; the logger shows its own cue.
+        # Every apply_patch goes on (an update records its folder for the continuation rule);
+        # other tools stop here. The logger shows its own cue when it runs.
+        if payload.get("tool_name") != "apply_patch" or logger_runs("PreToolUse"):
+            return
         output, moment = plan_cue(payload)  # COR-4887, on unless E3_SESH_PLAN_CUE=0/false/no/off.
     except Exception:  # noqa: BLE001 - the cue fails open.
         return

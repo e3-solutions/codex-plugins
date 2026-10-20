@@ -99,6 +99,11 @@
       "rollback_compatible": true
     },
     {
+      "id": "sesh-plan-cue",
+      "purpose": "COR-4887 plan-cue state per session: cue count, topic and folder hashes only (~/.codex/sesh-plan-cue).",
+      "rollback_compatible": true
+    },
+    {
       "id": "sesh-turn-guard",
       "purpose": "One-search-per-turn markers shared with codex-session-logging (~/.codex/sesh-turn-guard).",
       "rollback_compatible": true

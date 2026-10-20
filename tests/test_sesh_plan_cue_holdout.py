@@ -294,3 +294,27 @@ def test_exposure_event_types():
         "sesh_startup_cue_withheld"
     assert hooks.nudge_event_type({"sesh_past_work_cue": "shown"}) == "sesh_past_work_cue_shown"
     assert hooks.nudge_event_type({}) is None
+
+
+@pytest.mark.parametrize("copy", sorted(COPIES))
+def test_holdout_keeps_the_turn_marker_so_the_plan_cue_skips_searched_turns(copy, tmp_path, monkeypatch):
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex"))
+    need = _load(COPIES[copy], "sesh_need", f"cor4887_need3_{copy}")
+    plan = _load(COPIES[copy], "plan_cue", f"cor4887_plan3_{copy}")
+    plan._SCRATCH = __import__("re").compile(r"^/(?:private/)?tmp/scratch/")
+    repo = Repo(tmp_path)
+    search = {"hook_event_name": "PreToolUse", "tool_name": "mcp__cosmos__sesh__search_coding_sessions",
+              "session_id": HOLDOUT, "turn_id": "t1", "transcript_path": str(repo.transcript)}
+    assert need.one_per_turn_denial(search, {}) is None and need.one_per_turn_denial(search, {}) is None
+    assert plan.decide(repo.patch("*** Add File: svc/billing/invoice_sync.py", sid=HOLDOUT), {},
+                       directory=repo.state) == (None, None)
+
+
+def test_claude_code_holdout_never_denies_but_keeps_its_marker(tmp_path):
+    env = {"CLAUDE_CODE_ENTRYPOINT": "cli", "E3_SESH_STATE_DIR": str(tmp_path)}
+    search = {"hook_event_name": "PreToolUse", "tool_name": "mcp__cosmos__sesh__search_coding_sessions",
+              "session_id": HOLDOUT}
+    cc.start_turn({"hook_event_name": "UserPromptSubmit", "session_id": HOLDOUT}, env, tmp_path)
+    assert cc.one_per_turn_denial(search, env, tmp_path) is None
+    assert cc.searched_this_turn(search, env, tmp_path)
+    assert cc.one_per_turn_denial(search, env, tmp_path) is None

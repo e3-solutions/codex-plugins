@@ -10,7 +10,8 @@ Same behaviour as the Codex `sesh` plugin (plugins/sesh, 0.1.0), adapted to Clau
   Ask, find-similar and open are never limited. Bots and opt-outs keep unlimited searches.
 - PreToolUse on Write of a new code file: the COR-4887 "existing work" plan cue, at most
   twice a session and once per area.
-- A stable 15% session holdout (E3_SESH_HOLDOUT_PCT) gets no cue at all. Tools stay.
+- A stable 15% session holdout (E3_SESH_HOLDOUT_PCT) gets no cue at all and no one-search
+  denial (the turn marker is still kept). Tools stay.
 
 Every check fails open: an error never blocks a tool, and bots are never limited.
 Nothing here reads, stores or sends prompts, queries, passages or file contents.
@@ -480,6 +481,8 @@ def one_per_turn_denial(payload, env=None, base: Path | None = None) -> str | No
         try:
             os.close(os.open(marker, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600))
         except FileExistsError:
+            if sesh_arm(payload, env) == "holdout":
+                return None  # COR-4887 holdout: never denied (marker kept), same as the Codex plugin.
             return hook_output("PreToolUse", permissionDecision="deny",
                                permissionDecisionReason=DENY_REASON)
         return None

@@ -104,9 +104,12 @@ COR-4888), and `tests/test_sesh_plan_cue_holdout.py` checks that.
 **Holdout (`E3_SESH_HOLDOUT_PCT`, default 15)**
 - **Which sessions.** A session is held out when `(b[0]*256 + b[1]) % 100 < pct`, where
   `b = sha256("sesh_holdout_v1:" + lower(trim(session id)))`. This is the same formula as Claude Code.
-- **What a held-out session gets.** No startup cue, past-work cue or plan cue, and no
-  one-search-per-turn guard. Sesh tools, the skill and all logging stay.
-- **Who is never held out.** Bots, opt-outs and sessions with no id or header.
+- **What a held-out session gets.** No startup cue, past-work cue or plan cue, and a second
+  search in a turn is never denied. The guard's turn marker is still kept, so "this turn already
+  searched" means the same in both arms. Sesh tools, the skill and all logging stay. Claude Code
+  applies the same rule.
+- **Who is never held out.** Bots, opt-outs and sessions with no id. Codex also needs the
+  transcript header and logs `unassigned` without it; Claude Code needs only the session id.
 - **How it combines with the routine A/B.** The holdout is decided first. The routine A/B
   (`E3_SESH_ROUTINE_AB`) then splits the treated 85% with its own independent hash, which stays
   about 50/50.
