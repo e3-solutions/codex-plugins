@@ -76,6 +76,8 @@ Resident release `0.3.25` distributes Codex Session Logging `0.2.26`. The logger
 
 Standalone **Sesh** plugin `0.1.0` (`plugins/sesh`, COR-4884). It carries the Sesh hooks from Codex Session Logging `0.2.38` with the same flags and defaults, for machines where Jolly Roger retired that logger. It steps aside when an active Codex Session Logging will run the same hook, so nothing fires twice. It is not in the `coreedge-local` marketplace and the resident updater does not install it; it ships through the Jolly Roger native plugin catalog (see `plugins/sesh/README.md`). Until then, `python3 plugins/sesh/install.py` installs it by hand as `sesh@e3-sesh` (idempotent, touches no other plugin; `--uninstall` removes it). No change for current users, and no ingest or schema change.
 
+Resident release `0.3.40`: Linear drains persist completed-event history even if a later worker raises; corrupt state files are preserved before recovery and I/O errors stop the drain.
+
 Resident release `0.3.39` distributes Codex Session Logging `0.2.39` (COR-4883), and Claude Session Logging `0.2.19` ships the same change to Claude Code through the `coreedge-internal` marketplace. It adds the Forum cue v2 A/B, **off by default**: with `FORUM_CUE_AB` unset, every session gets the v1 Forum decision cue byte-for-byte and nothing new is logged. `FORUM_CUE_AB=1` (also `true`, `yes` or `on`) splits cued sessions by `sha256("forum_cue_v2:" + lowercased, trimmed session id)` into `v1` (50%, today's cue), `v2` (25%: rate only the posts used or checked, in one batched `give_collective_feedback` before finishing, off-topic posts as abstain, at most 2 duplicate-check searches before sharing) and `v2_midtask` (25%: v2 plus search once there is a specific cause, and again when the plan changes). The hook reads the variable from its own environment on every prompt, so it must be set where Codex or Claude Code is launched; unsetting it or setting `0` restores v1 on the next prompt, and `FORUM_CUE_ENABLED=0` still removes the cue. While on, the arm is written to the local cue log and to `thread_prompt_submitted` metadata (the current ingest sanitizer drops those keys, so the readout recomputes the arm from the session id). Companion Forum text: e3-solutions/forum#72. No ingest or schema change.
 
 Resident release `0.3.38` distributes Codex Session Logging `0.2.38` (COR-4811). Both Sesh "fire on need" switches from `0.2.37` are now **on by default** for everyone (Vansh, Oct 16, 2026): the one-Sesh-search-per-turn guard and the past-work prompt cue. `E3_SESH_ONE_PER_TURN=0` and `E3_SESH_PAST_WORK_CUE=0` (also `false`, `no` or `off`) turn each one off; with both off, hook output and logged events are exactly those of `0.2.36`. Bots and `E3_SESH_EXPERIMENT_OPTOUT=1` still keep unlimited searches and get no cue, `E3_SESH_CONTEXT_ENABLED=0` still removes the cue, and any guard error still allows the call. No ingest or schema change.
@@ -129,8 +131,6 @@ Inspect updater health and activation drift:
 ```bash
 python3 ~/.codex/coreedge/runtime/current/update_plugin.py --doctor
 ```
-
-Resident release `0.3.42`: Linear drains persist completed-event history even if a later worker raises; corrupt state files are preserved before recovery and I/O errors stop the drain.
 
 ## Rolling Out Updates
 
