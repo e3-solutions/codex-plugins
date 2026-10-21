@@ -24,6 +24,23 @@ def plan_cue(payload):
         return None, None
 
 
+def forum_decision(payload):
+    try:
+        from forum_decision_cue import decision_cue
+
+        return decision_cue(payload)  # COR-4911, on unless FORUM_DECISION_CUE=0/false/no/off.
+    except Exception:  # noqa: BLE001 - the cue fails open.
+        return None, None
+
+
+def capture_exposure(payload, event) -> None:
+    from session_logging import capture_metadata_event, should_capture_payload
+
+    if event and should_capture_payload(payload):
+        capture_metadata_event(payload, hook_event="PreToolUse", event_type=event["event_type"],
+                               event_metadata=event["metadata"])
+
+
 def main() -> None:
     denial = output = None
     try:
@@ -36,6 +53,16 @@ def main() -> None:
                     from sesh_hooks import capture_nudge
 
                     capture_nudge(payload, moment, "PreToolUse")
+                except Exception as exc:  # noqa: BLE001 - logging must not interrupt Codex.
+                    print(f"codex-session-logging capture failed: {exc}", file=sys.stderr)
+            forum_output, forum_event = forum_decision(payload)
+            if forum_output:
+                from forum_decision_cue import merge_outputs
+
+                output = merge_outputs(output, forum_output)
+            if forum_event:
+                try:
+                    capture_exposure(payload, forum_event)
                 except Exception as exc:  # noqa: BLE001 - logging must not interrupt Codex.
                     print(f"codex-session-logging capture failed: {exc}", file=sys.stderr)
         extra = {}

@@ -58,6 +58,10 @@ For eligible E3 sessions, `SessionStart` adds a compact reminder about the E3 Co
 
 Since `0.2.18`, in canonical E3 repositories (`origin` is an `e3-solutions` GitHub HTTPS/SSH remote) `UserPromptSubmit` adds a short Forum decision cue as `hookSpecificOutput.additionalContext`, the same text Codex Session Logging uses (`scripts/forum_cue.py`, kept in parity by tests). It fires on a session's first prompt and on a new task of 25+ words at most once an hour. It asks for one `forum__search_research_posts` with 2-4 words naming the system, tool or component plus the failure or decision before committing to an approach, then one explained `give_collective_feedback` (up/down/abstain) per fully read post using the `post_id`, `body_sha256` and `search_id` from the search result, and to name the Forum posts used in the final answer. The hook never contacts Forum. It logs only the session id, time, reason and prompt word count under `~/.claude/session-logging/forum-cue` (or `$CLAUDE_SESSION_LOG_STATE_DIR/forum-cue`), never prompt text. Prompt capture runs as before, and a cue failure never blocks it. Disable the cue with `FORUM_CUE_ENABLED=0`.
 
+## Forum decision-point cue (COR-4911, 0.2.20, on by default)
+
+`scripts/forum_decision_cue.py` (byte-identical in Codex and Claude Code Session Logging) adds one `PreToolUse` note per turn, at the agent's first edit (`apply_patch`, or `Edit`/`Write`/`MultiEdit`/`NotebookEdit`) or its 6th tool call, whichever comes first, in an e3-solutions repository: run ONE `forum__search_research_posts` with 3-8 words naming the general mechanism, not case names. At most 3 per session; `UserPromptSubmit` starts a new turn. 50% of sessions are a holdout by session-id hash; both arms log a content-free exposure event (`forum_decision_cue_shown` / `forum_decision_cue_withheld`). Local state under `forum-cue/decision/` holds counters only. Off with `FORUM_DECISION_CUE=0` (also `false`, `no`, `off`).
+
 ## Forum cue v2 A/B (COR-4883, 0.2.19, off by default)
 
 `FORUM_CUE_AB=1` (or `true`, `yes`, `on`) splits sessions that get the Forum decision cue

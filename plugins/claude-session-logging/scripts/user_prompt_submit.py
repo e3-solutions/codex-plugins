@@ -14,6 +14,12 @@ def main() -> None:
         return
     forum_meta = None
     try:
+        from forum_decision_cue import new_turn
+
+        new_turn(payload)  # COR-4911: the decision-point Forum cue counts tool calls per turn.
+    except Exception:  # noqa: BLE001
+        pass
+    try:
         from forum_cue import forum_cue_decision
 
         cue, forum_meta = forum_cue_decision(payload)  # COR-4883 arm only while FORUM_CUE_AB is on.

@@ -74,6 +74,10 @@ sanitizer keeps the three keys only when all are valid and both copies agree. **
 the updated `codex-session-ingest` function before turning the flag on**, or the
 arms are dropped and never reach `public.codex_session_events`.
 
+## Forum decision-point cue (COR-4911, 0.2.41, on by default)
+
+`scripts/forum_decision_cue.py` (byte-identical in Codex and Claude Code Session Logging) adds one `PreToolUse` note per turn, at the agent's first edit (`apply_patch`, or `Edit`/`Write`/`MultiEdit`/`NotebookEdit`) or its 6th tool call, whichever comes first, in an e3-solutions repository: run ONE `forum__search_research_posts` with 3-8 words naming the general mechanism, not case names. At most 3 per session; `UserPromptSubmit` starts a new turn. 50% of sessions are a holdout by session-id hash; both arms log a content-free exposure event (`forum_decision_cue_shown` / `forum_decision_cue_withheld`). Local state under `forum-cue/decision/` holds counters only. Off with `FORUM_DECISION_CUE=0` (also `false`, `no`, `off`).
+
 ## Forum cue v2 A/B (COR-4883, 0.2.39, off by default)
 
 `FORUM_CUE_AB=1` (or `true`, `yes`, `on`) splits sessions that get the Forum decision cue
