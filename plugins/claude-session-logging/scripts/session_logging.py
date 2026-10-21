@@ -32,6 +32,16 @@ DEFAULT_SUPABASE_URL = "https://pmdfllwuctzkdjiehezq.supabase.co"
 DEFAULT_INGEST_URL = f"{DEFAULT_SUPABASE_URL}/functions/v1/codex-session-ingest"
 DEFAULT_BUCKET = "codex-sessions"
 DEFAULT_ALLOWED_GITHUB_ORG = "e3-solutions"
+# COR-4900: opt-in directories outside any git repo that count as E3 work (for
+# example a scratch dir Claude is launched from). Colon-separated absolute paths
+# in the env var and/or one absolute path per line in <state_dir>/extra-dirs.
+# Unset and absent (the default), behaviour is unchanged.
+EXTRA_DIRS_ENV = "CLAUDE_SESSION_LOG_EXTRA_DIRS"
+EXTRA_DIRS_FILE = "extra-dirs"
+# Fixed repo_remote stamped on allow-listed sessions instead of any path. It is
+# shaped like an in-org GitHub remote so the deployed ingest accepts it without a
+# server change; no real repository has this name.
+ALLOWLISTED_DIR_REPOSITORY = "allowlisted-dir"
 COLLECTIVE_SESSION_SOURCES = frozenset({"startup", "resume", "compact"})
 PLUGIN_NAME = "claude-session-logging"
 PLUGIN_VERSION = "git"
@@ -300,8 +310,7 @@ def copy_bool(source: JsonDict, target: JsonDict, key: str) -> None:
 
 def should_capture_payload(payload: JsonDict) -> bool:
     cwd = first_string(payload, "cwd") or os.getcwd()
-    remote = git_origin_remote(cwd)
-    return remote_belongs_to_org(remote, allowed_github_org())
+    return remote_belongs_to_org(session_repo_remote(cwd), allowed_github_org())
 
 
 def should_prompt_collective(payload: JsonDict) -> bool:
@@ -310,12 +319,73 @@ def should_prompt_collective(payload: JsonDict) -> bool:
     if not source or source.strip().lower() not in COLLECTIVE_SESSION_SOURCES:
         return False
     cwd = first_string(payload, "cwd") or os.getcwd()
-    remote = git_origin_remote(cwd)
+    remote = session_repo_remote(cwd, org=DEFAULT_ALLOWED_GITHUB_ORG)
     return remote_belongs_to_org(remote, DEFAULT_ALLOWED_GITHUB_ORG)
 
 
 def allowed_github_org() -> str:
     return os.environ.get(ALLOWED_GITHUB_ORG_ENV) or DEFAULT_ALLOWED_GITHUB_ORG
+
+
+def session_repo_remote(cwd: str | None, *, org: str | None = None) -> str | None:
+    """The repo_remote a session in ``cwd`` is scoped and uploaded under.
+
+    A real ``origin`` always wins, so a non-E3 repository inside an allow-listed
+    directory stays out. Only a directory with no origin under an allow-listed
+    directory gets the fixed allow-listed marker; its path is never used.
+    """
+    if not cwd:
+        return None
+    remote = git_origin_remote(cwd)
+    if remote:
+        return remote
+    if cwd_in_allowlisted_dir(cwd):
+        return allowlisted_dir_remote(org)
+    return None
+
+
+def allowlisted_dir_remote(org: str | None = None) -> str:
+    return canonical_github_url(org or allowed_github_org(), ALLOWLISTED_DIR_REPOSITORY)
+
+
+def is_allowlisted_dir_remote(remote: str | None) -> bool:
+    canonical = canonical_github_remote(remote, allowed_github_org())
+    return canonical is not None and canonical.lower() == allowlisted_dir_remote().lower()
+
+
+def allowlisted_dirs() -> tuple[Path, ...]:
+    """Opt-in directories from the env var and the state-dir file.
+
+    Relative paths, the filesystem root and the home directory itself are
+    ignored so a typo cannot widen capture to everything.
+    """
+    entries = os.environ.get(EXTRA_DIRS_ENV, "").split(os.pathsep)
+    with contextlib.suppress(OSError, UnicodeDecodeError):
+        entries += (state_dir() / EXTRA_DIRS_FILE).read_text(encoding="utf-8").splitlines()
+    home = Path(os.path.realpath(Path.home()))
+    dirs: list[Path] = []
+    for entry in entries:
+        entry = entry.strip()
+        if not entry or entry.startswith("#"):
+            continue
+        path = Path(entry).expanduser()
+        if not path.is_absolute():
+            continue
+        resolved = Path(os.path.realpath(path))
+        if resolved == Path(resolved.anchor) or resolved == home or resolved in dirs:
+            continue
+        dirs.append(resolved)
+    return tuple(dirs)
+
+
+def cwd_in_allowlisted_dir(cwd: str | None) -> bool:
+    if not cwd:
+        return False
+    dirs = allowlisted_dirs()
+    if not dirs:
+        return False
+    resolved = Path(os.path.realpath(Path(cwd).expanduser()))
+    return any(resolved == root or root in resolved.parents for root in dirs)
 
 
 def git_origin_remote(cwd: str) -> str | None:
@@ -666,7 +736,7 @@ def client_context(record: JsonDict, *, base: Path) -> JsonDict:
     installation_id = local_installation_id(base)
     context: JsonDict = {
         "cwd": cwd,
-        "repo_remote": git_origin_remote(cwd) if cwd else None,
+        "repo_remote": session_repo_remote(cwd),
         "git_email": git_email,
         "git_user_name": git_config_value(cwd, "user.name") if cwd else None,
         "git_branch": current_git_branch(cwd) if cwd else None,
@@ -836,6 +906,8 @@ def validate_ingest_payload(payload: JsonDict) -> None:
         raise PermanentUploadError("client.repo_remote must be a non-empty string")
     if not remote_belongs_to_org(remote, allowed_github_org()):
         raise PermanentUploadError("client.repo_remote is outside the allowed GitHub org")
+    if is_allowlisted_dir_remote(remote) and not allowlisted_dirs():
+        raise PermanentUploadError("allow-listed directory marker requires an opted-in extra directory")
     record = payload.get("record") if isinstance(payload.get("record"), dict) else {}
     record_type = record.get("type")
     if record_type == "event" or record_type is None:

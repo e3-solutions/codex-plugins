@@ -45,7 +45,8 @@ def test_claude_copy_matches_codex_cue_text_and_gating():
     for name in ("ENABLED_ENV", "MIN_GAP_SECONDS", "NEW_TASK_MIN_WORDS"):
         assert getattr(cue, name) == getattr(codex_cue, name)
     assert cue._E3_REMOTE.pattern == codex_cue._E3_REMOTE.pattern
-    for name in ("forum_cue", "forum_cue_decision", "_enabled", "_e3_repository", "ab_enabled", "cue_arm"):
+    for name in ("forum_cue", "forum_cue_decision", "_enabled", "_e3_repository", "_in_extra_dir",
+                 "ab_enabled", "cue_arm"):
         assert inspect.getsource(getattr(cue, name)) == inspect.getsource(getattr(codex_cue, name))
     assert "search_id" in cue.CUE and cue.ENABLED_ENV == "FORUM_CUE_ENABLED"
 

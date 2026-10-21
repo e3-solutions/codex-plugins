@@ -1,7 +1,7 @@
 """Decision-time Forum cue for E3 repositories; never searches or stores prompt text.
 
-Claude Code copy of plugins/codex-session-logging/scripts/forum_cue.py. Only state_dir()
-differs; tests keep the cue text and gating identical.
+Claude Code copy of plugins/codex-session-logging/scripts/forum_cue.py. Only state_dir(),
+extra_dirs_file() and EXTRA_DIRS_ENV differ; tests keep the cue text and gating identical.
 
 Agents that received relevant Forum lessons mostly read past them, and searches
 ran after the approach was already chosen. On the first prompt of a thread (and
@@ -93,6 +93,8 @@ CUES = {"v1": CUE, "v2": CUE_V2, "v2_midtask": CUE_V2_MIDTASK}
 # i.e. 50% v1 (control), 25% v2, 25% v2_midtask. Primary comparison: v1 vs v2 + v2_midtask.
 AB_ENV = "FORUM_CUE_AB"
 AB_ID = "forum_cue_v2"
+# COR-4900: opt-in non-repo directories treated as E3 (off unless set).
+EXTRA_DIRS_ENV = "CLAUDE_SESSION_LOG_EXTRA_DIRS"
 
 _E3_REMOTE = re.compile(
     r"(?:https://github\.com/|git@github\.com:|ssh://git@github\.com/)"
@@ -106,6 +108,10 @@ def state_dir() -> Path:
     override = os.environ.get("CLAUDE_SESSION_LOG_STATE_DIR")
     base = Path(override).expanduser() if override else Path.home() / ".claude" / "session-logging"
     return base / "forum-cue"
+
+
+def extra_dirs_file() -> Path:
+    return state_dir().parent / "extra-dirs"
 
 
 def _enabled() -> bool:
@@ -131,8 +137,39 @@ def _e3_repository(cwd: str) -> bool:
             capture_output=True, text=True, check=False, timeout=0.5,
         )
     except (OSError, subprocess.TimeoutExpired):
-        return False
-    return result.returncode == 0 and bool(_E3_REMOTE.fullmatch(result.stdout.strip()))
+        # A slow git walk outside any repo must not hide an opted-in directory;
+        # this is a guidance hint only (capture checks the origin without a timeout).
+        return _in_extra_dir(cwd)
+    remote = result.stdout.strip() if result.returncode == 0 else ""
+    if remote:
+        return bool(_E3_REMOTE.fullmatch(remote))
+    return _in_extra_dir(cwd)
+
+
+def _in_extra_dir(cwd: str) -> bool:
+    """COR-4900: a cwd with no origin under an opted-in extra directory counts as E3.
+
+    Same rule as session_logging.allowlisted_dirs(): env var paths (os.pathsep-separated)
+    plus one path per line in the extra-dirs file; relative paths, / and $HOME are ignored.
+    """
+    entries = os.environ.get(EXTRA_DIRS_ENV, "").split(os.pathsep)
+    try:
+        entries += extra_dirs_file().read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeDecodeError):
+        pass
+    home = os.path.realpath(Path.home())
+    target = Path(os.path.realpath(Path(cwd).expanduser()))
+    for entry in entries:
+        entry = entry.strip()
+        path = Path(entry).expanduser()
+        if not entry or entry.startswith("#") or not path.is_absolute():
+            continue
+        root = Path(os.path.realpath(path))
+        if root == Path(root.anchor) or str(root) == home:
+            continue
+        if target == root or root in target.parents:
+            return True
+    return False
 
 
 def forum_cue(payload, *, directory: Path | None = None, now: float | None = None) -> str | None:

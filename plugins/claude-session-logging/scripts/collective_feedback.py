@@ -64,7 +64,47 @@ def preview_enabled() -> bool:
     return os.environ.get(FEEDBACK_ENABLED_ENV, "1") == "1"
 
 
-def _e3_repository(cwd: object) -> bool:
+def _extra_dirs_file(agent: str) -> Path:
+    if agent == "claude":
+        override = os.environ.get("CLAUDE_SESSION_LOG_STATE_DIR")
+        base = Path(override) if override else Path.home() / ".claude" / "session-logging"
+    else:
+        override = os.environ.get("CODEX_SESSION_LOG_STATE_DIR")
+        base = Path(override) if override else (
+            Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex") / "session-logging")
+    return base.expanduser() / "extra-dirs"
+
+
+def _in_extra_dir(cwd: str, agent: str | None) -> bool:
+    """COR-4900: a cwd with no origin under the agent's opted-in extra directories.
+
+    Same rule as session_logging.allowlisted_dirs(): CLAUDE_/CODEX_SESSION_LOG_EXTRA_DIRS
+    (os.pathsep-separated) plus one path per line in <state_dir>/extra-dirs; relative
+    paths, / and $HOME are ignored. Off unless the user opts in.
+    """
+    if agent not in {"codex", "claude"}:
+        return False
+    entries = os.environ.get(f"{agent.upper()}_SESSION_LOG_EXTRA_DIRS", "").split(os.pathsep)
+    try:
+        entries += _extra_dirs_file(agent).read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeDecodeError):
+        pass
+    home = os.path.realpath(Path.home())
+    target = Path(os.path.realpath(Path(cwd).expanduser()))
+    for entry in entries:
+        entry = entry.strip()
+        path = Path(entry).expanduser()
+        if not entry or entry.startswith("#") or not path.is_absolute():
+            continue
+        root = Path(os.path.realpath(path))
+        if root == Path(root.anchor) or str(root) == home:
+            continue
+        if target == root or root in target.parents:
+            return True
+    return False
+
+
+def _e3_repository(cwd: object, agent: str | None = None) -> bool:
     if not isinstance(cwd, str) or not cwd:
         return False
     try:
@@ -74,12 +114,17 @@ def _e3_repository(cwd: object) -> bool:
             check=False, timeout=0.5,
         )
     except (OSError, subprocess.TimeoutExpired):
-        return False
+        # A slow git walk outside any repo must not hide an opted-in directory;
+        # this is a guidance hint only (capture checks the origin without a timeout).
+        return _in_extra_dir(cwd, agent)
+    remote = result.stdout.strip() if result.returncode == 0 else ""
+    if not remote:
+        return _in_extra_dir(cwd, agent)
     # Scope hint only, never authentication. Unknown hosts/aliases fail closed.
-    return result.returncode == 0 and bool(re.fullmatch(
+    return bool(re.fullmatch(
         r"(?:https://github\.com/|git@github\.com:|ssh://git@github\.com/)"
         r"e3-solutions/[A-Za-z0-9_.-]+(?:\.git)?",
-        result.stdout.strip(), flags=re.IGNORECASE,
+        remote, flags=re.IGNORECASE,
     ))
 
 
@@ -133,7 +178,7 @@ def feedback_context(payload: object, *, event_name: str, agent: str) -> str | N
     if agent not in {"codex", "claude"}:
         return None
     try:
-        if _e3_repository(payload.get("cwd")) and _claim_context(payload, agent):
+        if _e3_repository(payload.get("cwd"), agent) and _claim_context(payload, agent):
             return FEEDBACK_CONTEXT
     except (OSError, sqlite3.Error, ValueError):
         pass
