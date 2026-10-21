@@ -298,6 +298,7 @@ def hook_env(tmp_path: Path, extra: dict[str, str]) -> dict[str, str]:
         "E3_COLLECTIVE_FEEDBACK_HOOK_ENABLED": "0",
         "E3_COLLECTIVE_HOOK_ENABLED": "0",
         "FORUM_CUE_ENABLED": "0",
+        "FORUM_DECISION_CUE": "0",  # COR-4911's Forum cue is not under test here
         **extra,
     })
     return env

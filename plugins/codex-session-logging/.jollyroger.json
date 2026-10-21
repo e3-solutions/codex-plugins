@@ -12,7 +12,7 @@
     "scripts/drain_queue.py",
     "scripts/collective.py",
     "scripts/collective_feedback.py",
-    "scripts/sesh_context.py", "scripts/sesh_need.py", "scripts/sesh_hooks.py", "scripts/plan_cue.py", "scripts/forum_cue.py",
+    "scripts/sesh_context.py", "scripts/sesh_need.py", "scripts/sesh_hooks.py", "scripts/plan_cue.py", "scripts/forum_cue.py", "scripts/forum_decision_cue.py",
     "scripts/session_start.py",
     "scripts/cosmos_health.py",
     "scripts/user_prompt_submit.py",
