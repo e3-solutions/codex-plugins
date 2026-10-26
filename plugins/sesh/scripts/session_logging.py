@@ -56,6 +56,8 @@ COLLECTIVE_SESSION_SOURCES = frozenset({"startup", "resume", "compact"})
 EXCERPT_BYTES = 4096
 PLUGIN_NAME = "sesh"  # sesh plugin: name sent with every upload
 PLUGIN_VERSION = "0.2.0"  # sesh plugin: keep equal to .codex-plugin/plugin.json
+ROLLOUT_CHUNK_DIR = "rollout-sync/chunks"
+ORPHAN_CHUNK_GRACE_SECONDS = 60 * 60
 PERMANENT_HTTP_STATUSES = {400, 413, 415, 422}
 _SESSION_UPLOAD_LOCKS: dict[str, threading.Lock] = {}
 _SESSION_UPLOAD_LOCKS_GUARD = threading.Lock()
@@ -1448,12 +1450,18 @@ def drain_queue(progress_callback: Callable[[JsonDict], None] | None = None) -> 
                             "remaining": len(pending_queue_paths(base))
                             + len(list(processing_queue_dir(base).glob("*.json"))),
                         })
-        return {
+        result = {
             "uploaded": uploaded,
             "failed": failed,
             "dead_lettered": dead_lettered,
             "remaining": len(pending_queue_paths(base)),
         }
+        try:
+            if pruned := prune_orphan_rollout_chunks(base):
+                result["pruned_chunks"] = pruned
+        except OSError as exc:
+            result["prune_error"] = type(exc).__name__
+        return result
 
 
 def upload_worker_count() -> int:
@@ -1493,7 +1501,60 @@ def upload_claimed_record(
         return "failed", claimed_path.name
     (dead_letter_queue_dir(base) / claimed_path.name).unlink(missing_ok=True)
     claimed_path.unlink(missing_ok=True)
+    # After the queue record, so a crash in between leaves an orphan for the
+    # sweep rather than a record whose chunk is gone.
+    if record.get("event_type") == "rollout_chunk":
+        chunk = rollout_chunk_path(base, record.get("local_content_path"))
+        if chunk is not None:
+            chunk.unlink(missing_ok=True)
     return "uploaded", claimed_path.name
+
+
+def rollout_chunk_path(base: Path, local_content_path: object) -> Path | None:
+    """The chunk file a record names, only when it is under rollout-sync/chunks."""
+    if not isinstance(local_content_path, str):
+        return None
+    relative = Path(local_content_path)
+    if (
+        relative.is_absolute()
+        or relative.parent != Path(ROLLOUT_CHUNK_DIR)
+        or relative.suffix != ".json"
+        or relative.name.startswith(".")
+    ):
+        return None
+    return base / relative
+
+
+def prune_orphan_rollout_chunks(base: Path, *, now: float | None = None) -> int:
+    """Delete chunk files no queue record still needs (COR-4993).
+
+    A rollout chunk is a base64 copy of bytes that stay in ~/.codex/sessions;
+    it exists only until its record uploads. Before 0.2.42 uploaded chunks
+    were never deleted. A chunk is kept while a pending, processing or
+    dead-letter record of the same id exists, and for a grace period after it
+    is written, because rollout_sync writes the chunk before its queue record.
+    """
+    chunk_dir = base / ROLLOUT_CHUNK_DIR
+    if not chunk_dir.is_dir():
+        return 0
+    referenced = {
+        path.stem
+        for directory in (pending_queue_dir(base), processing_queue_dir(base), dead_letter_queue_dir(base))
+        for path in directory.glob("*.json")
+    }
+    cutoff = (now if now is not None else datetime.now(timezone.utc).timestamp()) - ORPHAN_CHUNK_GRACE_SECONDS
+    removed = 0
+    for chunk in chunk_dir.glob("*.json"):
+        if chunk.stem in referenced:
+            continue
+        try:
+            if chunk.lstat().st_mtime > cutoff:
+                continue
+            chunk.unlink()
+        except FileNotFoundError:
+            continue
+        removed += 1
+    return removed
 
 
 def dead_letter_record(base: Path, record: JsonDict, source_path: Path, exc: Exception) -> None:
