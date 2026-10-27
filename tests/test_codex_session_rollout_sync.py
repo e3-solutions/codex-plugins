@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import importlib.util
 import json
+import os
 import sqlite3
 import sys
 from pathlib import Path
@@ -761,3 +762,73 @@ def test_large_tracked_rollout_cannot_consume_pending_subagent_byte_budget(tmp_p
     assert result["queued"] == 2
     assert {record["session_id"] for record in added} == {tracked_id, pending_id}
     assert {record["metadata"]["content_byte_size"] for record in added} == {50}
+
+
+def test_uploaded_rollout_chunk_file_is_deleted_and_failed_one_is_kept(tmp_path, monkeypatch):
+    # COR-4993: uploaded chunks were kept forever (23 GB on one machine).
+    codex_home = tmp_path / "codex"
+    rollout = tmp_path / "rollout.jsonl"
+    write_rollout(rollout, session_id=PARENT_ID)
+    create_database(codex_home / "state.sqlite", [{"id": PARENT_ID, "rollout_path": rollout}])
+    module = load_rollout_sync()
+    module.sync_rollouts(codex_home=codex_home)
+    state = tmp_path / "logging"
+    chunk_records = [record for record in queue_records(state) if record["event_type"] == "rollout_chunk"]
+    chunk = state / chunk_records[0]["local_content_path"]
+    assert chunk.is_file()
+
+    def fail(_self, _payload):
+        raise RuntimeError("network down")
+
+    monkeypatch.setattr(module.session_logging.IngestUploader, "post", fail)
+    result = module.session_logging.drain_queue()
+    assert result["failed"] >= 1
+    assert chunk.is_file()
+
+    sent = []
+    monkeypatch.setattr(module.session_logging.IngestUploader, "post", lambda _self, payload: sent.append(payload))
+    result = module.session_logging.drain_queue()
+
+    assert result["uploaded"] >= 1 and result["remaining"] == 0
+    assert any(payload.get("kind") == "rollout_chunk" for payload in sent)
+    assert not chunk.exists()
+    assert list((state / "rollout-sync" / "chunks").glob("*.json")) == []
+
+
+def test_drain_prunes_only_old_unreferenced_chunk_files(tmp_path):
+    module = load_rollout_sync()
+    session_logging = module.session_logging
+    state = tmp_path / "logging"
+    chunks = state / "rollout-sync" / "chunks"
+    chunks.mkdir(parents=True)
+    now = 2_000_000_000.0
+    old = now - session_logging.ORPHAN_CHUNK_GRACE_SECONDS - 60
+    files = {}
+    for name in ("orphan", "fresh", "pending", "processing", "dead"):
+        files[name] = chunks / f"{name}.json"
+        files[name].write_text("{}", encoding="utf-8")
+        os.utime(files[name], (old, old))
+    os.utime(files["fresh"], (now, now))
+    for directory, name in (
+        (session_logging.pending_queue_dir(state), "pending"),
+        (session_logging.processing_queue_dir(state), "processing"),
+        (session_logging.dead_letter_queue_dir(state), "dead"),
+    ):
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / f"{name}.json").write_text("{}", encoding="utf-8")
+    outside = state / "messages.json"
+    outside.write_text("{}", encoding="utf-8")
+    os.utime(outside, (old, old))
+
+    assert session_logging.prune_orphan_rollout_chunks(state, now=now) == 1
+    assert sorted(path.stem for path in chunks.glob("*.json")) == ["dead", "fresh", "pending", "processing"]
+    assert outside.exists()
+
+
+def test_chunk_path_guard_never_leaves_the_chunk_directory(tmp_path):
+    session_logging = load_rollout_sync().session_logging
+    guard = session_logging.rollout_chunk_path
+    assert guard(tmp_path, "rollout-sync/chunks/abc.json") == tmp_path / "rollout-sync/chunks/abc.json"
+    for bad in ("rollout-sync/chunks/../../x.json", "/etc/x.json", "messages/abc.json",
+                "rollout-sync/chunks/sub/abc.json", "rollout-sync/chunks/abc.txt", None, 7):
+        assert guard(tmp_path, bad) is None
