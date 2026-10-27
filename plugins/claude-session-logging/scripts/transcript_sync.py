@@ -93,6 +93,11 @@ def sync_transcript_records(
     path = Path(transcript_path).expanduser()
     if not path.exists():
         return {"synced": 0, "reason": "missing_transcript"}
+    # COR-5002: an excluded session is never read past its first cwd record, and
+    # its cursor stays put so lifting the exclusion later resumes from the start.
+    blocked = session_logging.session_blocked_reason(session_id or path.stem, transcript_path=str(path))
+    if blocked:
+        return {"synced": 0, "reason": blocked}
     target = publish_presence.session_target(path)
     if target is None:
         return {"synced": 0, "reason": "not_eligible"}

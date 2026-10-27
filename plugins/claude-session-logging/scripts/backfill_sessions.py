@@ -161,6 +161,10 @@ def _lifecycle_record(
 
 
 def import_transcript(path: Path, *, base: Path, dry_run: bool) -> JsonDict:
+    # COR-5002: checked on every run (not cached as done), so lifting an
+    # exclusion later lets the session backfill normally.
+    if session_logging.session_blocked_reason(path.stem, transcript_path=str(path)):
+        return {"status": "skipped_excluded", "queued": 0}
     target = publish_presence.session_target(path)
     if target is None:
         return {"status": "skipped_non_e3", "queued": 0}
