@@ -350,7 +350,7 @@ def test_claude_plugin_packaging_and_internal_marketplace_are_present():
     hooks_text = json.dumps(hooks)
 
     assert manifest["name"] == "claude-session-logging"
-    assert manifest["version"] == "0.2.20"
+    assert manifest["version"] == "0.2.21"
     assert "Codex" not in manifest["description"]
     assert "SessionStart" in hooks["hooks"]
     assert "UserPromptSubmit" in hooks["hooks"]
@@ -1149,3 +1149,332 @@ def test_auto_update_is_throttled(tmp_path, monkeypatch):
     monkeypatch.setattr(update_plugin.subprocess, "run", lambda *args, **kwargs: pytest.fail("must not run"))
 
     assert update_plugin.run_update(state_path=state_path) == {"updated": False, "reason": "not_due"}
+
+
+# --- COR-5002: owner session exclusions --------------------------------------
+# Every test writes its policy into its own temp SHERLOCK_HOME / CODEX_HOME
+# (tests/conftest.py already points SHERLOCK_HOME at an empty temp dir).
+
+EXCLUDED_ROOT = "11111111-1111-4111-8111-111111111111"
+ALLOWED_ROOT = "22222222-2222-4222-8222-222222222222"
+OTHER_ROOT = "33333333-3333-4333-8333-333333333333"
+AGENT_ID = "a1b2c3d4e5f6"
+
+
+def _write_policy(tmp_path: Path, monkeypatch, policy: object, *, raw: str | None = None) -> Path:
+    home = tmp_path / "sherlock-home"
+    home.mkdir(exist_ok=True)
+    monkeypatch.setenv("SHERLOCK_HOME", str(home))
+    path = home / "session-exclusions.json"
+    path.write_text(raw if raw is not None else json.dumps(policy), encoding="utf-8")
+    return path
+
+
+def _codex_home(tmp_path: Path, monkeypatch, ids: list[str] | None = None, *, raw: str | None = None) -> Path:
+    codex_home = tmp_path / "codex-home"
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    if ids is not None or raw is not None:
+        target = codex_home / "session-logging" / "excluded_sessions.json"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(raw if raw is not None else json.dumps({"excluded_session_ids": ids}), encoding="utf-8")
+    return codex_home
+
+
+def _start(session_logging, session_id: str, cwd: Path, **extra) -> dict | None:
+    return session_logging.capture_hook_event(
+        {"hook_event_name": "UserPromptSubmit", "session_id": session_id, "cwd": str(cwd), "prompt": "x", **extra}
+    )
+
+
+def _captured_sessions(tmp_path: Path) -> list[str]:
+    path = tmp_path / "state" / "events.jsonl"
+    return [event["session_id"] for event in read_jsonl(path)] if path.exists() else []
+
+
+def _fake_urlopen(session_logging, monkeypatch) -> list:
+    requests: list = []
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    monkeypatch.setattr(
+        session_logging.urllib.request, "urlopen", lambda request, timeout: requests.append(request) or Response()
+    )
+    return requests
+
+
+@pytest.mark.parametrize("source", ["sherlock", "codex"])
+def test_excluded_session_id_is_never_captured(tmp_path, monkeypatch, source):
+    monkeypatch.setenv("CLAUDE_SESSION_LOG_STATE_DIR", str(tmp_path / "state"))
+    _codex_home(tmp_path, monkeypatch, [EXCLUDED_ROOT.upper()] if source == "codex" else None)
+    if source == "sherlock":
+        _write_policy(tmp_path, monkeypatch, {"version": 1, "excluded_session_ids": [EXCLUDED_ROOT]})
+    session_logging = load_session_logging()
+    repo = init_git_repo(tmp_path / "repo", "https://github.com/e3-solutions/codex-plugins.git")
+
+    assert _start(session_logging, EXCLUDED_ROOT, repo) is None
+    # A subagent's hook payload carries its root session id and its own agent_id.
+    assert _start(session_logging, EXCLUDED_ROOT, repo, agent_id=AGENT_ID) is None
+    assert _start(session_logging, OTHER_ROOT, repo) is not None
+    assert _captured_sessions(tmp_path) == [OTHER_ROOT]
+    assert not (tmp_path / "state" / "users" / "local" / "sessions" / EXCLUDED_ROOT).exists()
+
+
+def test_subagent_transcript_of_excluded_root_is_not_synced(tmp_path, monkeypatch):
+    monkeypatch.setenv("CLAUDE_SESSION_LOG_STATE_DIR", str(tmp_path / "state"))
+    _codex_home(tmp_path, monkeypatch)
+    _write_policy(tmp_path, monkeypatch, {"version": 1, "excluded_session_ids": [EXCLUDED_ROOT]})
+    session_logging = load_scripts_module("session_logging")
+    load_scripts_module("publish_presence")
+    transcript_sync = load_scripts_module("transcript_sync")
+    repo = init_git_repo(tmp_path / "repo", "https://github.com/e3-solutions/codex-plugins.git")
+    slug = tmp_path / "projects" / "-slug"
+    agent = slug / EXCLUDED_ROOT / "subagents" / f"agent-{AGENT_ID}.jsonl"
+    agent.parent.mkdir(parents=True)
+    _write_claude_transcript(agent, repo)
+    root = slug / f"{EXCLUDED_ROOT}.jsonl"
+    _write_claude_transcript(root, repo)
+
+    # Subagent transcripts carry the root's sessionId; the path alone also names the root.
+    for session_id in (EXCLUDED_ROOT, AGENT_ID, ""):
+        result = transcript_sync.sync_transcript_records(session_id, agent)
+        assert result == {"synced": 0, "reason": "excluded_by_session_policy"}
+    assert transcript_sync.sync_transcript_records(EXCLUDED_ROOT, root)["synced"] == 0
+    assert _pending_records(session_logging, tmp_path / "state") == []
+    # The cursor is not advanced, so removing the exclusion later syncs from the start.
+    assert not list((tmp_path / "state").rglob("*cursor*.json"))
+
+
+def test_excluded_project_path_and_its_worktrees_are_never_captured(tmp_path, monkeypatch):
+    monkeypatch.setenv("CLAUDE_SESSION_LOG_STATE_DIR", str(tmp_path / "state"))
+    _codex_home(tmp_path, monkeypatch)
+    projects = tmp_path / "work"
+    projects.mkdir()
+    private = init_git_repo(projects / "private", "https://github.com/e3-solutions/private.git")
+    git = ["git", "-c", "user.email=t@example.test", "-c", "user.name=t"]
+    subprocess.run([*git, "commit", "-q", "--allow-empty", "-m", "init"], cwd=private, check=True)
+    worktree = tmp_path / "private-wt"
+    subprocess.run(["git", "worktree", "add", "-q", str(worktree)], cwd=private, check=True)
+    (private / "src").mkdir()
+    public = init_git_repo(tmp_path / "public", "https://github.com/e3-solutions/codex-plugins.git")
+    _write_policy(tmp_path, monkeypatch, {"version": 1, "excluded_project_paths": [str(private)]})
+    session_logging = load_session_logging()
+
+    assert _start(session_logging, EXCLUDED_ROOT, private) is None
+    assert _start(session_logging, EXCLUDED_ROOT, private / "src") is None
+    assert _start(session_logging, OTHER_ROOT, worktree) is None
+    assert _start(session_logging, ALLOWED_ROOT, public) is not None
+    assert _captured_sessions(tmp_path) == [ALLOWED_ROOT]
+
+
+def test_subagent_of_root_started_in_excluded_project_is_blocked(tmp_path, monkeypatch):
+    monkeypatch.setenv("CLAUDE_SESSION_LOG_STATE_DIR", str(tmp_path / "state"))
+    _codex_home(tmp_path, monkeypatch)
+    private = init_git_repo(tmp_path / "private", "https://github.com/e3-solutions/private.git")
+    public = init_git_repo(tmp_path / "public", "https://github.com/e3-solutions/codex-plugins.git")
+    _write_policy(tmp_path, monkeypatch, {"version": 1, "excluded_project_paths": [str(private)]})
+    session_logging = load_scripts_module("session_logging")
+    load_scripts_module("publish_presence")
+    transcript_sync = load_scripts_module("transcript_sync")
+    slug = tmp_path / "projects" / "-slug"
+    slug.mkdir(parents=True)
+    _write_claude_transcript(slug / f"{EXCLUDED_ROOT}.jsonl", private)
+    # The subagent itself worked in a non-excluded repository; its root did not.
+    agent = slug / EXCLUDED_ROOT / "subagents" / f"agent-{AGENT_ID}.jsonl"
+    agent.parent.mkdir(parents=True)
+    _write_claude_transcript(agent, public)
+
+    assert transcript_sync.sync_transcript_records(EXCLUDED_ROOT, agent)["reason"] == "excluded_by_project_policy"
+    root_transcript = str(slug / f"{EXCLUDED_ROOT}.jsonl")
+    assert _start(session_logging, EXCLUDED_ROOT, public, agent_id=AGENT_ID, transcript_path=root_transcript) is None
+    assert _pending_records(session_logging, tmp_path / "state") == []
+
+
+def test_claude_allowlist_captures_only_listed_root_sessions(tmp_path, monkeypatch):
+    monkeypatch.setenv("CLAUDE_SESSION_LOG_STATE_DIR", str(tmp_path / "state"))
+    _codex_home(tmp_path, monkeypatch)
+    _write_policy(tmp_path, monkeypatch, {"version": 1, "allowed_claude_session_ids": [ALLOWED_ROOT]})
+    session_logging = load_session_logging()
+    repo = init_git_repo(tmp_path / "repo", "https://github.com/e3-solutions/codex-plugins.git")
+
+    assert _start(session_logging, OTHER_ROOT, repo) is None
+    assert _start(session_logging, ALLOWED_ROOT, repo, agent_id=AGENT_ID) is None  # subagents are not allowed
+    assert _start(session_logging, "", repo) is None  # no session id cannot be verified
+    assert _start(session_logging, ALLOWED_ROOT, repo) is not None
+    assert _captured_sessions(tmp_path) == [ALLOWED_ROOT]
+
+
+def test_empty_allowlist_captures_no_claude_session(tmp_path, monkeypatch):
+    monkeypatch.setenv("CLAUDE_SESSION_LOG_STATE_DIR", str(tmp_path / "state"))
+    _codex_home(tmp_path, monkeypatch)
+    _write_policy(tmp_path, monkeypatch, {"version": 1, "allowed_claude_session_ids": []})
+    session_logging = load_session_logging()
+    repo = init_git_repo(tmp_path / "repo", "https://github.com/e3-solutions/codex-plugins.git")
+    assert _start(session_logging, ALLOWED_ROOT, repo) is None
+
+
+@pytest.mark.parametrize(
+    "sherlock_raw, codex_raw",
+    [
+        ("{not json", None),
+        (json.dumps({"version": 2, "excluded_session_ids": []}), None),
+        (json.dumps({"version": 1, "excluded_session_ids": "not-a-list"}), None),
+        (json.dumps({"version": 1, "excluded_project_paths": ["relative/path"]}), None),
+        (json.dumps({"version": 1, "excluded_project_paths": ["/"]}), None),
+        (None, "[oops"),
+        (None, json.dumps({"excluded_session_ids": [1, 2]})),
+    ],
+)
+def test_unusable_policy_fails_closed_for_capture_and_upload(tmp_path, monkeypatch, sherlock_raw, codex_raw):
+    monkeypatch.setenv("CLAUDE_SESSION_LOG_STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setenv("CLAUDE_SESSION_LOG_INGEST_URL", "https://logs.example.test/ingest")
+    _codex_home(tmp_path, monkeypatch)
+    session_logging = load_session_logging()
+    repo = init_git_repo(tmp_path / "repo", "https://github.com/e3-solutions/codex-plugins.git")
+    assert _start(session_logging, OTHER_ROOT, repo) is not None  # queued before the policy broke
+
+    if sherlock_raw is not None:
+        _write_policy(tmp_path, monkeypatch, None, raw=sherlock_raw)
+    if codex_raw is not None:
+        _codex_home(tmp_path, monkeypatch, raw=codex_raw)
+
+    assert _start(session_logging, ALLOWED_ROOT, repo) is None
+    requests = _fake_urlopen(session_logging, monkeypatch)
+    result = session_logging.drain_queue()
+    assert requests == []
+    assert result["uploaded"] == 0
+    assert result["blocked"] == "session_exclusion_policy_unreadable"
+    assert result["remaining"] == 1  # kept, not dropped: it may be fine once the file is repaired
+    assert _captured_sessions(tmp_path) == [OTHER_ROOT]
+
+
+def test_unreadable_policy_file_fails_closed(tmp_path, monkeypatch):
+    monkeypatch.setenv("CLAUDE_SESSION_LOG_STATE_DIR", str(tmp_path / "state"))
+    _codex_home(tmp_path, monkeypatch)
+    policy = _write_policy(tmp_path, monkeypatch, None, raw="")
+    policy.unlink()
+    policy.mkdir()  # exists, cannot be read as a file
+    session_logging = load_session_logging()
+    repo = init_git_repo(tmp_path / "repo", "https://github.com/e3-solutions/codex-plugins.git")
+    assert _start(session_logging, OTHER_ROOT, repo) is None
+
+
+def test_no_policy_files_capture_normally(tmp_path, monkeypatch):
+    monkeypatch.setenv("CLAUDE_SESSION_LOG_STATE_DIR", str(tmp_path / "state"))
+    _codex_home(tmp_path, monkeypatch)
+    session_logging = load_session_logging()
+    repo = init_git_repo(tmp_path / "repo", "https://github.com/e3-solutions/codex-plugins.git")
+    assert _start(session_logging, EXCLUDED_ROOT, repo) is not None
+    assert session_logging.exclusion_policy().active is False
+
+
+def test_drain_drops_queued_records_of_newly_excluded_session(tmp_path, monkeypatch):
+    monkeypatch.setenv("CLAUDE_SESSION_LOG_STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setenv("CLAUDE_SESSION_LOG_INGEST_URL", "https://logs.example.test/ingest")
+    _codex_home(tmp_path, monkeypatch)
+    session_logging = load_scripts_module("session_logging")
+    load_scripts_module("publish_presence")
+    transcript_sync = load_scripts_module("transcript_sync")
+    repo = init_git_repo(tmp_path / "repo", "https://github.com/e3-solutions/codex-plugins.git")
+    transcript = tmp_path / "projects" / "-slug" / f"{EXCLUDED_ROOT}.jsonl"
+    transcript.parent.mkdir(parents=True)
+    _write_claude_transcript(transcript, repo)
+
+    # Queued while nothing was excluded: hook events plus message and usage records.
+    assert _start(session_logging, EXCLUDED_ROOT, repo, transcript_path=str(transcript)) is not None
+    assert transcript_sync.sync_transcript_records(EXCLUDED_ROOT, transcript)["queued"] == 3
+    assert _start(session_logging, OTHER_ROOT, repo) is not None
+    base = tmp_path / "state"
+    excluded_spool = [
+        base / record["local_content_path"]
+        for record in _pending_records(session_logging, base)
+        if record["session_id"] == EXCLUDED_ROOT
+    ]
+    assert len(excluded_spool) == 4 and all(path.exists() for path in excluded_spool)
+
+    _write_policy(tmp_path, monkeypatch, {"version": 1, "excluded_session_ids": [EXCLUDED_ROOT]})
+    requests = _fake_urlopen(session_logging, monkeypatch)
+    result = session_logging.drain_queue()
+
+    uploaded = [json.loads(request.data.decode("utf-8"))["record"]["session_id"] for request in requests]
+    assert uploaded == [OTHER_ROOT]
+    assert result["uploaded"] == 1
+    assert result["excluded_dropped"] == 4
+    assert result["remaining"] == 0
+    assert not any(path.exists() for path in excluded_spool)
+    assert not list(session_logging.dead_letter_queue_dir(base).glob("*.json"))
+
+
+def test_drain_drops_queued_records_from_excluded_project(tmp_path, monkeypatch):
+    monkeypatch.setenv("CLAUDE_SESSION_LOG_STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setenv("CLAUDE_SESSION_LOG_INGEST_URL", "https://logs.example.test/ingest")
+    _codex_home(tmp_path, monkeypatch)
+    session_logging = load_session_logging()
+    private = init_git_repo(tmp_path / "private", "https://github.com/e3-solutions/private.git")
+    public = init_git_repo(tmp_path / "public", "https://github.com/e3-solutions/codex-plugins.git")
+    assert _start(session_logging, EXCLUDED_ROOT, private) is not None
+    assert _start(session_logging, OTHER_ROOT, public) is not None
+
+    _write_policy(tmp_path, monkeypatch, {"version": 1, "excluded_project_paths": [str(private)]})
+    requests = _fake_urlopen(session_logging, monkeypatch)
+    result = session_logging.drain_queue()
+    assert [json.loads(r.data.decode("utf-8"))["record"]["session_id"] for r in requests] == [OTHER_ROOT]
+    assert result["excluded_dropped"] == 1
+
+
+def test_presence_and_backfill_skip_excluded_sessions(tmp_path, monkeypatch):
+    monkeypatch.setenv("CLAUDE_SESSION_LOG_STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setenv("CLAUDE_SESSION_LOG_INGEST_URL", "https://logs.example.test/ingest")
+    monkeypatch.setenv("CLAUDE_SESSION_LOG_AUTO_UPLOAD", "1")
+    monkeypatch.setenv("CLAUDE_SESSION_LOG_PROJECTS_DIR", str(tmp_path / "projects"))
+    monkeypatch.setenv("CLAUDE_SESSION_LOG_PRESENCE_STATE", str(tmp_path / "presence.json"))
+    _codex_home(tmp_path, monkeypatch)
+    _write_policy(tmp_path, monkeypatch, {"version": 1, "excluded_session_ids": [EXCLUDED_ROOT]})
+    session_logging = load_scripts_module("session_logging")
+    publish_presence = load_scripts_module("publish_presence")
+    backfill = load_scripts_module("backfill_sessions")
+    repo = init_git_repo(tmp_path / "repo", "https://github.com/e3-solutions/codex-plugins.git")
+    slug = tmp_path / "projects" / "-slug"
+    slug.mkdir(parents=True)
+    for session_id in (EXCLUDED_ROOT, OTHER_ROOT):
+        _write_claude_transcript(slug / f"{session_id}.jsonl", repo)
+    requests = _fake_urlopen(session_logging, monkeypatch)
+
+    assert publish_presence.publish_one(EXCLUDED_ROOT, slug / f"{EXCLUDED_ROOT}.jsonl")["reason"] == (
+        "excluded_by_session_policy"
+    )
+    assert publish_presence.run_presence()["published"] == 1
+    first = backfill.run_backfill()
+    assert first["processed"] == 2
+
+    sessions = {json.loads(r.data.decode("utf-8"))["record"]["session_id"] for r in requests}
+    assert sessions == {OTHER_ROOT}
+    # Excluded transcripts are re-checked on every run (not cached as done).
+    state = backfill.read_state(tmp_path / "state")
+    assert state["files"][str(slug / f"{EXCLUDED_ROOT}.jsonl")]["status"] == "skipped_excluded"
+    assert backfill.run_backfill()["processed"] == 1  # only the excluded file is looked at again
+
+
+def test_exclusion_ids_match_codex_logger_helper(tmp_path, monkeypatch):
+    """Both loggers read the same two files and normalize ids the same way."""
+    home = tmp_path / "home"
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("SHERLOCK_HOME", raising=False)
+    _codex_home(tmp_path, monkeypatch, [f"  {OTHER_ROOT.upper()} "])
+    sherlock = home / ".sherlock" / "session-exclusions.json"
+    sherlock.parent.mkdir(parents=True)
+    sherlock.write_text(json.dumps({"version": 1, "excluded_session_ids": [EXCLUDED_ROOT]}), encoding="utf-8")
+
+    claude = load_session_logging()
+    spec = importlib.util.spec_from_file_location(
+        "codex_session_logging_for_parity", ROOT / "plugins/codex-session-logging/scripts/session_logging.py"
+    )
+    codex = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(codex)
+
+    assert set(claude.exclusion_policy().excluded) == codex.excluded_session_ids() == {EXCLUDED_ROOT, OTHER_ROOT}

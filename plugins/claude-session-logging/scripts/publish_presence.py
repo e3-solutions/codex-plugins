@@ -109,6 +109,15 @@ def session_target(path: Path) -> JsonDict | None:
     }
 
 
+def target_blocked_reason(target: JsonDict) -> str | None:
+    """COR-5002: owner-excluded sessions publish no presence."""
+    return session_logging.session_blocked_reason(
+        str(target["session_id"]),
+        cwd=str(target["cwd"]),
+        transcript_path=str(target["transcript_path"]),
+    )
+
+
 def presence_record(
     target: JsonDict,
     *,
@@ -194,6 +203,9 @@ def publish_one(
     if target is None:
         return {"published": 0, "reason": "not_eligible"}
     target["session_id"] = session_id or target["session_id"]
+    blocked = target_blocked_reason(target)
+    if blocked:
+        return {"published": 0, "reason": blocked}
     observed_at = (now or now_utc()).isoformat() if ended else mtime_iso(path)
     publish_target(target, observed_at=observed_at, ended=ended)
     drain = session_logging.drain_queue()
@@ -243,7 +255,7 @@ def run_presence(
                 # go stale on the dashboard rather than re-asserting liveness.
                 continue
             target = session_target(path)
-            if target is None:
+            if target is None or target_blocked_reason(target):
                 continue
             scanned += 1
             session_id = session_logging.safe_segment(str(target["session_id"]))

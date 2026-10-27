@@ -310,7 +310,91 @@ def copy_bool(source: JsonDict, target: JsonDict, key: str) -> None:
 
 def should_capture_payload(payload: JsonDict) -> bool:
     cwd = first_string(payload, "cwd") or os.getcwd()
-    return remote_belongs_to_org(session_repo_remote(cwd), allowed_github_org())
+    if not remote_belongs_to_org(session_repo_remote(cwd), allowed_github_org()):
+        return False
+    return payload_blocked_reason(payload) is None
+
+
+def _exclusions_module():
+    """The sibling ``session_exclusions`` module, loaded by path so hooks and tests agree."""
+    module = sys.modules.get("claude_session_exclusions")
+    if module is None:
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location(
+            "claude_session_exclusions", Path(__file__).with_name("session_exclusions.py")
+        )
+        module = importlib.util.module_from_spec(spec)
+        assert spec.loader is not None
+        sys.modules[spec.name] = module
+        spec.loader.exec_module(module)
+    return module
+
+
+def exclusion_policy():
+    """Owner exclusions (Sherlock policy + Codex list), re-read on every call (COR-5002)."""
+    return _exclusions_module().load_policy()
+
+
+def session_blocked_reason(
+    session_id: str | None,
+    *,
+    cwd: str | None = None,
+    transcript_path: str | None = None,
+    agent_id: str | None = None,
+    policy: Any = None,
+) -> str | None:
+    """Why this Claude session must not be captured or uploaded, or None.
+
+    A hook payload carrying ``agent_id`` comes from a subagent of ``session_id``.
+    Any error while deciding fails closed.
+    """
+    try:
+        policy = policy if policy is not None else exclusion_policy()
+        parent = None
+        if agent_id:
+            parent, session_id = session_id, agent_id
+        return policy.blocked_reason(
+            session_id,
+            parent_session_id=parent,
+            cwds=[cwd] if cwd else [],
+            transcript_path=transcript_path,
+        )
+    except Exception as exc:  # noqa: BLE001 - an exclusion check that cannot finish must not capture.
+        return f"session_exclusion_check_failed: {type(exc).__name__}"
+
+
+def payload_blocked_reason(payload: JsonDict) -> str | None:
+    return session_blocked_reason(
+        first_string(payload, "session_id", "sessionId"),
+        cwd=first_string(payload, "cwd") or os.getcwd(),
+        transcript_path=first_string(payload, "transcript_path", "transcriptPath"),
+        agent_id=first_string(payload, "agent_id", "agentId"),
+    )
+
+
+def record_blocked_reason(record: JsonDict, policy: Any) -> str | None:
+    metadata = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
+    session_id = record.get("session_id")
+    cwd = metadata.get("cwd")
+    transcript_path = metadata.get("transcript_path")
+    return session_blocked_reason(
+        session_id if isinstance(session_id, str) else None,
+        cwd=cwd if isinstance(cwd, str) else None,
+        transcript_path=transcript_path if isinstance(transcript_path, str) else None,
+        policy=policy,
+    )
+
+
+def drop_excluded_record(base: Path, record: JsonDict, claimed_path: Path) -> None:
+    """Remove a queued record of an excluded session and its local spooled copy."""
+    local = record.get("local_content_path")
+    if isinstance(local, str) and local:
+        root = base.resolve()
+        target = (base / local).resolve()
+        if root in target.parents:
+            target.unlink(missing_ok=True)
+    claimed_path.unlink(missing_ok=True)
 
 
 def should_prompt_collective(payload: JsonDict) -> bool:
@@ -610,9 +694,23 @@ def drain_queue() -> JsonDict:
             }
 
         recover_processing_records(base)
+        # COR-5002: re-read the owner's exclusions before every drain. An unusable
+        # policy uploads nothing and keeps the queue; excluded sessions are dropped.
+        policy = exclusion_policy()
+        if getattr(policy, "error", None):
+            return {
+                "uploaded": 0,
+                "failed": 0,
+                "dead_lettered": 0,
+                "remaining": len(pending_queue_paths(base)),
+                "blocked": "session_exclusion_policy_unreadable",
+            }
+        drop_reasons = _exclusions_module().DROP_REASONS
         uploaded = 0
         failed = 0
         dead_lettered = 0
+        excluded = 0
+        held = 0
         failed_record_names: set[str] = set()
         uploader: IngestUploader | None = None
         while True:
@@ -628,6 +726,17 @@ def drain_queue() -> JsonDict:
                 record: JsonDict | None = None
                 try:
                     record = read_json_file(claimed_path)
+                    blocked = record_blocked_reason(record, policy)
+                    if blocked in drop_reasons:
+                        drop_excluded_record(base, record, claimed_path)
+                        excluded += 1
+                        continue
+                    if blocked:
+                        # Cannot verify yet (e.g. unreadable worktree record): keep it queued.
+                        claimed_path.replace(pending_queue_dir(base) / claimed_path.name)
+                        failed_record_names.add(claimed_path.name)
+                        held += 1
+                        continue
                     uploader.upload_record(record, base=base)
                 except PermanentUploadError as exc:
                     dead_lettered += 1
@@ -650,12 +759,17 @@ def drain_queue() -> JsonDict:
                 else:
                     uploaded += 1
                     claimed_path.unlink(missing_ok=True)
-        return {
+        result = {
             "uploaded": uploaded,
             "failed": failed,
             "dead_lettered": dead_lettered,
             "remaining": len(pending_queue_paths(base)),
         }
+        if excluded:
+            result["excluded_dropped"] = excluded
+        if held:
+            result["held"] = held
+        return result
 
 
 def dead_letter_record(base: Path, record: JsonDict, source_path: Path, exc: Exception) -> None:
