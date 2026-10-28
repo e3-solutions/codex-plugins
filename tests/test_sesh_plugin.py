@@ -80,7 +80,7 @@ def test_version_never_equals_the_loggers_version():
     # COR-4887: Vansh set this plugin to 0.2.0. Versions are per plugin name, so only an exact
     # match with the logger's own release would read ambiguously in a codex_setup snapshot.
     logger = json.loads((LOGGER / ".codex-plugin/plugin.json").read_text())["version"]
-    assert _manifest()["version"] == "0.2.0" and _manifest()["version"] != logger
+    assert _manifest()["version"] == "0.2.1" and _manifest()["version"] != logger
 
 
 def test_hooks_point_at_this_plugins_scripts():

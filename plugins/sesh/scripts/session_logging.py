@@ -55,7 +55,7 @@ ALLOWLISTED_DIR_REPOSITORY = "allowlisted-dir"
 COLLECTIVE_SESSION_SOURCES = frozenset({"startup", "resume", "compact"})
 EXCERPT_BYTES = 4096
 PLUGIN_NAME = "sesh"  # sesh plugin: name sent with every upload
-PLUGIN_VERSION = "0.2.0"  # sesh plugin: keep equal to .codex-plugin/plugin.json
+PLUGIN_VERSION = "0.2.1"  # sesh plugin: keep equal to .codex-plugin/plugin.json
 ROLLOUT_CHUNK_DIR = "rollout-sync/chunks"
 ORPHAN_CHUNK_GRACE_SECONDS = 60 * 60
 PERMANENT_HTTP_STATUSES = {400, 413, 415, 422}
@@ -353,6 +353,7 @@ def event_from_payload(hook_event: str, payload: JsonDict) -> tuple[str | None, 
             metadata.update(search_origin_metadata(payload))
         metadata.update(source_open_metadata(payload))
         success = tool_success(payload)
+        metadata.update(open_passages_metadata(payload, success))
         if success is not None:
             metadata["success"] = success
         return ("tool_call_finished", metadata) if metadata.get("tool_name") else (None, {})
@@ -380,7 +381,8 @@ SESH_REQUEST_ID_KEY_PATTERN = re.compile(
     r'(?<!\\)"search_request_id"\s*:\s*"([^"\\]{0,64})"'
 )
 SESH_MAX_DELIVERED_SOURCE_HANDLES = 75
-SESH_MAX_SOURCE_HANDLE_OCCURRENCES = 80
+# 5 results x (source + open handle + 15 evidence) = 85, plus nested additional sources.
+SESH_MAX_SOURCE_HANDLE_OCCURRENCES = 100
 SESH_UUID_PATTERN = re.compile(
     r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[89ab][0-9a-f]{3}-[0-9a-f]{12}'
 )
@@ -488,11 +490,32 @@ def _canonical_source_handle(tool, arguments):
                 not _canonical_uuid(arguments.get('sessionId'))):
             return None
         leaf = 'timetracker__get_chat'
+    elif tool == 'open_session_passages':
+        # COR-5027: the reader search results point at (COR-4910). The handle is the session and
+        # revision only; offset, query, search_request_id and feedback never enter the digest.
+        if not isinstance(arguments, dict) or not set(arguments) <= SESH_OPEN_PASSAGES_ARGUMENTS:
+            return None
+        session_id, revision_id = arguments.get('session_id'), arguments.get('revision_id')
+        if not _bounded_handle_id(session_id, 256) or not _bounded_handle_id(revision_id, 200):
+            return None
+        arguments = {'session_id': session_id, 'revision_id': revision_id}
+        leaf = 'sesh__open_session_passages'
     else:
         return None
     encoded = json.dumps(arguments, sort_keys=True, separators=(',', ':'),
                          ensure_ascii=True, allow_nan=False)
     return leaf, encoded
+
+
+SESH_OPEN_PASSAGES_ARGUMENTS = frozenset({'session_id', 'revision_id', 'offset', 'query',
+                                          'search_request_id', 'helped', 'helped_reason'})
+SESH_OPEN_PASSAGES_TOOL_PATTERN = re.compile(r'(?:[A-Za-z0-9_-]+__)?(?:sesh__)?open_session_passages')
+SESH_MAX_OPEN_OFFSET = 1000
+
+
+def _bounded_handle_id(value, maximum):
+    return (isinstance(value, str) and 0 < len(value) <= maximum and value.strip() == value and
+            not any(ord(char) < 32 or ord(char) == 127 for char in value))
 
 
 def _source_handle_digest(tool, arguments):
@@ -520,6 +543,8 @@ def _delivered_source_handle_digests(body):
             raise ValueError('too many or too deeply nested Sesh source handles')
         if not isinstance(source, dict):
             raise ValueError('invalid Sesh source handle')
+        if source.get('available') is False and 'tool' not in source:
+            return  # Sesh says this evidence has no open handle; nothing was delivered.
         digest = _source_handle_digest(source.get('tool'), source.get('arguments'))
         if digest is None:
             raise ValueError('invalid Sesh source handle')
@@ -540,6 +565,8 @@ def _delivered_source_handle_digests(body):
         if 'source' not in result:
             raise ValueError('missing Sesh result source')
         add_source(result['source'])
+        if 'open' in result:
+            add_source(result['open'])
         evidence = result.get('evidence', [])
         if not isinstance(evidence, list) or len(evidence) > 15:
             raise ValueError('invalid Sesh evidence count')
@@ -552,6 +579,48 @@ def _delivered_source_handle_digests(body):
 
 def is_sesh_search_tool(name):
     return isinstance(name, str) and SESH_SEARCH_TOOL_PATTERN.fullmatch(name) is not None
+
+
+def is_sesh_open_passages_tool(name):
+    return (isinstance(name, str) and len(name) <= 256 and
+            SESH_OPEN_PASSAGES_TOOL_PATTERN.fullmatch(name) is not None)
+
+
+def open_passages_metadata(payload, success):
+    """COR-5027: link an open_session_passages call to the search that returned the session.
+
+    Keeps the search_request_id the open handle carries, whether the call read passages ("open")
+    or only answered "did it help" ("feedback"), the page offset, and for reads the digest of the
+    opened session/revision handle, matching sesh_delivered_source_handle_sha256_v1 on the search.
+    Never the query, passages, helped_reason or any other tool input or output.
+    """
+    try:
+        if not isinstance(payload, dict) or not is_sesh_open_passages_tool(payload.get('tool_name')):
+            return {}
+        arguments = payload.get('tool_input')
+        if not isinstance(arguments, dict) or not set(arguments) <= SESH_OPEN_PASSAGES_ARGUMENTS:
+            return {}
+        kind = 'feedback' if 'helped' in arguments else 'open'
+        metadata = {'sesh_open_kind': kind}
+        request_id = arguments.get('search_request_id')
+        if isinstance(request_id, str) and SESH_UUID_PATTERN.fullmatch(request_id) is not None:
+            metadata['sesh_open_search_request_id'] = request_id
+        if kind == 'open':
+            offset = arguments.get('offset')
+            offset = 0 if offset is None else offset
+            if (isinstance(offset, int) and not isinstance(offset, bool) and
+                    0 <= offset <= SESH_MAX_OPEN_OFFSET):
+                metadata['sesh_open_offset'] = offset
+            digest = _source_handle_digest('open_session_passages', arguments)
+            if digest is not None:
+                metadata['sesh_opened_source_handle_sha256_v1'] = digest
+                # Passages are ranked excerpts, never exact source bytes: no "verified" witness.
+                response = payload.get('tool_response')
+                failed = success is False or (isinstance(response, dict) and response.get('isError') is True)
+                metadata['sesh_source_open_witness_v1'] = 'failed' if failed else 'unknown'
+        return metadata
+    except (ValueError, TypeError, UnicodeError, RecursionError):
+        return {}
 
 
 def _per_query_request_ids(body):

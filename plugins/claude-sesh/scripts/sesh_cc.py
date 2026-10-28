@@ -29,7 +29,7 @@ import uuid
 from pathlib import Path
 
 PLUGIN_NAME = "sesh"
-PLUGIN_VERSION = "0.1.1"  # keep equal to .claude-plugin/plugin.json
+PLUGIN_VERSION = "0.1.2"  # keep equal to .claude-plugin/plugin.json
 
 # --- switches (same names and defaults as the Codex plugin) --------------------------------------
 DISABLE_ENVS = ("E3_SESH_CONTEXT_ENABLED", "E3_SESH_START_SEARCH_ENABLED")

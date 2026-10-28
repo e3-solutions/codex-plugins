@@ -74,6 +74,26 @@ sanitizer keeps the three keys only when all are valid and both copies agree. **
 the updated `codex-session-ingest` function before turning the flag on**, or the
 arms are dropped and never reach `public.codex_session_events`.
 
+## Sesh open linkage and Forum cue labels at ingest (COR-5027, 0.2.43)
+
+Finished `open_session_passages` events (any `mcp__<namespace>__sesh__open_session_passages`) keep
+`sesh_open_search_request_id` (the canonical `search_request_id` argument the open handle carries),
+`sesh_open_kind` (`open`, or `feedback` for a "did it help" call, which reads nothing),
+`sesh_open_offset` (0-1000, reads only) and, for reads, `sesh_opened_source_handle_sha256_v1` =
+`sha256("v1\nsesh__open_session_passages\n" + {"revision_id","session_id"} as sorted compact JSON)`
+with witness `failed` or `unknown` (passages are never `verified` exact bytes). Search events add the
+same digest for every `open_session_passages` handle in `results[].open`, `results[].source` and
+evidence sources; evidence the server marks `available: false` is skipped. The query, passages and
+`helped_reason` never leave the machine. The ingest sanitizer keeps these keys always on, like the
+older search/open linkage, and only when both copies agree.
+
+The sanitizer also keeps the COR-4911 decision-cue labels on `forum_decision_cue_shown` /
+`_withheld` (Codex and Claude Code): `forum_decision_cue` (must match the event type),
+`forum_decision_cue_reason` (`first_edit` or `call_N`, N 1-50), `forum_decision_cue_index` (1-10),
+`forum_searches_in_turn_before` (0-1000) and `forum_decision_cue_version` (a date). Always on: each
+is a closed enum, a small integer or a date. All of these are per-event and never merged onto
+`codex_sessions.metadata`.
+
 ## Rollout chunk cleanup (COR-4993, 0.2.42)
 
 A rollout chunk file exists only until its record uploads, then it is deleted. Every drain also deletes chunk files that no queue record (pending, processing or dead-letter) references and that are over an hour old; the drain result reports `pruned_chunks` when it removed any.

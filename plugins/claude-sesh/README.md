@@ -47,6 +47,8 @@ Every event also carries `sesh_arm` (`holdout`, `treated`, `bot`, `optout`, `una
 
 ## Search linking and who runs it
 
+Since 0.1.2 (COR-5027) finished `open_session_passages` events also carry the search request id the open handle carries, `open` vs `feedback`, the offset and a digest of the session/revision handle that matches the search's delivered digests; never the query, passages or helped reason.
+
 For Sesh tools only, the plugin queues metadata-only events to the same `codex-session-ingest`
 function `claude-session-logging` uses (same identity, same `CLAUDE_SESSION_LOG_*` settings and
 upload opt-out `CLAUDE_SESSION_LOG_AUTO_UPLOAD=0`), with `platform: "claude-code"`, `agent: "claude"`:

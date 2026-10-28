@@ -24,6 +24,8 @@ It also ships the `search-coding-sessions` skill the cue refers to.
 
 ## Search linking and version telemetry
 
+Since 0.2.1 (COR-5027, same code as Codex Session Logging 0.2.43) `open_session_passages` calls are linked to the search that returned the session: the search request id the open handle carries, `open` vs `feedback`, the offset and a digest of the session/revision handle that matches the search's delivered digests (see the Codex Session Logging README). `install.py` still pins 0.2.0 at `c6411e1` until the post-merge pin bump.
+
 For Sesh tools only (search, ask, find-similar, open, and the source-open tools its results
 point to), the plugin queues the same metadata-only `tool_call_started`/`tool_call_finished`
 events Codex Session Logging writes: `sesh_request_id(s)`, the origin session, source-handle

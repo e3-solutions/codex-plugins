@@ -9,8 +9,8 @@ import sys
 def main() -> None:
     try:
         from sesh_cc import is_sesh_tool
-        from sesh_linking import (capture, duration_ms, read_stdin_json, search_metadata,
-                                  tool_metadata, tool_success)
+        from sesh_linking import (capture, duration_ms, open_passages_metadata, read_stdin_json,
+                                  search_metadata, tool_metadata, tool_success)
 
         payload = read_stdin_json()
         if not is_sesh_tool(payload.get("tool_name")):
@@ -28,6 +28,8 @@ def main() -> None:
         if not failed:
             metadata.update(search_metadata(payload))
         success = tool_success(payload)
+        if not failed:
+            metadata.update(open_passages_metadata(payload, success))  # COR-5027
         if success is not None:
             metadata["success"] = success
         elapsed = duration_ms(payload)

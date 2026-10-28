@@ -70,6 +70,14 @@ function sanitizeEventMetadata(
     return metadata;
   }
 
+  if (FORUM_DECISION_CUE_EVENTS.includes(eventType)) {
+    Object.assign(
+      metadata,
+      sanitizeForumDecisionCue(eventType, recordMetadata, eventMetadata),
+    );
+    return metadata;
+  }
+
   if (eventType === "resident_presence") {
     copyStringFields(source, metadata, [
       "thread_source",
@@ -175,6 +183,16 @@ function sanitizeEventMetadata(
         metadata[witnessKey] = witness;
       }
     }
+
+    if (
+      eventType === "tool_call_finished" &&
+      isSeshOpenPassagesTool(source.tool_name) &&
+      source.tool_phase === "finished" &&
+      recordMetadata.tool_name === source.tool_name &&
+      recordMetadata.tool_phase === "finished"
+    ) {
+      Object.assign(metadata, sanitizeSeshOpenLinkage(recordMetadata, eventMetadata));
+    }
   }
 
   if (
@@ -262,6 +280,15 @@ const SESH_PER_EVENT_KEYS = [
   "sesh_startup_cue",
   "sesh_past_work_cue",
   "sesh_withheld_by",
+  // COR-5027: open_session_passages linkage and Forum decision-cue labels are per event too.
+  "sesh_open_search_request_id",
+  "sesh_open_kind",
+  "sesh_open_offset",
+  "forum_decision_cue",
+  "forum_decision_cue_reason",
+  "forum_decision_cue_index",
+  "forum_searches_in_turn_before",
+  "forum_decision_cue_version",
 ];
 
 export function sessionLevelMetadata(metadata: JsonObject): JsonObject {
@@ -382,10 +409,85 @@ function canonicalRequestIdArray(value: unknown, maximum: number): string[] | nu
 }
 
 function isSeshSourceOpenTool(value: unknown): boolean {
-  return ["e3_cosmos", "e3", "cosmos", "cosmos_e3"].some((namespace) =>
-    value === `mcp__${namespace}__sesh__open_coding_session_source` ||
-    value === `mcp__${namespace}__timetracker__get_chat`
-  );
+  return isSeshOpenPassagesTool(value) ||
+    ["e3_cosmos", "e3", "cosmos", "cosmos_e3"].some((namespace) =>
+      value === `mcp__${namespace}__sesh__open_coding_session_source` ||
+      value === `mcp__${namespace}__timetracker__get_chat`
+    );
+}
+
+// COR-5027: open_session_passages is the reader agents are told to use (COR-4910), under any
+// namespace that serves Sesh search (mcp__cosmos__, mcp__codex_apps__cosmos__, mcp__<uuid>__ ...).
+// Same rule as SESH_SEARCH_TOOL and the client hook. Its opens are never "verified".
+const SESH_OPEN_PASSAGES_TOOL = /^(?:[A-Za-z0-9_-]+__)?(?:sesh__)?open_session_passages$/;
+
+function isSeshOpenPassagesTool(value: unknown): boolean {
+  return typeof value === "string" && value.length <= 256 && SESH_OPEN_PASSAGES_TOOL.test(value);
+}
+
+// The search an open_session_passages call came from (its search_request_id argument, which the
+// search's own open handle carries), whether the call read passages or only answered "did it
+// help" (kind), and the page offset. Ids and labels only, never the query, passages or reason.
+// Always on, like the search/open linkage above. Both copies must agree, key by key.
+function sanitizeSeshOpenLinkage(
+  recordMetadata: JsonObject,
+  eventMetadata: JsonObject,
+): JsonObject {
+  const result: JsonObject = {};
+  const agreed = (key: string): unknown => {
+    const value = recordMetadata[key];
+    return key in eventMetadata && eventMetadata[key] !== value ? undefined : value;
+  };
+  const requestId = agreed("sesh_open_search_request_id");
+  if (typeof requestId === "string" && requestId.length === 36 && CANONICAL_REQUEST_ID.test(requestId)) {
+    result.sesh_open_search_request_id = requestId;
+  }
+  const kind = agreed("sesh_open_kind");
+  if (kind === "open" || kind === "feedback") {
+    result.sesh_open_kind = kind;
+  }
+  const offset = agreed("sesh_open_offset");
+  if (kind === "open" && typeof offset === "number" && Number.isInteger(offset) &&
+      offset >= 0 && offset <= 1000) {
+    result.sesh_open_offset = offset;
+  }
+  return result;
+}
+
+// COR-4911 Forum decision-point cue: exposure events from both arms (shown / withheld by the 50%
+// holdout), Codex and Claude Code alike. Kept always on, not behind SESH_TELEMETRY_ENV: every
+// value is a closed enum, a small integer or a date, so no content can pass, and without them the
+// running holdout cannot be read. The arm is the event type; forum_decision_cue must match it.
+const FORUM_DECISION_CUE_EVENTS = ["forum_decision_cue_shown", "forum_decision_cue_withheld"];
+const FORUM_DECISION_CUE_REASON = /^(?:first_edit|call_(?:[1-9]|[1-4][0-9]|50))$/;
+const FORUM_DECISION_CUE_VERSION = /^20[0-9]{2}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12][0-9]|3[01])$/;
+
+function sanitizeForumDecisionCue(
+  eventType: string,
+  recordMetadata: JsonObject,
+  eventMetadata: JsonObject,
+): JsonObject {
+  const result: JsonObject = {};
+  const keep = (key: string, valid: (value: unknown) => boolean) => {
+    const value = recordMetadata[key];
+    if (key in eventMetadata && eventMetadata[key] !== value) {
+      return;
+    }
+    if (value !== undefined && valid(value)) {
+      result[key] = value;
+    }
+  };
+  const integer = (minimum: number, maximum: number) => (value: unknown) =>
+    typeof value === "number" && Number.isInteger(value) && value >= minimum && value <= maximum;
+  const arm = eventType === "forum_decision_cue_shown" ? "shown" : "withheld";
+  keep("forum_decision_cue", (value) => value === arm);
+  keep("forum_decision_cue_reason", (value) =>
+    typeof value === "string" && FORUM_DECISION_CUE_REASON.test(value));
+  keep("forum_decision_cue_index", integer(1, 10));
+  keep("forum_searches_in_turn_before", integer(0, 1000));
+  keep("forum_decision_cue_version", (value) =>
+    typeof value === "string" && FORUM_DECISION_CUE_VERSION.test(value));
+  return result;
 }
 
 function isSeshExactBytesSourceOpenTool(value: unknown): boolean {
