@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "id": "codex-session-logging",
-  "version": "0.2.42",
+  "version": "0.2.43",
   "owner": "Core Edge",
   "providers": ["codex", "claude"],
   "include": [
