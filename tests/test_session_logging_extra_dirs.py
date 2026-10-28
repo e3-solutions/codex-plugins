@@ -182,6 +182,7 @@ def test_claude_presence_target_uses_marker(scratch, monkeypatch, tmp_path):
                                            (CODEX, "CODEX_SESSION_LOG_EXTRA_DIRS")])
 def test_forum_cue_fires_in_allow_listed_dir_only_when_opted_in(directory, env, scratch, monkeypatch, tmp_path):
     cue = load(directory, "forum_cue", alias=f"forum_cue_extra_{directory.parent.name}")
+    monkeypatch.setenv("FORUM_CUE_ENABLED", "1")  # COR-5034: the cue is off unless switched on.
     prompt = {"hook_event_name": "UserPromptSubmit", "session_id": "s-extra", "cwd": str(scratch),
               "prompt": "fix the timeout"}
     assert cue.forum_cue(prompt, directory=tmp_path / "off") is None
@@ -195,6 +196,7 @@ def test_forum_cue_fires_in_allow_listed_dir_only_when_opted_in(directory, env, 
 
 def test_forum_cue_state_file(scratch, monkeypatch, tmp_path):
     cue = load(CLAUDE, "forum_cue", alias="forum_cue_extra_file")
+    monkeypatch.setenv("FORUM_CUE_ENABLED", "1")  # COR-5034: the cue is off unless switched on.
     state = tmp_path / "claude-state"
     state.mkdir()
     (state / "extra-dirs").write_text(f"{scratch}\n", encoding="utf-8")

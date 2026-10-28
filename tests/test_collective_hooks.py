@@ -138,7 +138,7 @@ def test_collective_eligibility_accepts_only_verified_github_ssh_aliases(scripts
 
 
 def test_context_requires_a_general_lesson_in_the_full_body(collective, monkeypatch):
-    monkeypatch.delenv("E3_COLLECTIVE_HOOK_ENABLED", raising=False)
+    monkeypatch.setenv("E3_COLLECTIVE_HOOK_ENABLED", "1")  # COR-5034: off unless switched on.
     context = collective.session_context(eligible=True)
     for required in (
         "Query authoritative systems for current state",
@@ -154,8 +154,15 @@ def test_context_requires_a_general_lesson_in_the_full_body(collective, monkeypa
     assert len(context) <= 2600
 
 
-def test_session_context_is_eligible_and_opt_out_bounded(collective, monkeypatch):
+def test_session_context_is_off_by_default_while_forum_is_hidden(collective, monkeypatch):
+    # COR-5034 (Oct 28, 2026): Forum is hidden from Cosmos, so no Collective guidance unless asked for.
     monkeypatch.delenv("E3_COLLECTIVE_HOOK_ENABLED", raising=False)
+    assert collective.COLLECTIVE_DEFAULT == "0" and not collective.enabled()
+    assert collective.session_context(eligible=True) is None
+
+
+def test_session_context_is_eligible_and_opt_out_bounded(collective, monkeypatch):
+    monkeypatch.setenv("E3_COLLECTIVE_HOOK_ENABLED", "1")  # COR-5034: re-enabled path.
     context = collective.session_context(eligible=True)
     assert "private review queue" in context
     assert "Query authoritative systems for current state" in context
@@ -206,6 +213,27 @@ def test_session_start_process_injects_context_for_e3_even_if_logging_fails(
     expected = load_collective(scripts, f"emitted_{agent}").SESSION_CONTEXT
     assert result.stdout.strip() == expected
     assert "capture failed" in result.stderr
+
+
+@pytest.mark.parametrize(
+    "agent,scripts",
+    [("codex", CODEX_SCRIPTS), ("claude", CLAUDE_SCRIPTS)],
+)
+@pytest.mark.parametrize("source", ["startup", "resume", "clear", "compact"])
+def test_session_start_has_no_forum_guidance_by_default(tmp_path, agent, scripts, source):
+    """COR-5034: with neither Collective flag set, an E3 session start says nothing about Forum."""
+    repo = init_git_repo(tmp_path / f"{agent}-repo", "https://github.com/e3-solutions/example.git")
+    env = base_env(tmp_path, agent=agent)
+    env.pop("E3_COLLECTIVE_FEEDBACK_HOOK_ENABLED")
+    env.pop("E3_COLLECTIVE_HOOK_ENABLED")
+    env["E3_COLLECTIVE_HOOK_STATE_DIR"] = str(tmp_path / "collective-state")
+    result = run_hook(scripts, "session_start", {
+        "hook_event_name": "SessionStart", "session_id": "test-session",
+        "cwd": str(repo), "source": source,
+    }, env=env)
+    assert result.returncode == 0
+    assert "Forum" not in result.stdout and "Collective" not in result.stdout
+    assert result.stdout == ""
 
 
 @pytest.mark.parametrize(
@@ -315,6 +343,11 @@ def test_user_prompt_submit_process_in_e3_emits_only_the_forum_decision_cue(tmp_
         "cwd": str(repo),
         "prompt": "ordinary request",
     }
+    # COR-5034: unset, the Forum cue is off (Forum is hidden from Cosmos) and nothing is logged.
+    env.pop("FORUM_CUE_ENABLED", None)
+    default = run_hook(scripts, "user_prompt_submit", {**prompt, "session_id": "default-off"}, env=env)
+    assert default.returncode == 0 and default.stdout == ""
+    env["FORUM_CUE_ENABLED"] = "1"  # Switched back on, the cue behaves exactly as before.
     result = run_hook(scripts, "user_prompt_submit", prompt, env=env)
 
     assert result.returncode == 0

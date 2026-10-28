@@ -34,15 +34,34 @@ def payload(prompt="fix the timeout", session="0b8f6c1e-claude", **extra):
 
 @pytest.fixture
 def e3(monkeypatch):
+    # COR-5034: the cue is off by default while Forum is hidden; these tests cover it switched back on.
+    monkeypatch.setenv(cue.ENABLED_ENV, "1")
     run = Mock(return_value=E3)
     monkeypatch.setattr(cue.subprocess, "run", run)
     return run
 
 
+def test_off_by_default_while_forum_is_hidden(tmp_path, monkeypatch):
+    # COR-5034: no FORUM_CUE_ENABLED means no cue, no git call and no state written.
+    monkeypatch.delenv(cue.ENABLED_ENV, raising=False)
+    monkeypatch.setattr(cue.subprocess, "run", Mock(side_effect=AssertionError("must not spawn")))
+    assert cue.ENABLED_DEFAULT == "0"
+    assert cue.forum_cue(payload(), directory=tmp_path) is None
+    assert not any(tmp_path.iterdir())
+
+
+@pytest.mark.parametrize("value", ["1", "true", "on", "yes"])
+def test_setting_the_flag_on_restores_the_cue(tmp_path, monkeypatch, value):
+    monkeypatch.setenv(cue.ENABLED_ENV, value)
+    monkeypatch.setattr(cue.subprocess, "run", Mock(return_value=E3))
+    output = cue.forum_cue(payload(), directory=tmp_path)
+    assert json.loads(output)["hookSpecificOutput"]["additionalContext"] == cue.CUE
+
+
 def test_claude_copy_matches_codex_cue_text_and_gating():
     assert cue.CUE == codex_cue.CUE
     assert cue.CUES == codex_cue.CUES and cue.AB_ENV == codex_cue.AB_ENV and cue.AB_ID == codex_cue.AB_ID
-    for name in ("ENABLED_ENV", "MIN_GAP_SECONDS", "NEW_TASK_MIN_WORDS"):
+    for name in ("ENABLED_ENV", "ENABLED_DEFAULT", "MIN_GAP_SECONDS", "NEW_TASK_MIN_WORDS"):
         assert getattr(cue, name) == getattr(codex_cue, name)
     assert cue._E3_REMOTE.pattern == codex_cue._E3_REMOTE.pattern
     for name in ("forum_cue", "forum_cue_decision", "_enabled", "_e3_repository", "_in_extra_dir",

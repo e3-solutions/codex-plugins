@@ -11,7 +11,10 @@ names the mechanism. The agent knows it only after reading code. The prompt-time
 So once per turn, at the agent's first edit or its 6th tool call, whichever comes first, this
 adds one note asking for ONE Forum search naming the general mechanism. At most 3 per session.
 50% of sessions (by session-id hash) are a holdout: the moment is logged as withheld and nothing
-is shown, so live yield can be compared in the same weeks. Off with FORUM_DECISION_CUE=0.
+is shown, so live yield can be compared in the same weeks.
+
+COR-5034 (Oct 28, 2026): Forum is hidden from Cosmos, so this cue is off by default and logs
+nothing. FORUM_DECISION_CUE=1 (or any value but 0/false/no/off) turns it back on.
 
 Byte-identical in codex-session-logging and claude-session-logging (tests pin it); each plugin's
 forum_cue supplies the E3-repository rule and the state location. Logs only content-free events
@@ -27,6 +30,7 @@ import os
 from pathlib import Path
 
 ENV = "FORUM_DECISION_CUE"
+DEFAULT = "0"  # COR-5034: off unless FORUM_DECISION_CUE is set on.
 HOLDOUT_ID = "forum_decision_cue"
 VERSION = "2026-10-21"
 FIRE_AT_CALL = 6
@@ -44,7 +48,7 @@ CUE = (
 
 
 def enabled(env=None) -> bool:
-    value = (os.environ if env is None else env).get(ENV, "1")
+    value = (os.environ if env is None else env).get(ENV, DEFAULT)
     return value.strip().lower() not in {"0", "false", "no", "off"}
 
 

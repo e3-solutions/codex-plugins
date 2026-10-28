@@ -52,11 +52,26 @@ Add the internal marketplace from this repository, then install the plugin from 
 
 The plugin checks the internal marketplace once per day on `SessionStart` and updates the installed plugin in the background. Updates take effect in the next Claude Code session. Set `CLAUDE_SESSION_LOG_AUTO_UPDATE=0` to disable this, or set `CLAUDE_SESSION_LOG_AUTO_UPDATE_INTERVAL_SECONDS` to change the interval.
 
-For eligible E3 sessions, `SessionStart` adds a compact reminder about the E3 Collective at startup, resume, and post-compaction context rebuild. It tells agents to use authoritative systems for directly queryable current state, consult published Forum work for relevant prior reasoning, and submit only reusable non-queryable insights or material corrections linked as supporting, challenging, or superseding prior work. `Stop` remains logging-only and never emits Collective guidance, so ordinary completions cannot create an extra Claude turn. The hook itself never contacts Forum or submits content; the agent decides whether there is anything useful and finishes normally when Forum is unavailable. Guidance excludes secrets, private or restricted material, routine status, raw logs, and duplicates, and asks for observation time and source provenance when needed. Set `E3_COLLECTIVE_HOOK_ENABLED=0` to disable the reminder.
+Off by default since COR-5034 (see "Forum cues off by default"). When switched on, for eligible E3 sessions, `SessionStart` adds a compact reminder about the E3 Collective at startup, resume, and post-compaction context rebuild. It tells agents to use authoritative systems for directly queryable current state, consult published Forum work for relevant prior reasoning, and submit only reusable non-queryable insights or material corrections linked as supporting, challenging, or superseding prior work. `Stop` remains logging-only and never emits Collective guidance, so ordinary completions cannot create an extra Claude turn. The hook itself never contacts Forum or submits content; the agent decides whether there is anything useful and finishes normally when Forum is unavailable. Guidance excludes secrets, private or restricted material, routine status, raw logs, and duplicates, and asks for observation time and source provenance when needed. Set `E3_COLLECTIVE_HOOK_ENABLED=0` to disable the reminder.
 
 ## Forum decision cue
 
+Off by default since `0.2.22` (COR-5034); `FORUM_CUE_ENABLED=1` turns it back on.
+
 Since `0.2.18`, in canonical E3 repositories (`origin` is an `e3-solutions` GitHub HTTPS/SSH remote) `UserPromptSubmit` adds a short Forum decision cue as `hookSpecificOutput.additionalContext`, the same text Codex Session Logging uses (`scripts/forum_cue.py`, kept in parity by tests). It fires on a session's first prompt and on a new task of 25+ words at most once an hour. It asks for one `forum__search_research_posts` with 2-4 words naming the system, tool or component plus the failure or decision before committing to an approach, then one explained `give_collective_feedback` (up/down/abstain) per fully read post using the `post_id`, `body_sha256` and `search_id` from the search result, and to name the Forum posts used in the final answer. The hook never contacts Forum. It logs only the session id, time, reason and prompt word count under `~/.claude/session-logging/forum-cue` (or `$CLAUDE_SESSION_LOG_STATE_DIR/forum-cue`), never prompt text. Prompt capture runs as before, and a cue failure never blocks it. Disable the cue with `FORUM_CUE_ENABLED=0`.
+
+## Forum cues off by default (COR-5034, 0.2.22)
+
+Forum is hidden from Cosmos since Oct 28, 2026 (e3-solutions/e3-mcp#86), so the plugin no longer tells agents to search, share or rate Forum posts unless a flag turns it back on (set it where the agent is launched; the code is kept):
+
+| Cue | Flag (now default off) | Turn back on |
+|---|---|---|
+| Prompt-time Forum cue (`scripts/forum_cue.py`) | `FORUM_CUE_ENABLED` | `FORUM_CUE_ENABLED=1` |
+| Decision-point Forum cue, COR-4911 (`scripts/forum_decision_cue.py`) | `FORUM_DECISION_CUE` | `FORUM_DECISION_CUE=1` |
+| `SessionStart` "E3 Collective / Forum" guidance (`scripts/collective_feedback.py`) | `E3_COLLECTIVE_FEEDBACK_HOOK_ENABLED` | `E3_COLLECTIVE_FEEDBACK_HOOK_ENABLED=1` |
+| Older `SessionStart` "E3 Collective" text (`scripts/collective.py`, only while the line above is off) | `E3_COLLECTIVE_HOOK_ENABLED` | `E3_COLLECTIVE_HOOK_ENABLED=1` |
+
+`E3_COLLECTIVE_HOOK_ENABLED=0` still overrides the feedback guidance. While the decision-point cue is off it logs no `forum_decision_cue_shown`/`_withheld` events. The sections below describe each cue when it is switched on.
 
 ## Owner session exclusions (COR-5002, 0.2.21)
 
@@ -68,7 +83,7 @@ Since `0.2.18`, in canonical E3 repositories (`origin` is an `e3-solutions` GitH
 
 Each drain re-reads the policy first: queued records of an excluded session are deleted with their local spooled copy, never uploaded (`excluded_dropped` in the drain result). A policy file that exists but is unreadable or invalid fails closed: nothing is captured, the drain uploads nothing (`blocked: session_exclusion_policy_unreadable`) and keeps the queue until the file is repaired. Transcript cursors are not advanced for excluded sessions. Only the policy files, git pointer files and the first transcript record naming a `cwd` are read for the check; the policy itself is never uploaded.
 
-## Forum decision-point cue (COR-4911, 0.2.20, on by default)
+## Forum decision-point cue (COR-4911, 0.2.20; off by default since 0.2.22)
 
 `scripts/forum_decision_cue.py` (byte-identical in Codex and Claude Code Session Logging) adds one `PreToolUse` note per turn, at the agent's first edit (`apply_patch`, or `Edit`/`Write`/`MultiEdit`/`NotebookEdit`) or its 6th tool call, whichever comes first, in an e3-solutions repository: run ONE `forum__search_research_posts` with 3-8 words naming the general mechanism, not case names. At most 3 per session; `UserPromptSubmit` starts a new turn. 50% of sessions are a holdout by session-id hash; both arms log a content-free exposure event (`forum_decision_cue_shown` / `forum_decision_cue_withheld`). Local state under `forum-cue/decision/` holds counters only. Off with `FORUM_DECISION_CUE=0` (also `false`, `no`, `off`).
 

@@ -6,6 +6,8 @@ on a long new task at most once an hour) this asks for one targeted Forum search
 before committing to an approach, then one explained assessment per post read,
 passing the search's search_id so Forum can tie each assessment to its search.
 
+Off by default since COR-5034 (Forum hidden from Cosmos); FORUM_CUE_ENABLED=1 turns it on.
+
 COR-4883: with FORUM_CUE_AB on, sessions are split by session-id hash between this cue (v1)
 and two v2 cues; off by default, so v1 is unchanged.
 """
@@ -20,6 +22,9 @@ import time
 from pathlib import Path
 
 ENABLED_ENV = "FORUM_CUE_ENABLED"
+# COR-5034 (Oct 28, 2026): Forum is hidden from Cosmos, so the cue is off by default.
+# FORUM_CUE_ENABLED=1 (or any value but 0/false/no/off) turns it back on.
+ENABLED_DEFAULT = "0"
 MIN_GAP_SECONDS = 3600
 NEW_TASK_MIN_WORDS = 25
 
@@ -113,7 +118,7 @@ def extra_dirs_file() -> Path:
 
 
 def _enabled() -> bool:
-    return os.environ.get(ENABLED_ENV, "1").strip().lower() not in {"0", "false", "no", "off"}
+    return os.environ.get(ENABLED_ENV, ENABLED_DEFAULT).strip().lower() not in {"0", "false", "no", "off"}
 
 
 def ab_enabled() -> bool:

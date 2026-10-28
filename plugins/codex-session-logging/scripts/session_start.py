@@ -20,7 +20,9 @@ def main() -> None:
             print(context, flush=True)
     except Exception:
         pass  # Retrieval guidance must not interrupt existing hooks.
-    preview = os.environ.get("E3_COLLECTIVE_FEEDBACK_HOOK_ENABLED", "1") == "1"
+    # COR-5034: Forum guidance is off unless E3_COLLECTIVE_FEEDBACK_HOOK_ENABLED=1
+    # (or, for the legacy Collective text, E3_COLLECTIVE_HOOK_ENABLED=1).
+    preview = os.environ.get("E3_COLLECTIVE_FEEDBACK_HOOK_ENABLED", "0") == "1"
     if preview:
         try:
             from collective_feedback import feedback_context

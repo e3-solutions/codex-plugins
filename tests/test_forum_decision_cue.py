@@ -63,7 +63,8 @@ def e3(monkeypatch):
 @pytest.fixture(autouse=True)
 def _scripts_on_path(monkeypatch):
     monkeypatch.syspath_prepend(str(CODEX))
-    monkeypatch.delenv(cue.ENV, raising=False)
+    # COR-5034: off by default while Forum is hidden; most tests cover it switched back on.
+    monkeypatch.setenv(cue.ENV, "1")
 
 
 def run(n, directory, **kw):
@@ -133,6 +134,23 @@ def test_not_an_e3_repository_never_fires(tmp_path, monkeypatch):
     assert all(result == (None, None) for result in run(8, tmp_path, tool="apply_patch"))
 
 
+def test_off_by_default_while_forum_is_hidden(tmp_path, e3, monkeypatch):
+    # COR-5034: unset means no cue, no exposure event, no git check and no state.
+    monkeypatch.delenv(cue.ENV, raising=False)
+    assert cue.DEFAULT == "0" and not cue.enabled() and not cue.enabled({})
+    assert all(result == (None, None) for result in run(8, tmp_path, tool="apply_patch"))
+    cue.new_turn({"session_id": SHOWN}, directory=tmp_path)
+    assert e3 == [] and not any(tmp_path.iterdir())
+
+
+@pytest.mark.parametrize("value", ["1", "true", "on", "yes"])
+def test_setting_the_flag_on_restores_the_cue(tmp_path, e3, monkeypatch, value):
+    monkeypatch.setenv(cue.ENV, value)
+    output, event = cue.decision_cue(call(tool="apply_patch"), directory=tmp_path)
+    assert json.loads(output)["hookSpecificOutput"]["additionalContext"] == cue.CUE
+    assert event["event_type"] == "forum_decision_cue_shown"
+
+
 @pytest.mark.parametrize("value", ["0", "false", "no", "off"])
 def test_switch_off(tmp_path, e3, monkeypatch, value):
     monkeypatch.setenv(cue.ENV, value)
@@ -175,8 +193,12 @@ def _git_repo(path: Path) -> Path:
 
 
 @pytest.mark.parametrize("plugin", ["codex", "claude"])
-def test_hook_scripts_print_the_cue_on_the_sixth_call_end_to_end(tmp_path, plugin):
-    """Runs the real pre_tool_use.py and user_prompt_submit.py in a temporary home, upload off."""
+@pytest.mark.parametrize("flag", ["1", None])
+def test_hook_scripts_print_the_cue_on_the_sixth_call_end_to_end(tmp_path, plugin, flag):
+    """Runs the real pre_tool_use.py and user_prompt_submit.py in a temporary home, upload off.
+
+    COR-5034: with FORUM_DECISION_CUE unset the hooks print nothing; =1 brings back the cue.
+    """
     repo = _git_repo(tmp_path / "repo")
     scripts = CODEX if plugin == "codex" else CLAUDE
     env = {"PATH": "/usr/bin:/bin:/opt/homebrew/bin", "HOME": str(tmp_path / "home"),
@@ -185,6 +207,8 @@ def test_hook_scripts_print_the_cue_on_the_sixth_call_end_to_end(tmp_path, plugi
            "CODEX_SESSION_LOG_STATE_DIR": str(tmp_path / "home/codex-state"),
            "CODEX_SESSION_LOG_AUTO_UPLOAD": "0", "CLAUDE_SESSION_LOG_AUTO_UPLOAD": "0",
            "E3_SESH_PLAN_CUE": "0", "E3_SESH_ONE_PER_TURN": "0", "FORUM_CUE_ENABLED": "0"}
+    if flag is not None:
+        env["FORUM_DECISION_CUE"] = flag
     (tmp_path / "home").mkdir()
 
     def hook(name, payload):
@@ -200,5 +224,9 @@ def test_hook_scripts_print_the_cue_on_the_sixth_call_end_to_end(tmp_path, plugi
                                         "transcript_path": str(tmp_path / "t.jsonl"),
                                         "tool_use_id": f"t{i}", "turn_id": "turn-1"})
                for i in range(7)]
+    if flag is None:
+        assert outputs == [""] * 7
+        assert not list((tmp_path / "home").rglob("decision"))
+        return
     assert [bool(o) for o in outputs] == [False] * 5 + [True, False]
     assert json.loads(outputs[5])["hookSpecificOutput"]["additionalContext"] == cue.CUE

@@ -28,7 +28,7 @@ def forum_decision(payload):
     try:
         from forum_decision_cue import decision_cue
 
-        return decision_cue(payload)  # COR-4911, on unless FORUM_DECISION_CUE=0/false/no/off.
+        return decision_cue(payload)  # COR-4911; off unless FORUM_DECISION_CUE=1 (COR-5034).
     except Exception:  # noqa: BLE001 - the cue fails open.
         return None, None
 
