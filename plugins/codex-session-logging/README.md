@@ -74,6 +74,19 @@ sanitizer keeps the three keys only when all are valid and both copies agree. **
 the updated `codex-session-ingest` function before turning the flag on**, or the
 arms are dropped and never reach `public.codex_session_events`.
 
+## Forum cues off by default (COR-5034, 0.2.44)
+
+Forum is hidden from Cosmos since Oct 28, 2026 (e3-solutions/e3-mcp#86), so the plugin no longer tells agents to search, share or rate Forum posts unless a flag turns it back on (set it where the agent is launched; the code is kept):
+
+| Cue | Flag (now default off) | Turn back on |
+|---|---|---|
+| Prompt-time Forum cue (`scripts/forum_cue.py`) | `FORUM_CUE_ENABLED` | `FORUM_CUE_ENABLED=1` |
+| Decision-point Forum cue, COR-4911 (`scripts/forum_decision_cue.py`) | `FORUM_DECISION_CUE` | `FORUM_DECISION_CUE=1` |
+| `SessionStart` "E3 Collective / Forum" guidance (`scripts/collective_feedback.py`) | `E3_COLLECTIVE_FEEDBACK_HOOK_ENABLED` | `E3_COLLECTIVE_FEEDBACK_HOOK_ENABLED=1` |
+| Older `SessionStart` "E3 Collective" text (`scripts/collective.py`, only while the line above is off) | `E3_COLLECTIVE_HOOK_ENABLED` | `E3_COLLECTIVE_HOOK_ENABLED=1` |
+
+`E3_COLLECTIVE_HOOK_ENABLED=0` still overrides the feedback guidance. While the decision-point cue is off it logs no `forum_decision_cue_shown`/`_withheld` events. The sections below describe each cue when it is switched on.
+
 ## Sesh open linkage and Forum cue labels at ingest (COR-5027, 0.2.43)
 
 Finished `open_session_passages` events (any `mcp__<namespace>__sesh__open_session_passages`) keep
@@ -98,7 +111,7 @@ is a closed enum, a small integer or a date. All of these are per-event and neve
 
 A rollout chunk file exists only until its record uploads, then it is deleted. Every drain also deletes chunk files that no queue record (pending, processing or dead-letter) references and that are over an hour old; the drain result reports `pruned_chunks` when it removed any.
 
-## Forum decision-point cue (COR-4911, 0.2.41, on by default)
+## Forum decision-point cue (COR-4911, 0.2.41; off by default since 0.2.44)
 
 `scripts/forum_decision_cue.py` (byte-identical in Codex and Claude Code Session Logging) adds one `PreToolUse` note per turn, at the agent's first edit (`apply_patch`, or `Edit`/`Write`/`MultiEdit`/`NotebookEdit`) or its 6th tool call, whichever comes first, in an e3-solutions repository: run ONE `forum__search_research_posts` with 3-8 words naming the general mechanism, not case names. At most 3 per session; `UserPromptSubmit` starts a new turn. 50% of sessions are a holdout by session-id hash; both arms log a content-free exposure event (`forum_decision_cue_shown` / `forum_decision_cue_withheld`). Local state under `forum-cue/decision/` holds counters only. Off with `FORUM_DECISION_CUE=0` (also `false`, `no`, `off`).
 
@@ -204,7 +217,7 @@ Some E3 work runs from a scratch directory that is not a git repository, so it h
 These sessions upload the fixed `repo_remote` `https://github.com/e3-solutions/allowlisted-dir.git` (no repository has that name; it is shaped like an in-org remote so the existing ingest accepts it). No new path is uploaded; `cwd` is sent exactly as for repository sessions. The client refuses to upload that marker unless an extra directory is configured. Nothing changes for anyone who does not set this.
 
 
-For eligible E3 sessions, `SessionStart` adds a compact reminder about the E3 Collective at startup, resume, and post-compaction context rebuild. It tells agents to use authoritative systems for directly queryable current state, consult published Forum work for relevant prior reasoning, and submit only reusable non-queryable insights or material corrections linked as supporting, challenging, or superseding prior work. `Stop` remains logging-only and never emits Collective guidance, so ordinary completions cannot create an extra agent turn. The hook itself never contacts Forum or submits content; the agent decides whether there is anything useful and finishes normally when Forum is unavailable. Guidance excludes secrets, private or restricted material, routine status, raw logs, and duplicates, and asks for observation time and source provenance when needed. Set `E3_COLLECTIVE_HOOK_ENABLED=0` to disable the reminder.
+Off by default since COR-5034 (see "Forum cues off by default"). When switched on, for eligible E3 sessions, `SessionStart` adds a compact reminder about the E3 Collective at startup, resume, and post-compaction context rebuild. It tells agents to use authoritative systems for directly queryable current state, consult published Forum work for relevant prior reasoning, and submit only reusable non-queryable insights or material corrections linked as supporting, challenging, or superseding prior work. `Stop` remains logging-only and never emits Collective guidance, so ordinary completions cannot create an extra agent turn. The hook itself never contacts Forum or submits content; the agent decides whether there is anything useful and finishes normally when Forum is unavailable. Guidance excludes secrets, private or restricted material, routine status, raw logs, and duplicates, and asks for observation time and source provenance when needed. Set `E3_COLLECTIVE_HOOK_ENABLED=0` to disable the reminder.
 
 Queryable hook event rows record only the tool name, phase, optional tool call id, and success flag when exposed by Codex. The private rollout objects retain the exact native JSONL, including tool arguments and outputs, so no available session data is discarded. Setup snapshots include sanitized Codex config names such as enabled plugins, installed skill names/sources, MCP server names/transport, marketplaces, app connection ids/tool names, and non-secret model/runtime settings.
 

@@ -22,9 +22,28 @@ def payload(prompt="fix the timeout", session="s1", **extra):
 
 @pytest.fixture
 def e3(monkeypatch):
+    # COR-5034: the cue is off by default while Forum is hidden; these tests cover it switched back on.
+    monkeypatch.setenv(cue.ENABLED_ENV, "1")
     run = Mock(return_value=E3)
     monkeypatch.setattr(cue.subprocess, "run", run)
     return run
+
+
+def test_off_by_default_while_forum_is_hidden(tmp_path, monkeypatch):
+    # COR-5034: no FORUM_CUE_ENABLED means no cue, no git call and no state written.
+    monkeypatch.delenv(cue.ENABLED_ENV, raising=False)
+    monkeypatch.setattr(cue.subprocess, "run", Mock(side_effect=AssertionError("must not spawn")))
+    assert cue.ENABLED_DEFAULT == "0"
+    assert cue.forum_cue(payload(), directory=tmp_path) is None
+    assert not any(tmp_path.iterdir())
+
+
+@pytest.mark.parametrize("value", ["1", "true", "on", "yes"])
+def test_setting_the_flag_on_restores_the_cue(tmp_path, monkeypatch, value):
+    monkeypatch.setenv(cue.ENABLED_ENV, value)
+    monkeypatch.setattr(cue.subprocess, "run", Mock(return_value=E3))
+    output = cue.forum_cue(payload(), directory=tmp_path)
+    assert json.loads(output)["hookSpecificOutput"]["additionalContext"] == cue.CUE
 
 
 def context_of(output):

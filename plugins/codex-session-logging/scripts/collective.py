@@ -10,6 +10,9 @@ import os
 
 
 COLLECTIVE_ENABLED_ENV = "E3_COLLECTIVE_HOOK_ENABLED"
+# COR-5034 (Oct 28, 2026): Forum is hidden from Cosmos, so this guidance is off by default.
+# E3_COLLECTIVE_HOOK_ENABLED=1 (or any value but 0/false/no/off) turns it back on.
+COLLECTIVE_DEFAULT = "0"
 SESSION_CONTEXT = (
     "E3 Collective: use Cosmos Forum to learn from relevant prior E3 reasoning, decisions, "
     "investigations, failures, and methods. Query authoritative systems for current state; do not "
@@ -33,7 +36,7 @@ SESSION_CONTEXT = (
 
 
 def enabled() -> bool:
-    return os.environ.get(COLLECTIVE_ENABLED_ENV, "1").strip().lower() not in {
+    return os.environ.get(COLLECTIVE_ENABLED_ENV, COLLECTIVE_DEFAULT).strip().lower() not in {
         "0",
         "false",
         "no",

@@ -167,12 +167,28 @@ def test_packaged_context_loads(name, source, local):
 
 
 @pytest.mark.parametrize("name", PROVIDERS)
-def test_released_default_and_explicit_global_optout(name, local):
+def test_released_default_is_off_and_explicit_flag_and_global_optout(name, local):
+    if name.startswith("sherlock"):
+        pytest.skip("Sherlock ships its own default (e3-solutions/sherlock); COR-5034 is codex-plugins only")
+    # COR-5034 (Oct 28, 2026): Forum is hidden from Cosmos, so with neither flag set the released
+    # default says nothing about Forum or the Collective.
     local[1].pop("E3_COLLECTIVE_FEEDBACK_HOOK_ENABLED")
+    local[1].pop("E3_COLLECTIVE_HOOK_ENABLED")
+    output = invoke(name, local)  # Codex still prints the separate Sesh startup cue.
+    assert "Forum" not in output and "Collective" not in output and "forum__" not in output
+    # E3_COLLECTIVE_FEEDBACK_HOOK_ENABLED=1 brings the feedback guidance back unchanged.
+    local[2]["session_id"] = "enabled-session"
+    local[1]["E3_COLLECTIVE_FEEDBACK_HOOK_ENABLED"] = "1"
     assert "E3 Collective / Forum:" in invoke(name, local)
+    # E3_COLLECTIVE_HOOK_ENABLED=0 still overrides it.
     local[2]["session_id"] = "optout-session"
     local[1]["E3_COLLECTIVE_HOOK_ENABLED"] = "0"
     assert "E3 Collective" not in invoke(name, local)
+
+
+def test_feedback_preview_default_is_off():
+    module = load(provider_root(PROVIDERS[0]) / "scripts/collective_feedback.py", "default_contract")
+    assert module.FEEDBACK_DEFAULT == "0"
 
 
 @pytest.mark.parametrize("name", PROVIDERS)

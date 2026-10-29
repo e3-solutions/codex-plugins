@@ -1,6 +1,6 @@
 {
   "name": "claude-session-logging",
-  "version": "0.2.21",
+  "version": "0.2.22",
   "description": "Internal Claude Code thread and tool metadata tracking for Core Edge repositories.",
   "author": {
     "name": "Core Edge Solution"
