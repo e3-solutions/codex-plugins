@@ -350,7 +350,7 @@ def test_claude_plugin_packaging_and_internal_marketplace_are_present():
     hooks_text = json.dumps(hooks)
 
     assert manifest["name"] == "claude-session-logging"
-    assert manifest["version"] == "0.2.22"
+    assert manifest["version"] == "0.2.23"
     assert "Codex" not in manifest["description"]
     assert "SessionStart" in hooks["hooks"]
     assert "UserPromptSubmit" in hooks["hooks"]
@@ -1478,3 +1478,45 @@ def test_exclusion_ids_match_codex_logger_helper(tmp_path, monkeypatch):
     spec.loader.exec_module(codex)
 
     assert set(claude.exclusion_policy().excluded) == codex.excluded_session_ids() == {EXCLUDED_ROOT, OTHER_ROOT}
+
+
+def test_drain_stops_on_server_busy_waits_then_resumes_with_region_header(tmp_path, monkeypatch):
+    # COR-5169: one busy answer stops the drain and starts a backoff; a later
+    # drain posts to us-east-1 and clears it.
+    import io
+    import urllib.error
+
+    monkeypatch.setenv("CLAUDE_SESSION_LOG_STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setenv("CLAUDE_SESSION_LOG_INGEST_URL", "https://logs.example.test/ingest")
+    session_logging = load_session_logging()
+    repo = init_git_repo(tmp_path / "repo", "https://github.com/e3-solutions/codex-plugins.git")
+    for index in range(3):
+        session_logging.capture_hook_event(
+            {
+                "hook_event_name": "PreToolUse",
+                "session_id": f"claude-busy-{index}",
+                "cwd": str(repo),
+                "tool_name": "Bash",
+                "tool_input": {"command": "true"},
+            }
+        )
+    attempts = []
+
+    def busy(request, timeout):
+        attempts.append(request)
+        raise urllib.error.HTTPError(request.full_url, 503, "busy", {}, io.BytesIO(b"{}"))
+
+    monkeypatch.setattr(session_logging.urllib.request, "urlopen", busy)
+    first = session_logging.drain_queue()
+    assert len(attempts) == 1
+    assert first["remaining"] == 3 and first["server_status"] == 503 and 14 < first["backoff_seconds"] <= 15
+    assert session_logging.drain_queue()["backoff_seconds"] > 0
+    assert len(attempts) == 1
+
+    base = session_logging.ensure_state_dir()
+    (base / "upload-backoff.json").write_text('{"until": 0, "attempts": 3}', encoding="utf-8")
+    requests = _fake_urlopen(session_logging, monkeypatch)
+    resumed = session_logging.drain_queue()
+    assert resumed["uploaded"] == 3 and "backoff_seconds" not in resumed
+    assert {request.get_header("X-region") for request in requests} == {"us-east-1"}
+    assert not (base / "upload-backoff.json").exists()

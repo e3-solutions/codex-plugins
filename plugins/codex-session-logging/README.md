@@ -74,6 +74,10 @@ sanitizer keeps the three keys only when all are valid and both copies agree. **
 the updated `codex-session-ingest` function before turning the flag on**, or the
 arms are dropped and never reach `public.codex_session_events`.
 
+## Ingest region and backoff (COR-5169, 0.2.45)
+
+Ingest posts send `x-region: us-east-1`, so the ingest runs next to its database. A 429, 502, 503 or 504 answer stops the drain (a 500 stays a per-record retry). Records not yet tried stay queued, and the next drain waits for `Retry-After`, or else 15 s doubling to 5 min (`upload-backoff.json` in the state directory). Only a drain with no busy answer resets the count.
+
 ## Forum cues off by default (COR-5034, 0.2.44)
 
 Forum is hidden from Cosmos since Oct 28, 2026 (e3-solutions/e3-mcp#86), so the plugin no longer tells agents to search, share or rate Forum posts unless a flag turns it back on (set it where the agent is launched; the code is kept):

@@ -17,6 +17,7 @@ import stat
 import subprocess
 import sys
 import threading
+import time
 import urllib.error
 import urllib.request
 import uuid
@@ -55,10 +56,20 @@ ALLOWLISTED_DIR_REPOSITORY = "allowlisted-dir"
 COLLECTIVE_SESSION_SOURCES = frozenset({"startup", "resume", "compact"})
 EXCERPT_BYTES = 4096
 PLUGIN_NAME = "sesh"  # sesh plugin: name sent with every upload
-PLUGIN_VERSION = "0.2.1"  # sesh plugin: keep equal to .codex-plugin/plugin.json
+PLUGIN_VERSION = "0.2.2"  # sesh plugin: keep equal to .codex-plugin/plugin.json
 ROLLOUT_CHUNK_DIR = "rollout-sync/chunks"
 ORPHAN_CHUNK_GRACE_SECONDS = 60 * 60
 PERMANENT_HTTP_STATUSES = {400, 413, 415, 422}
+# COR-5169: run the ingest next to its database. Without this the edge runtime
+# picks the region nearest the machine; from Mumbai each record took ~2.3 s and
+# every ingest 500 and nearly every 503 of a day came from there.
+INGEST_REGION = "us-east-1"
+# Answers that mean the server is overloaded, not this record. A 500 can be
+# this record's own database error, so it stays a per-record retry: one bad
+# record must not hold the whole queue.
+SERVER_BUSY_HTTP_STATUSES = {429, 502, 503, 504}
+UPLOAD_BACKOFF_FILE = "upload-backoff.json"
+MAX_UPLOAD_BACKOFF_SECONDS = 300
 _SESSION_UPLOAD_LOCKS: dict[str, threading.Lock] = {}
 _SESSION_UPLOAD_LOCKS_GUARD = threading.Lock()
 
@@ -1483,13 +1494,23 @@ def drain_queue(progress_callback: Callable[[JsonDict], None] | None = None) -> 
 
         migrate_legacy_queue(base)
         recover_processing_records(base)
+        # COR-5169: after the ingest answered busy, wait rather than hammer it.
+        if waiting := upload_backoff_remaining(base):
+            return {
+                "uploaded": 0,
+                "failed": 0,
+                "dead_lettered": 0,
+                "remaining": len(pending_queue_paths(base)),
+                "backoff_seconds": round(waiting, 1),
+            }
         uploaded = 0
         failed = 0
         dead_lettered = 0
         failed_record_names: set[str] = set()
         uploader: IngestUploader | None = None
+        busy = BusySignal()
         with ThreadPoolExecutor(max_workers=upload_worker_count()) as executor:
-            while True:
+            while not busy.error:
                 queue_paths = [path for path in pending_queue_paths(base) if path.name not in failed_record_names]
                 if not queue_paths:
                     break
@@ -1501,13 +1522,15 @@ def drain_queue(progress_callback: Callable[[JsonDict], None] | None = None) -> 
                     if (claimed := claim_queue_path(path, base)) is not None
                 ]
                 for status, record_name in executor.map(
-                    lambda path: upload_claimed_record(path, uploader=uploader, base=base),
+                    lambda path: upload_claimed_record(path, uploader=uploader, base=base, busy=busy),
                     claimed_paths,
                 ):
                     if status == "uploaded":
                         uploaded += 1
                     elif status == "dead_lettered":
                         dead_lettered += 1
+                    elif status == "deferred":
+                        failed_record_names.add(record_name)
                     else:
                         failed += 1
                         failed_record_names.add(record_name)
@@ -1525,6 +1548,12 @@ def drain_queue(progress_callback: Callable[[JsonDict], None] | None = None) -> 
             "dead_lettered": dead_lettered,
             "remaining": len(pending_queue_paths(base)),
         }
+        if busy.error:
+            state = record_server_busy(base, busy.error)
+            result["backoff_seconds"] = round(state["until"] - time.time(), 1)
+            result["server_status"] = busy.error.status
+        elif uploaded:
+            clear_server_busy(base)
         try:
             if pruned := prune_orphan_rollout_chunks(base):
                 result["pruned_chunks"] = pruned
@@ -1540,16 +1569,36 @@ def upload_worker_count() -> int:
         return 4
 
 
+class BusySignal:
+    """The first busy answer of a drain; later workers stop before uploading."""
+
+    def __init__(self) -> None:
+        self.error: ServerBusyError | None = None
+        self._lock = threading.Lock()
+
+    def set(self, error: ServerBusyError) -> None:
+        with self._lock:
+            self.error = self.error or error
+
+
 def upload_claimed_record(
     claimed_path: Path,
     *,
     uploader: "IngestUploader",
     base: Path,
+    busy: BusySignal | None = None,
 ) -> tuple[str, str]:
     record: JsonDict | None = None
+    if busy is not None and busy.error:
+        # Not attempted: back to the queue unchanged for the next drain.
+        claimed_path.replace(pending_queue_dir(base) / claimed_path.name)
+        return "deferred", claimed_path.name
     try:
         record = read_json_file(claimed_path)
         with session_upload_lock(str(record.get("session_id") or "unknown-session")):
+            if busy is not None and busy.error:
+                claimed_path.replace(pending_queue_dir(base) / claimed_path.name)
+                return "deferred", claimed_path.name
             uploader.upload_message(record, base=base)
     except PermanentUploadError as exc:
         if record is None:
@@ -1560,6 +1609,8 @@ def upload_claimed_record(
             dead_letter_record(base, record, claimed_path, exc)
         return "dead_lettered", claimed_path.name
     except Exception as exc:  # noqa: BLE001 - uploader must preserve queue on any failure.
+        if isinstance(exc, ServerBusyError) and busy is not None:
+            busy.set(exc)
         if record is None:
             claimed_path.replace(pending_queue_dir(base) / claimed_path.name)
         else:
@@ -1954,6 +2005,7 @@ class IngestUploader:
             "content-type": "application/json",
             "connection": "close",
             "user-agent": f"{PLUGIN_NAME}/{PLUGIN_VERSION}",  # sesh plugin
+            "x-region": INGEST_REGION,
         }
         if self.token:
             headers["x-codex-session-log-token"] = self.token
@@ -1974,6 +2026,10 @@ class IngestUploader:
             message = f"Codex session ingest failed {exc.code}: {body}"
             if exc.code in PERMANENT_HTTP_STATUSES:
                 raise PermanentUploadError(message, status=exc.code) from exc
+            if exc.code in SERVER_BUSY_HTTP_STATUSES:
+                raise ServerBusyError(
+                    message, status=exc.code, retry_after=retry_after_seconds(exc.headers)
+                ) from exc
             raise RuntimeError(message) from exc
 
 
@@ -1981,6 +2037,61 @@ class PermanentUploadError(RuntimeError):
     def __init__(self, message: str, *, status: int | None = None) -> None:
         super().__init__(message)
         self.status = status
+
+
+class ServerBusyError(RuntimeError):
+    """The ingest is overloaded or failing; stop this drain and back off."""
+
+    def __init__(self, message: str, *, status: int, retry_after: float | None = None) -> None:
+        super().__init__(message)
+        self.status = status
+        self.retry_after = retry_after
+
+
+def retry_after_seconds(headers: object) -> float | None:
+    try:
+        value = float(headers.get("Retry-After"))  # type: ignore[union-attr]
+    except (AttributeError, TypeError, ValueError):
+        return None
+    return min(value, MAX_UPLOAD_BACKOFF_SECONDS) if value >= 0 else None
+
+
+def upload_backoff_remaining(base: Path, *, now: float | None = None) -> float:
+    """Seconds until the next drain may upload; 0 when no backoff is in force."""
+    try:
+        until = float(read_json_file(base / UPLOAD_BACKOFF_FILE)["until"])
+    except (FileNotFoundError, OSError, ValueError, KeyError, TypeError, json.JSONDecodeError):
+        return 0.0
+    remaining = until - (time.time() if now is None else now)
+    # A wait longer than the cap (clock change, older file) counts as over.
+    return remaining if 0 < remaining <= MAX_UPLOAD_BACKOFF_SECONDS else 0.0
+
+
+def record_server_busy(base: Path, error: ServerBusyError, *, now: float | None = None) -> JsonDict:
+    """Back off after a busy answer: Retry-After (at most 5 min), else 15 s doubling to 5 min.
+
+    Only a drain that met no busy answer clears the count, so a partly
+    overloaded server that still accepts some uploads keeps backing off.
+    """
+    try:
+        previous = int(read_json_file(base / UPLOAD_BACKOFF_FILE).get("attempts", 0))
+    except (FileNotFoundError, OSError, ValueError, TypeError, OverflowError, json.JSONDecodeError):
+        previous = 0
+    attempts = min(max(previous, 0), 16) + 1
+    delay = error.retry_after if error.retry_after is not None else 15 * 2 ** (attempts - 1)
+    delay = min(MAX_UPLOAD_BACKOFF_SECONDS, delay)
+    state = {
+        "until": (time.time() if now is None else now) + delay,
+        "attempts": attempts,
+        "status": error.status,
+        "at": now_iso(),
+    }
+    write_json_atomic(base / UPLOAD_BACKOFF_FILE, state)
+    return state
+
+
+def clear_server_busy(base: Path) -> None:
+    (base / UPLOAD_BACKOFF_FILE).unlink(missing_ok=True)
 
 
 def validate_ingest_payload(payload: JsonDict) -> None:
