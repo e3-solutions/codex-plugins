@@ -1509,7 +1509,7 @@ def test_drain_stops_on_server_busy_waits_then_resumes_with_region_header(tmp_pa
     monkeypatch.setattr(session_logging.urllib.request, "urlopen", busy)
     first = session_logging.drain_queue()
     assert len(attempts) == 1
-    assert first["remaining"] == 3 and first["server_status"] == 503 and first["backoff_seconds"] == 15.0
+    assert first["remaining"] == 3 and first["server_status"] == 503 and 14 < first["backoff_seconds"] <= 15
     assert session_logging.drain_queue()["backoff_seconds"] > 0
     assert len(attempts) == 1
 

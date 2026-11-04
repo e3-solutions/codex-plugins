@@ -59,7 +59,9 @@ PERMANENT_HTTP_STATUSES = {400, 403, 413, 415, 422}
 # the machine (from Mumbai each record took ~2.3 s, and the ingest's 500s and
 # 503s came from there), and back off when it answers busy.
 INGEST_REGION = "us-east-1"
-SERVER_BUSY_HTTP_STATUSES = {429, 500, 502, 503, 504}
+# Not 500: it can be this record's own database error, and one bad record
+# must not hold the whole queue.
+SERVER_BUSY_HTTP_STATUSES = {429, 502, 503, 504}
 UPLOAD_BACKOFF_FILE = "upload-backoff.json"
 MAX_UPLOAD_BACKOFF_SECONDS = 300
 # Byte budget for the utf8 excerpt stored alongside full-body message records
@@ -788,7 +790,7 @@ def drain_queue() -> JsonDict:
             "remaining": len(pending_queue_paths(base)),
         }
         if busy is not None:
-            state = record_server_busy(base, busy, progressed=uploaded > 0)
+            state = record_server_busy(base, busy)
             result["backoff_seconds"] = round(state["until"] - time.time(), 1)
             result["server_status"] = busy.status
         elif uploaded:
@@ -1060,7 +1062,7 @@ def retry_after_seconds(headers: object) -> float | None:
         value = float(headers.get("Retry-After"))  # type: ignore[union-attr]
     except (AttributeError, TypeError, ValueError):
         return None
-    return value if 0 <= value <= MAX_UPLOAD_BACKOFF_SECONDS else None
+    return min(value, MAX_UPLOAD_BACKOFF_SECONDS) if value >= 0 else None
 
 
 def upload_backoff_remaining(base: Path, *, now: float | None = None) -> float:
@@ -1074,16 +1076,17 @@ def upload_backoff_remaining(base: Path, *, now: float | None = None) -> float:
     return remaining if 0 < remaining <= MAX_UPLOAD_BACKOFF_SECONDS else 0.0
 
 
-def record_server_busy(base: Path, error: ServerBusyError, *, progressed: bool, now: float | None = None) -> JsonDict:
-    """Back off after a busy answer: Retry-After, else 15 s doubling to 5 min.
+def record_server_busy(base: Path, error: ServerBusyError, *, now: float | None = None) -> JsonDict:
+    """Back off after a busy answer: Retry-After (at most 5 min), else 15 s doubling to 5 min.
 
-    A drain that uploaded something first starts the count again.
+    Only a drain that met no busy answer clears the count, so a partly
+    overloaded server that still accepts some uploads keeps backing off.
     """
     try:
         previous = int(read_json_file(base / UPLOAD_BACKOFF_FILE).get("attempts", 0))
-    except (FileNotFoundError, OSError, ValueError, TypeError, json.JSONDecodeError):
+    except (FileNotFoundError, OSError, ValueError, TypeError, OverflowError, json.JSONDecodeError):
         previous = 0
-    attempts = 1 if progressed else min(previous, 16) + 1
+    attempts = min(max(previous, 0), 16) + 1
     delay = error.retry_after if error.retry_after is not None else 15 * 2 ** (attempts - 1)
     delay = min(MAX_UPLOAD_BACKOFF_SECONDS, delay)
     state = {

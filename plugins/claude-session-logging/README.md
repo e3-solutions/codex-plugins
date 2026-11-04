@@ -62,7 +62,7 @@ Since `0.2.18`, in canonical E3 repositories (`origin` is an `e3-solutions` GitH
 
 ## Ingest region and backoff (COR-5169, 0.2.23)
 
-Ingest posts send `x-region: us-east-1`, so the ingest runs next to its database. A 429 or 5xx answer stops the drain. Records not yet tried stay queued, and the next drain waits for `Retry-After`, or else 15 s doubling to 5 min (`upload-backoff.json` in the state directory). An upload resets the count.
+Ingest posts send `x-region: us-east-1`, so the ingest runs next to its database. A 429, 502, 503 or 504 answer stops the drain (a 500 stays a per-record retry). Records not yet tried stay queued, and the next drain waits for `Retry-After`, or else 15 s doubling to 5 min (`upload-backoff.json` in the state directory). Only a drain with no busy answer resets the count.
 
 ## Forum cues off by default (COR-5034, 0.2.22)
 

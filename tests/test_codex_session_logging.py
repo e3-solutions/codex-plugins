@@ -1070,10 +1070,8 @@ def test_drain_keeps_transient_ingest_failure_pending(tmp_path, monkeypatch):
     result = session_logging.drain_queue()
     queued = read_queue_records(tmp_path / "state")
 
-    assert result == {
-        "uploaded": 0, "failed": 1, "dead_lettered": 0, "remaining": 1,
-        "backoff_seconds": 15.0, "server_status": 500,
-    }
+    # A 500 can be this record's own database error: a per-record retry, no backoff.
+    assert result == {"uploaded": 0, "failed": 1, "dead_lettered": 0, "remaining": 1}
     assert queued[0]["id"] == captured["id"]
     assert "500" in queued[0]["last_upload_error"]
 
@@ -1122,20 +1120,22 @@ def test_drain_stops_on_server_busy_and_waits_before_the_next_upload(tmp_path, m
     assert second["uploaded"] == 0 and second["remaining"] == 3 and second["backoff_seconds"] > 0
 
 
-def test_backoff_doubles_without_progress_and_resets_after_an_upload(tmp_path, monkeypatch):
+def test_backoff_doubles_until_a_clean_drain_and_caps_retry_after(tmp_path, monkeypatch):
     monkeypatch.setenv("CODEX_SESSION_LOG_STATE_DIR", str(tmp_path / "state"))
     session_logging = load_session_logging()
     base = session_logging.ensure_state_dir()
     error = session_logging.ServerBusyError("busy", status=503)
     delays = [
-        session_logging.record_server_busy(base, error, progressed=False, now=1000.0)["until"] - 1000.0
+        session_logging.record_server_busy(base, error, now=1000.0)["until"] - 1000.0
         for _ in range(6)
     ]
     assert delays == [15, 30, 60, 120, 240, 300]
     assert session_logging.upload_backoff_remaining(base, now=1000.0) == 300
     assert session_logging.upload_backoff_remaining(base, now=1400.0) == 0
-    reset = session_logging.record_server_busy(base, error, progressed=True, now=2000.0)
-    assert reset["attempts"] == 1 and reset["until"] == 2015.0
+    long_wait = session_logging.ServerBusyError("busy", status=429, retry_after=session_logging.retry_after_seconds({"Retry-After": "3600"}))
+    assert session_logging.record_server_busy(base, long_wait, now=2000.0)["until"] == 2300.0
+    (base / "upload-backoff.json").write_text('{"until": 0, "attempts": 1e999}', encoding="utf-8")
+    assert session_logging.record_server_busy(base, error, now=2000.0)["attempts"] == 1
     # A wait beyond the cap (clock change, corrupt file) counts as over.
     (base / "upload-backoff.json").write_text('{"until": 1e12}', encoding="utf-8")
     assert session_logging.upload_backoff_remaining(base, now=2000.0) == 0
@@ -1560,3 +1560,32 @@ def test_no_exclusion_file_captures_normally(tmp_path, monkeypatch):
     monkeypatch.setenv("CODEX_SESSION_LOG_STATE_DIR", str(tmp_path / "state"))
     session_logging = load_session_logging()
     assert not session_logging.session_excluded(EXCLUDED_ROOT)
+
+
+def test_a_record_that_always_gets_500_does_not_hold_the_queue(tmp_path, monkeypatch):
+    # Review of COR-5169: a 500 can be one record's own database error. It is
+    # retried per record, the rest of the queue uploads, and no backoff starts.
+    monkeypatch.setenv("CODEX_SESSION_LOG_STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setenv("CODEX_SESSION_LOG_INGEST_URL", "https://logs.example.test/ingest")
+    monkeypatch.setenv("CODEX_SESSION_LOG_UPLOAD_WORKERS", "1")
+    session_logging = load_session_logging()
+    repo = init_git_repo(tmp_path / "repo", "https://github.com/e3-solutions/codex-plugins.git")
+    captured = _capture_records(session_logging, repo, 3, session_prefix="poison")
+    poison = captured[0]["session_id"]
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            return False
+
+    def urlopen(request, timeout):
+        if json.loads(request.data)["record"]["session_id"] == poison:
+            raise urllib.error.HTTPError(request.full_url, 500, "x", {}, io.BytesIO(b'{"error":"ingest_failed"}'))
+        return Response()
+
+    monkeypatch.setattr(session_logging.urllib.request, "urlopen", urlopen)
+    result = session_logging.drain_queue()
+    assert result == {"uploaded": 2, "failed": 1, "dead_lettered": 0, "remaining": 1}
+    assert session_logging.upload_backoff_remaining(session_logging.ensure_state_dir()) == 0
