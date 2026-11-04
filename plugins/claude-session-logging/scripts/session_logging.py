@@ -12,6 +12,7 @@ import re
 import socket
 import subprocess
 import sys
+import time
 import urllib.error
 import urllib.request
 import uuid
@@ -54,6 +55,13 @@ AGENT = "claude"
 # ingest upsertSession branch).
 END_EVENT_TYPES = frozenset({"thread_stopped", "thread_ended"})
 PERMANENT_HTTP_STATUSES = {400, 403, 413, 415, 422}
+# COR-5169: run the ingest next to its database instead of the region nearest
+# the machine (from Mumbai each record took ~2.3 s, and the ingest's 500s and
+# 503s came from there), and back off when it answers busy.
+INGEST_REGION = "us-east-1"
+SERVER_BUSY_HTTP_STATUSES = {429, 500, 502, 503, 504}
+UPLOAD_BACKOFF_FILE = "upload-backoff.json"
+MAX_UPLOAD_BACKOFF_SECONDS = 300
 # Byte budget for the utf8 excerpt stored alongside full-body message records
 # (matches codex-session-logging so both agents produce identical shapes).
 EXCERPT_BYTES = 4096
@@ -705,6 +713,15 @@ def drain_queue() -> JsonDict:
                 "remaining": len(pending_queue_paths(base)),
                 "blocked": "session_exclusion_policy_unreadable",
             }
+        # COR-5169: after the ingest answered busy, wait rather than hammer it.
+        if waiting := upload_backoff_remaining(base):
+            return {
+                "uploaded": 0,
+                "failed": 0,
+                "dead_lettered": 0,
+                "remaining": len(pending_queue_paths(base)),
+                "backoff_seconds": round(waiting, 1),
+            }
         drop_reasons = _exclusions_module().DROP_REASONS
         uploaded = 0
         failed = 0
@@ -713,13 +730,16 @@ def drain_queue() -> JsonDict:
         held = 0
         failed_record_names: set[str] = set()
         uploader: IngestUploader | None = None
-        while True:
+        busy: ServerBusyError | None = None
+        while busy is None:
             queue_paths = [path for path in pending_queue_paths(base) if path.name not in failed_record_names]
             if not queue_paths:
                 break
             if uploader is None:
                 uploader = IngestUploader.from_env()
             for queue_path in queue_paths:
+                if busy is not None:
+                    break
                 claimed_path = claim_queue_path(queue_path, base)
                 if claimed_path is None:
                     continue
@@ -747,6 +767,8 @@ def drain_queue() -> JsonDict:
                         continue
                     dead_letter_record(base, record, claimed_path, exc)
                 except Exception as exc:  # noqa: BLE001 - hook uploader must preserve queue on any failure.
+                    if isinstance(exc, ServerBusyError):
+                        busy = exc
                     failed += 1
                     failed_record_names.add(claimed_path.name)
                     if record is None:
@@ -765,6 +787,12 @@ def drain_queue() -> JsonDict:
             "dead_lettered": dead_lettered,
             "remaining": len(pending_queue_paths(base)),
         }
+        if busy is not None:
+            state = record_server_busy(base, busy, progressed=uploaded > 0)
+            result["backoff_seconds"] = round(state["until"] - time.time(), 1)
+            result["server_status"] = busy.status
+        elif uploaded:
+            clear_server_busy(base)
         if excluded:
             result["excluded_dropped"] = excluded
         if held:
@@ -988,6 +1016,7 @@ class IngestUploader:
             "content-type": "application/json",
             "connection": "close",
             "user-agent": f"{PLUGIN_NAME}/{PLUGIN_VERSION}",
+            "x-region": INGEST_REGION,
         }
         if self.token:
             headers["x-codex-session-log-token"] = self.token
@@ -1008,9 +1037,67 @@ class IngestUploader:
             message = f"Claude session ingest failed {exc.code}: {body}"
             if exc.code in PERMANENT_HTTP_STATUSES:
                 raise PermanentUploadError(message) from exc
+            if exc.code in SERVER_BUSY_HTTP_STATUSES:
+                raise ServerBusyError(
+                    message, status=exc.code, retry_after=retry_after_seconds(exc.headers)
+                ) from exc
             raise RuntimeError(message) from exc
         except urllib.error.URLError as exc:
             raise RuntimeError(f"Claude session ingest failed: {exc}") from exc
+
+
+class ServerBusyError(RuntimeError):
+    """The ingest is overloaded or failing; stop this drain and back off."""
+
+    def __init__(self, message: str, *, status: int, retry_after: float | None = None) -> None:
+        super().__init__(message)
+        self.status = status
+        self.retry_after = retry_after
+
+
+def retry_after_seconds(headers: object) -> float | None:
+    try:
+        value = float(headers.get("Retry-After"))  # type: ignore[union-attr]
+    except (AttributeError, TypeError, ValueError):
+        return None
+    return value if 0 <= value <= MAX_UPLOAD_BACKOFF_SECONDS else None
+
+
+def upload_backoff_remaining(base: Path, *, now: float | None = None) -> float:
+    """Seconds until the next drain may upload; 0 when no backoff is in force."""
+    try:
+        until = float(read_json_file(base / UPLOAD_BACKOFF_FILE)["until"])
+    except (FileNotFoundError, OSError, ValueError, KeyError, TypeError, json.JSONDecodeError):
+        return 0.0
+    remaining = until - (time.time() if now is None else now)
+    # A wait longer than the cap (clock change, older file) counts as over.
+    return remaining if 0 < remaining <= MAX_UPLOAD_BACKOFF_SECONDS else 0.0
+
+
+def record_server_busy(base: Path, error: ServerBusyError, *, progressed: bool, now: float | None = None) -> JsonDict:
+    """Back off after a busy answer: Retry-After, else 15 s doubling to 5 min.
+
+    A drain that uploaded something first starts the count again.
+    """
+    try:
+        previous = int(read_json_file(base / UPLOAD_BACKOFF_FILE).get("attempts", 0))
+    except (FileNotFoundError, OSError, ValueError, TypeError, json.JSONDecodeError):
+        previous = 0
+    attempts = 1 if progressed else min(previous, 16) + 1
+    delay = error.retry_after if error.retry_after is not None else 15 * 2 ** (attempts - 1)
+    delay = min(MAX_UPLOAD_BACKOFF_SECONDS, delay)
+    state = {
+        "until": (time.time() if now is None else now) + delay,
+        "attempts": attempts,
+        "status": error.status,
+        "at": now_iso(),
+    }
+    write_json_atomic(base / UPLOAD_BACKOFF_FILE, state)
+    return state
+
+
+def clear_server_busy(base: Path) -> None:
+    (base / UPLOAD_BACKOFF_FILE).unlink(missing_ok=True)
 
 
 def validate_ingest_payload(payload: JsonDict) -> None:
