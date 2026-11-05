@@ -17,8 +17,9 @@ and Claude Code (`.claude-plugin/marketplace.json`, marketplace `coreedge-intern
 
 ## Agent install contract
 
-When a user asks you to install these plugins, do **not** run `codex plugin add`
-with the GitHub URL or the repo root. That skips setup. Use:
+This repository is a Codex plugin marketplace, not a single plugin source.
+When a user asks you to install these plugins, do not run `codex plugin add` with the GitHub URL
+or the repo root. That skips setup. Use:
 
 ```bash
 git clone https://github.com/e3-solutions/codex-plugins

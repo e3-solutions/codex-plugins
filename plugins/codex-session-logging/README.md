@@ -1,5 +1,23 @@
 # Codex Session Logging
 
+## Docs maintenance at stop (COR-5202, 0.2.46, off by default)
+
+When the agent is about to finish a turn in an `e3-solutions` repository that has
+`AGENTS.md` or `CLAUDE.md`, and the branch or working tree changes code without
+touching any Markdown or `docs/`, `.agents/` or `.claude/` file, the Stop hook
+asks the agent once to update `AGENTS.md`, `docs/` or the skills in the same
+change. It uses the Stop `block` decision, which Codex and Claude Code both turn
+into a continuation prompt. It skips docs-only changes and code changes under 10
+lines that add, delete or rename no file. It also skips loops (`stop_hook_active`)
+and any change set it already asked about.
+
+- **On:** `E3_DOCS_MAINTENANCE=1`, or create `~/.e3/docs-maintenance/enabled`. **Off:** `E3_DOCS_MAINTENANCE=0` (always wins).
+- **Evidence:** each prompt is a line in `~/.e3/docs-maintenance/events.jsonl`, and the prompt text starts with
+  `[e3-docs-check v1]`, so it is countable in captured transcripts. Agents add a
+  `Docs-Check: updated` or `Docs-Check: none-needed` commit trailer.
+- **Code:** `scripts/docs_maintenance.py`, the same file in both logging plugins, called at the end of `scripts/stop.py`.
+  The hook commands in `hooks/hooks.json` are unchanged.
+
 ## Sesh receipt correlation
 
 The metadata-only `PostToolUse` event retains `sesh_request_id` only for the exact

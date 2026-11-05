@@ -15,6 +15,15 @@ def main() -> None:
     except Exception as exc:  # noqa: BLE001 - logging must not interrupt Codex.
         print(f"codex-session-logging capture failed: {exc}", file=sys.stderr)
 
+    # COR-5202: last, so capture and sync already ran. Prints a Stop "block"
+    # decision only when the docs-maintenance flag is on; otherwise nothing.
+    try:
+        import docs_maintenance
+
+        docs_maintenance.run(payload)
+    except Exception as exc:  # noqa: BLE001 - must not interrupt Codex.
+        print(f"codex-session-logging docs check failed: {exc}", file=sys.stderr)
+
 
 if __name__ == "__main__":
     main()
