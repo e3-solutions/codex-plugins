@@ -19,5 +19,9 @@ Start here after `AGENTS.md`. Find your task and read only what it lists.
 
 ## Keeping this useful
 
+- `python3 .agents/check_agent_docs.py` checks that every path, module, workflow and
+  skill named in these docs still exists. CI runs it on every PR (warn-only until
+  2026-11-12, then required). Put correct names it cannot find (other repos, runtime
+  files, Supabase refs) in `.agents/doc-check-allow.txt`.
 - One fact, one home. Link to it instead of copying it into a skill or `AGENTS.md`.
 - Add a row here in the same PR that adds a durable doc.

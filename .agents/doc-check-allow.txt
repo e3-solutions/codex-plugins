@@ -1,0 +1,11 @@
+# Names the agent-docs check cannot find in this repo but that are correct.
+# One per line: other repos or branches, runtime files, Supabase project refs.
+pmdfllwuctzkdjiehezq
+# e3-solutions/jolly-roger
+e3-solutions/jolly-roger
+repositories.json
+# per-plugin file names, written relative to each plugins/<name>/ folder
+hooks/hooks.json
+.codex-plugin/plugin.json
+.claude-plugin/plugin.json
+scripts/session_logging.py
