@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "id": "codex-session-logging",
-  "version": "0.2.45",
+  "version": "0.2.46",
   "owner": "Core Edge",
   "providers": ["codex", "claude"],
   "include": [
@@ -19,6 +19,7 @@
     "scripts/pre_tool_use.py",
     "scripts/post_tool_use.py",
     "scripts/stop.py",
+    "scripts/docs_maintenance.py",
     "skills/search-coding-sessions"
   ],
   "hook_defaults": {

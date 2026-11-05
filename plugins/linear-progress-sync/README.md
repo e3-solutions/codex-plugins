@@ -142,6 +142,8 @@ python3 ~/.codex/coreedge/runtime/current/update_plugin.py --doctor
 
 ## Rolling Out Updates
 
+Resident release `0.3.46` distributes Codex Session Logging `0.2.46` with the docs-maintenance Stop check (COR-5202), off by default; see the Codex Session Logging README.
+
 Teammates install this repository once with `setup.py`. After that, they should not need to reinstall from the marketplace for normal plugin, skill, command, hook, or extension updates.
 
 To roll out a new default plugin or extension:
