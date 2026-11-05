@@ -11,6 +11,7 @@ Start here after `AGENTS.md`. Find your task and read only what it lists.
 | Sesh cues and search skill | `plugins/sesh/README.md`, `plugins/claude-sesh/README.md` | [SESH_CONTEXT_HOOKS.md](SESH_CONTEXT_HOOKS.md) |
 | Add or change a hook | `hook-change` skill | [COLLECTIVE_FEEDBACK_HOOK_CONTRACT.md](COLLECTIVE_FEEDBACK_HOOK_CONTRACT.md), [COLLECTIVE_FEEDBACK_HOOKS.md](COLLECTIVE_FEEDBACK_HOOKS.md) |
 | Linear progress sync behaviour | `plugins/linear-progress-sync/README.md` | |
+| Weekly proof that repo docs stay current | `tools/docs_maintenance_report.py --markdown` (counts Docs-Check trailers, agent docs commits, backstop runs and PRs, drift per repo) | |
 
 ## History, not current guidance
 
