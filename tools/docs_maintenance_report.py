@@ -7,10 +7,12 @@ For each e3-solutions repository that has the agent docs system (a
   merged        merged PRs
   code          merged PRs that changed code
   code+docs     PRs that changed code and agent docs together
-                  (AGENTS.md, CLAUDE.md, docs/, .agents/, .claude/, any *.md)
+                  (AGENTS.md, CLAUDE.md, docs/, .agents/, .claude/, .codex/, any *.md)
   dc-updated    PRs with a `Docs-Check: updated` commit trailer
   dc-none       PRs with a `Docs-Check: none-needed` trailer
-  stale-risk    PRs that changed code but no docs and carry no Docs-Check trailer
+  stale-risk    PRs the docs backstop would act on: code changed (10+ lines or a
+                  code file added/removed), no docs, no Docs-Check trailer.
+                  Same rules as .agents/docs_backstop_gate.py, imported from it
   doc-commits   commits on the default branch that changed AGENTS.md, CLAUDE.md,
                   docs/ or .agents/skills/
   by-agent      of those, commits written with a coding agent (a Claude or Codex
@@ -18,8 +20,9 @@ For each e3-solutions repository that has the agent docs system (a
   backstop      docs backstop runs that found code without docs (the gate said
                   needed=true), from the docs-backstop.yml workflow
   bs-prs        docs backstop PRs opened (head branch docs-backstop/...), merged in ()
-  drift         docs-check warnings on the latest Agent docs run on the default
-                  branch: paths, commands or skills the docs name that no longer exist
+  drift         problems on the latest completed Agent docs run on the default
+                  branch (its "agent docs check: N problem(s)" log line): paths,
+                  commands or skills the docs name that no longer exist
 
 Repos with merged PRs but no docs system are listed separately, with their PR count.
 Read-only; uses the GitHub CLI (`gh`) with the caller's own login.
@@ -31,12 +34,19 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import importlib.util
 import json
+import os
 import re
 import subprocess
+import sys
 from collections import defaultdict
+from pathlib import Path
 
-DOC_PREFIXES = ("docs/", ".agents/", ".claude/", ".codex/")
+_GATE = Path(__file__).resolve().parents[1] / ".agents" / "docs_backstop_gate.py"
+_spec = importlib.util.spec_from_file_location("docs_backstop_gate", _GATE)
+gate = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(gate)
 AGENT_DOC_PATHS = ("AGENTS.md", "CLAUDE.md", "docs", ".agents/skills")
 AGENT_MARK = re.compile(r"co-authored-by:.*(claude|codex|openai)|generated with \[?(claude|codex)", re.I)
 BOT_LOGINS = {"github-actions[bot]", "claude[bot]"}
@@ -62,14 +72,6 @@ def gh_ok(*args: str) -> bool:
     return subprocess.run(["gh", *args], capture_output=True, text=True).returncode == 0
 
 
-def is_doc(path: str) -> bool:
-    return path.endswith(".md") or path.startswith(DOC_PREFIXES)
-
-
-def is_code(path: str) -> bool:
-    return not is_doc(path) and not path.endswith((".lock", "-lock.json", "-lock.yaml"))
-
-
 def search(query: str) -> list[dict]:
     items, page = [], 1
     while True:
@@ -81,21 +83,21 @@ def search(query: str) -> list[dict]:
 
 
 def pr_facts(repo: str, number: int) -> dict:
-    files = gh_lines("api", f"repos/{repo}/pulls/{number}/files", "--paginate", "--jq", ".[].filename")
-    commits = gh_lines("api", f"repos/{repo}/pulls/{number}/commits", "--paginate", "--jq", ".[].commit.message | @json")
+    changes, messages = gate.from_github(repo, str(number))
+    stale, _reason, code = gate.decide(changes, messages)
     trailer = None
-    for message in (json.loads(c) for c in commits):
-        for line in message.splitlines():
-            if line.lower().startswith("docs-check:"):
-                trailer = line.split(":", 1)[1].strip().lower()
-    return {"code": any(is_code(f) for f in files), "docs": any(is_doc(f) for f in files), "trailer": trailer}
+    for line in messages.splitlines():
+        if line.lower().startswith("docs-check:"):
+            trailer = line.split(":", 1)[1].strip().lower()
+    return {"code": bool(code), "docs": any(gate.is_doc(c["filename"]) for c in changes),
+            "trailer": trailer, "stale": stale}
 
 
 def doc_commits(repo: str, since: str) -> tuple[int, int]:
     seen: dict[str, bool] = {}
     for path in AGENT_DOC_PATHS:
         rows = gh_lines("api", "-X", "GET", f"repos/{repo}/commits", "-f", f"since={since}T00:00:00Z", "-f", f"path={path}",
-                        "-f", "per_page=100", "--jq", '.[] | {sha, m: .commit.message, a: (.author.login // "")} | @json')
+                        "-f", "per_page=100", "--paginate", "--jq", '.[] | {sha, m: .commit.message, a: (.author.login // "")} | @json')
         for row in rows:
             c = json.loads(row)
             seen[c["sha"]] = bool(AGENT_MARK.search(c["m"])) or c["a"] in BOT_LOGINS
@@ -107,7 +109,7 @@ def backstop_runs(repo: str, since: str) -> int:
     if not gh_ok("api", f"repos/{repo}/actions/workflows/docs-backstop.yml"):
         return 0
     runs = gh_lines("api", "-X", "GET", f"repos/{repo}/actions/workflows/docs-backstop.yml/runs",
-                    "-f", f"created=>={since}", "-f", "per_page=100", "--jq", ".workflow_runs[].id")
+                    "-f", f"created=>={since}", "-f", "per_page=100", "--paginate", "--jq", ".workflow_runs[].id")
     needed = 0
     for run in runs:
         steps = gh_lines("api", f"repos/{repo}/actions/runs/{run}/jobs", "--jq",
@@ -116,19 +118,25 @@ def backstop_runs(repo: str, since: str) -> int:
     return needed
 
 
+PROBLEMS = re.compile(r"agent docs check: (\d+) problem")
+
+
 def drift(repo: str, branch: str) -> int | None:
-    """Docs-check warnings on the latest Agent docs run on the default branch."""
+    """Problems on the latest completed Agent docs run on the default branch.
+
+    Read from the job log, not annotations: GitHub keeps at most 10 warnings per step."""
     if not gh_ok("api", f"repos/{repo}/actions/workflows/agent-docs.yml"):
         return None
     runs = gh_lines("api", "-X", "GET", f"repos/{repo}/actions/workflows/agent-docs.yml/runs",
-                    "-f", f"branch={branch}", "-f", "per_page=1", "--jq", ".workflow_runs[].id")
+                    "-f", f"branch={branch}", "-f", "status=completed", "-f", "per_page=1", "--jq", ".workflow_runs[].id")
     if not runs:
         return None
-    total = 0
+    found = None
     for job in gh_lines("api", f"repos/{repo}/actions/runs/{runs[0]}/jobs", "--jq", ".jobs[].id"):
-        total += len(gh_lines("api", f"repos/{repo}/check-runs/{job}/annotations", "--paginate", "--jq",
-                              '.[] | select(.annotation_level == "warning" and .path != ".github") | .path'))
-    return total
+        log = subprocess.run(["gh", "api", f"repos/{repo}/actions/jobs/{job}/logs"], capture_output=True, text=True).stdout
+        for match in PROBLEMS.finditer(log):
+            found = (found or 0) + int(match.group(1))
+    return found
 
 
 def main() -> None:
@@ -141,6 +149,9 @@ def main() -> None:
     parser.add_argument("--out", help="write the report to this file instead of stdout")
     args = parser.parse_args()
     since = (dt.date.today() - dt.timedelta(days=args.days)).isoformat()
+    if subprocess.run(["gh", "auth", "status"], capture_output=True).returncode != 0:
+        hint = " GITHUB_TOKEN is set and may be invalid: try `env -u GITHUB_TOKEN`." if os.environ.get("GITHUB_TOKEN") else ""
+        sys.exit("gh is not logged in (gh auth status failed)." + hint)
 
     merged: dict[str, list[int]] = defaultdict(list)
     for item in search(f"org:{args.org} is:pr is:merged merged:>={since}"):
@@ -150,6 +161,10 @@ def main() -> None:
     bs_merged: dict[str, int] = defaultdict(int)
     for item in search(f"org:{args.org} is:pr head:docs-backstop/ created:>={since}"):
         repo = item["repository_url"].split("/repos/", 1)[1]
+        # Search matches head:docs-backstop as a word prefix; keep only real backstop branches.
+        head = gh_lines("api", f"repos/{repo}/pulls/{item['number']}", "--jq", ".head.ref")
+        if not head or not head[0].startswith("docs-backstop/"):
+            continue
         bs_opened[repo] += 1
         bs_merged[repo] += bool((item.get("pull_request") or {}).get("merged_at"))
 
@@ -173,7 +188,7 @@ def main() -> None:
             "code+docs": sum(f["code"] and f["docs"] for f in facts),
             "dc-updated": sum(f["trailer"] == "updated" for f in facts),
             "dc-none": sum(f["trailer"] == "none-needed" for f in facts),
-            "stale-risk": sum(f["code"] and not f["docs"] and f["trailer"] is None for f in facts),
+            "stale-risk": sum(f["stale"] for f in facts),
             "doc-commits": commits, "by-agent": by_agent,
             "backstop": backstop_runs(repo, since),
             "bs-prs": f"{bs_opened[repo]} ({bs_merged[repo]})",
