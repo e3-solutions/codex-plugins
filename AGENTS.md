@@ -55,6 +55,11 @@ usually get all of this through Jolly Roger instead (`e3-solutions/jolly-roger`)
 
 ## Rules for every task
 
+- **Keep docs current in the same change.** When you change code, check whether AGENTS.md,
+  docs/ or a skill in .agents/skills now states a wrong or missing command, deploy step, env
+  var, branch, path, service or rule, and fix it in the same commit or PR. Add the commit
+  trailer `Docs-Check: updated` or `Docs-Check: none-needed`. If you miss it, the docs
+  backstop opens a docs PR after merge.
 - Register hooks only in each plugin's own `hooks/hooks.json`, never in
   `~/.codex/hooks.json`. Duplicate registration writes duplicate log rows.
 - Ingest changes: order the migration and function by compatibility, ship clients
