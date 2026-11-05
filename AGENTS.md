@@ -29,27 +29,35 @@ codex mcp login linear
 codex mcp login e3-cosmos
 ```
 
-Then tell the user to restart Codex. If Codex asks to review hooks, they should
-trust the Linear Progress Sync and Codex Session Logging hooks once. New machines
+`codex plugin add` skips the setup that installs both plugins, merges global
+hooks and registers the Linear and Cosmos MCPs. After setup, tell the user to
+restart Codex or start a new Codex thread. If Codex asks to review hooks, they
+should trust the Linear Progress Sync and Codex Session Logging hooks once. New machines
 usually get all of this through Jolly Roger instead (`e3-solutions/jolly-roger`).
 
 ## How changes reach machines
 
-- **Codex plugins:** the resident updater reads
-  `plugins/linear-progress-sync/update-manifest.json` on `main`. Machines update
-  only when that version changes (`release-plugin` skill).
-- **Jolly Roger** pins this repo to one commit in its `repositories.json`. Bumping
-  that pin is a separate PR in jolly-roger.
-- **Claude plugins** update from the marketplace once a day when their version changes.
-- A merge that bumps no version ships nothing. **A merge that bumps the manifest
-  ships to every engineer's machine**, so it needs an explicit yes.
+- **Any merge to `main` that changes a file inside a default Codex plugin
+  (`INSTALLED_BY_DEFAULT` in `.agents/plugins/marketplace.json`: today
+  `plugins/linear-progress-sync/` and `plugins/codex-session-logging/`) reaches
+  every resident machine within about 30 minutes, version bump or not.** The
+  resident updater downloads `main.zip` every 1800 s and replaces any cached
+  plugin whose file digest changed (`plugins/linear-progress-sync/scripts/resident_updater.py`).
+  Treat every such merge as a release and get an explicit yes (`release-plugin` skill).
+- Root docs, `tests/`, `docs/` and `.agents/skills/` ship nothing.
+- `plugins/sesh` is not a default plugin. It reaches machines through Jolly
+  Roger or `plugins/sesh/install.py`, which pins a commit.
+- **Jolly Roger** pins this repo to one commit in its `repositories.json`.
+  Bumping that pin is a separate PR in jolly-roger.
+- `claude-session-logging` updates itself from the Claude marketplace once a day.
+  `claude-sesh` relies on Claude Code's marketplace update or its `install.py`.
 
 ## Rules for every task
 
 - Register hooks only in each plugin's own `hooks/hooks.json`, never in
   `~/.codex/hooks.json`. Duplicate registration writes duplicate log rows.
-- Ingest changes: apply the migration before deploying the function, and deploy
-  the function by name only (`ingest-change` skill).
+- Ingest changes: order the migration and function by compatibility, ship clients
+  last, and deploy the function by name only (`ingest-change` skill).
 - Tests: `python3 -m pytest -q tests` for the Python plugins. In
   `plugins/codex-session-logging/supabase/functions/codex-session-ingest`, run
   `deno test --allow-env --allow-net=127.0.0.1,localhost --no-lock .`

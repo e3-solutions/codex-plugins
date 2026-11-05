@@ -12,9 +12,14 @@ Project: `pmdfllwuctzkdjiehezq`.
 
 ## Rules
 
-- **Order: schema, then function, then clients.** The function must accept what
-  old clients still send, and old function versions must survive the new schema.
-  Ship client changes (`release-plugin` skill) last.
+- **Order follows compatibility; clients go last.**
+  - Usually: an additive migration first, then the function.
+  - When old function versions cannot survive the new schema, flip it: deploy the
+    function, wait for old invocations to drain, then migrate. This happened for
+    the ignore-session rollout (the function first, 600 s wait, then the migration;
+    plugin README "Supabase").
+  - The function must accept what old clients still send. Ship client changes
+    (`release-plugin` skill) last.
 - **Schema only through migration history.** This Supabase project also holds
   the Sesh and Jolly Roger schemas, so its history has versions this folder does
   not. `supabase db push` from here sees them as unknown. Apply the new file
@@ -41,7 +46,7 @@ Project: `pmdfllwuctzkdjiehezq`.
    ```
 
    CI runs the same command (`.github/workflows/ingest-deno-tests.yml`).
-3. After merge, with approval: apply the migration, then deploy:
+3. After merge, with approval, in the order above. Deploy with:
 
    ```bash
    supabase functions deploy codex-session-ingest \

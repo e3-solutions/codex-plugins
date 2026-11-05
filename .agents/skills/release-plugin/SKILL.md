@@ -10,9 +10,11 @@ adds the files that move together and the checks that recent releases used.
 
 ## Rules
 
-- **A merge that bumps `plugins/linear-progress-sync/update-manifest.json` ships
-  to every Codex machine**, which picks it up on its next update check. Get an
-  explicit yes before merging it.
+- **Any merge that changes files in a default plugin (`plugins/linear-progress-sync/`,
+  `plugins/codex-session-logging/`) ships to every resident machine within about
+  30 minutes, with or without a version bump.** The resident updater replaces any
+  plugin whose file digest changed. Get an explicit yes before merging, and still
+  bump versions so presence reports can tell releases apart.
 - One release, one PR. The PR title lists every new version, for example
   "(logger 0.2.44, resident 0.3.44, Claude 0.2.22)".
 - New behaviour that could add noise or cost ships **off by default** behind an
@@ -23,9 +25,10 @@ adds the files that move together and the checks that recent releases used.
 | Changed | Bump |
 | --- | --- |
 | `plugins/codex-session-logging/` | `.codex-plugin/plugin.json` `version`, `.jollyroger.json` `version`, `PLUGIN_VERSION` in `scripts/session_logging.py` |
-| `plugins/sesh/` | `.codex-plugin/plugin.json`, `.jollyroger.json` |
-| `plugins/claude-session-logging/`, `plugins/claude-sesh/` | `.claude-plugin/plugin.json`. For `sesh`, also its `version` in `.claude-plugin/marketplace.json` (`tests/test_claude_sesh.py::test_versions_agree`) |
-| Any Codex plugin | `plugins/linear-progress-sync/.codex-plugin/plugin.json` **and** `plugins/linear-progress-sync/update-manifest.json`. Without this bump, machines never fetch the change |
+| `plugins/sesh/` (not a default plugin) | `.codex-plugin/plugin.json`, `.jollyroger.json`, `PLUGIN_VERSION` in `scripts/session_logging.py`. After the merge, `COMMIT` and `VERSION` in `plugins/sesh/install.py` |
+| `plugins/claude-session-logging/` | `.claude-plugin/plugin.json` |
+| `plugins/claude-sesh/` | `.claude-plugin/plugin.json`, `PLUGIN_VERSION` in `scripts/sesh_cc.py`, and the `sesh` `version` in `.claude-plugin/marketplace.json` (`tests/test_claude_sesh.py::test_versions_agree`) |
+| A default Codex plugin | `plugins/linear-progress-sync/.codex-plugin/plugin.json` **and** `plugins/linear-progress-sync/update-manifest.json`, kept **equal**. A mismatch makes every machine's update fail ("does not match archive plugin") |
 | A new default Codex plugin | Its entry in `.agents/plugins/marketplace.json` with `policy.installation: INSTALLED_BY_DEFAULT` |
 
 - `plugins/sesh/scripts/session_logging.py` and
