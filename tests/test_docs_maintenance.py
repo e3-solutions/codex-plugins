@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
+import time
 import subprocess
 from pathlib import Path
 
@@ -111,3 +113,44 @@ def test_run_never_raises_and_prints_nothing_when_off(tmp_path, monkeypatch, cap
     module = load("claude-session-logging")
     module.run({"cwd": str(tmp_path / "missing")})
     assert capsys.readouterr().out == ""
+
+
+def test_more_edits_to_the_same_files_do_not_ask_again(dm, repo):
+    big_change(repo)
+    assert dm.decide({"cwd": str(repo), "session_id": "s"})["decision"] == "block"
+    (repo / "app.py").write_text("".join(f"print({i})\n" for i in range(40)))
+    assert dm.decide({"cwd": str(repo), "session_id": "s"}) is None
+
+
+def test_a_new_code_file_asks_again_up_to_the_session_cap(dm, repo):
+    big_change(repo)
+    assert dm.decide({"cwd": str(repo), "session_id": "s"})["decision"] == "block"
+    (repo / "server.py").write_text("x = 1\n")
+    assert dm.decide({"cwd": str(repo), "session_id": "s"})["decision"] == "block"
+    (repo / "worker.py").write_text("y = 1\n")
+    assert dm.decide({"cwd": str(repo), "session_id": "s"}) is None  # MAX_PROMPTS_PER_SESSION
+
+
+def test_untracked_non_code_files_are_ignored(dm, repo):
+    (repo / "notes.txt").write_text("scratch\n")
+    (repo / "run.log").write_text("log\n")
+    assert dm.decide({"cwd": str(repo)}) is None
+
+
+def test_changes_older_than_the_session_are_ignored(dm, repo, tmp_path):
+    big_change(repo)
+    old = time.time() - 3600
+    os.utime(repo / "app.py", (old, old))
+    transcript = tmp_path / "t.jsonl"
+    stamp = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime())
+    transcript.write_text(json.dumps({"timestamp": f"{stamp}.000Z", "type": "user"}) + "\n")
+    assert dm.decide({"cwd": str(repo), "transcript_path": str(transcript)}) is None
+    (repo / "app.py").write_text("".join(f"print({i})\n" for i in range(15)))
+    assert dm.decide({"cwd": str(repo), "transcript_path": str(transcript)})["decision"] == "block"
+
+
+def test_prompt_keeps_the_original_answer(dm, repo):
+    big_change(repo)
+    reason = dm.decide({"cwd": str(repo)})["reason"]
+    assert "repeat your previous final answer" in reason
+    assert "do not commit or push only to add the trailer" in reason
