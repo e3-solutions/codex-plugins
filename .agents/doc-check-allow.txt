@@ -4,3 +4,8 @@ pmdfllwuctzkdjiehezq
 # e3-solutions/jolly-roger
 e3-solutions/jolly-roger
 repositories.json
+# per-plugin file names, written relative to each plugins/<name>/ folder
+hooks/hooks.json
+.codex-plugin/plugin.json
+.claude-plugin/plugin.json
+scripts/session_logging.py
