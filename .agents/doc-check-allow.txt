@@ -1,0 +1,6 @@
+# Names the agent-docs check cannot find in this repo but that are correct.
+# One per line: other repos or branches, runtime files, Supabase project refs.
+pmdfllwuctzkdjiehezq
+# e3-solutions/jolly-roger
+e3-solutions/jolly-roger
+repositories.json
